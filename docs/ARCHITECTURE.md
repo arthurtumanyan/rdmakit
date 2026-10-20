@@ -42,7 +42,7 @@ transport; `kvpace` links the store's client library only for the optional nativ
 
 | Decision | Reason | Cost |
 |---|---|---|
-| One message API over RDMA and TCP | develop and test on machines without RDMA; compare transports under the same server | the API is limited to what both provide (no one-sided operations) |
+| One message API over RDMA and TCP | develop and test on machines without RDMA; compare transports under the same server | one-sided operations on TCP are emulated by the target library and progress only while the target calls into it |
 | Credit-based flow control with credits written into a remote word | no receive buffer is reserved for control messages; receiver-not-ready cannot occur | an extra registered page with remote write access; event mode polls it every 200 microseconds |
 | Log-structured arenas with in-place same-size overwrite | fast appends, no per-entry allocator, no fragmentation inside a shard | dead space until the log wraps for variable-size overwrites; resident memory approaches the capacity |
 | Index of 128-byte buckets with 16-bit tags compared by vector instructions | one or two cache lines per lookup | the index is sized once from an expected entry size |

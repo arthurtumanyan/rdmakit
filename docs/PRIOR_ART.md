@@ -32,15 +32,17 @@ other people can read, run and challenge.
 | MPI | message passing with collectives | the application is an MPI program |
 | ZeroMQ, gRPC | general messaging / RPC, mainly over TCP | no RDMA hardware path is needed |
 
-What `rdmaduct` provides that the list above does not claim to: one small C library (about 1,800 lines including
-headers) with a single message API whose behavior is the same on RDMA reliable connections and on TCP, including
-credit-based flow control, ordering of delivery before a close is reported, and a documented error model. It
+What `rdmaduct` provides that the list above does not claim to: one small C library (about 3,500 lines including
+headers) whose behavior is the same on RDMA reliable connections and on TCP for two-sided messages, registered
+regions, zero-copy sends, one-sided reads, writes and 64-bit atomics (emulated by the peer's library on TCP) and
+pollable descriptors for event loops, including credit-based flow control, ordering of delivery before a close
+is reported, and a documented error model. It
 depends only on libc for the TCP transport and additionally on libibverbs and librdmacm for RDMA. A program can
 therefore be developed on a laptop without RDMA hardware (TCP, or Soft-RoCE), and the transport is tested
 for faults and malformed input (see `rdmaduct/docs/ARCHITECTURE.md`).
 
-What it does not do: one-sided operations, multiple NICs or rails, GPU memory, collectives, connection
-multiplexing (one endpoint is one thread's responsibility), encryption or authentication.
+What it does not do: multiple NICs or rails, GPU memory, tag matching, collectives, encryption or authentication.
+On TCP, one-sided operations progress only while the target application calls into the library.
 
 ## kvpace: key-value benchmark
 

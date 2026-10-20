@@ -163,14 +163,29 @@ static void echo_once(duct_ep *ep, size_t len, unsigned seed) {
     EXPECT(duct_recv(ep, &rx, 50) == -ETIMEDOUT, "receive timeout");
     EXPECT(duct_recv(ep, &rx, 0) == -ETIMEDOUT, "non-blocking receive");
 
-    if (transport == DUCT_TRANSPORT_TCP) {
-        echo_once(ep, 1, 99);
-        EXPECT(duct_send(ep, "x", 1, 1000) == 0, "send for busy test");
-        rc = duct_recv(ep, &rx, 5000);
-        EXPECT(rc == 0, "recv for busy test");
-        struct duct_rx rx2;
-        EXPECT(duct_recv(ep, &rx2, 0) == -EBUSY, "second unreleased receive on TCP");
-        duct_rx_release(ep, &rx);
+    /* Several messages may be held unreleased at once; each keeps its own buffer. */
+    {
+        struct duct_rx held[3];
+        for (unsigned i = 0; i < 3; i++) {
+            unsigned char b = (unsigned char)(0xa0 + i);
+            EXPECT(duct_send(ep, &b, 1, 1000) == 0, "send for hold test %u", i);
+        }
+        int got = 0;
+        for (unsigned i = 0; i < 3; i++) {
+            rc = duct_recv(ep, &held[i], 5000);
+            EXPECT(rc == 0, "hold recv %u: %s", i, duct_strerror(rc));
+            got += rc == 0;
+        }
+        if (got == 3) {
+            for (unsigned i = 0; i < 3; i++) {
+                EXPECT(held[i].len == 1 && ((const unsigned char *)held[i].data)[0] == 0xa0 + i,
+                       "held message %u intact", i);
+            }
+            for (unsigned i = 0; i < 3; i++) {
+                EXPECT(duct_rx_release(ep, &held[i]) == 0, "release held %u", i);
+            }
+        }
+        EXPECT(duct_rx_release(ep, &held[0]) == -EINVAL, "double release rejected");
     }
 
     duct_ep_close(ep);

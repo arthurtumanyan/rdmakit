@@ -2,10 +2,37 @@
  * tcp.c - TCP transport.
  *
  * Sockets are non-blocking; all waits use poll() with the caller's deadline.
- * Receive state persists across calls, so a duct_recv() that times out in the
- * middle of a frame resumes at the same byte on the next call. A send that
- * times out after writing part of a frame leaves the stream in an undefined
- * state and marks the endpoint broken.
+ *
+ * Receive path. A state machine reads frames as far as the socket allows and resumes at the same byte on
+ * the next call, so a timeout inside a frame does not corrupt the stream. Data frames are read into
+ * receive slots: 2 * recv_depth buffers of max_msg bytes, allocated on first use. At most recv_depth
+ * delivered messages may be held by the application (as on RDMA, where the peer is limited by credits);
+ * the other slots buffer frames that arrive while the application waits for a one-sided operation, so
+ * that the response behind them can be read. When every slot is in use, reading stops until a release.
+ *
+ * Send path. Frames are written directly while the socket accepts data; the rest of a frame is copied
+ * into a send queue that later calls flush. duct_send() waits while the queue holds more than
+ * send_depth full-size frames and returns -ETIMEDOUT without writing anything when the deadline passes,
+ * so a timeout never leaves a partial frame. Control responses are queued without that limit, because
+ * the servicing side must not block.
+ *
+ * Control frames (bit 31 of the frame word set) emulate one-sided operations. Payload layout
+ * (little-endian), common prefix: type (1), atomic op (1), reserved (2), operation id (8):
+ *
+ *   type 1 READ_REQ     prefix, addr (8), key (4), len (4)                          28 bytes
+ *   type 2 READ_RESP    prefix, status (4), reserved (4), then len data bytes if ok 20 (+ len)
+ *   type 3 WRITE_REQ    prefix, addr (8), key (4), len (4), then len data bytes     28 + len
+ *   type 4 WRITE_RESP   prefix, status (4), reserved (4)                            20
+ *   type 5 ATOMIC_REQ   prefix, addr (8), key (4), reserved (4), a (8), b (8)       44
+ *   type 6 ATOMIC_RESP  prefix, status (4), reserved (4), previous value (8)        28
+ *
+ * Status 0 is success, 1 an access violation. The owner of a region executes requests in arrival order
+ * while its application calls into the library; responses therefore arrive in request order, and a
+ * response must match the oldest outstanding request (type and id), otherwise the stream is rejected.
+ * An access violation fails the requesting endpoint with DUCT_EACCESS, as an RDMA queue pair would.
+ *
+ * Event loop integration: each endpoint owns an epoll descriptor that contains the socket (POLLIN, and
+ * POLLOUT while the send queue is not empty).
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -15,22 +42,101 @@
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include "internal.h"
 
 #define FRAME_HEADER 4u
+#define CTRL_FLAG 0x80000000u
+#define CTRL_PREFIX 12u
+#define CTRL_MAX_FIXED 44u
+#define CLOSE_FLUSH_MS 1000
+
+enum ctrl_type {
+    CT_READ_REQ = 1,
+    CT_READ_RESP = 2,
+    CT_WRITE_REQ = 3,
+    CT_WRITE_RESP = 4,
+    CT_ATOMIC_REQ = 5,
+    CT_ATOMIC_RESP = 6,
+};
+
+enum rx_state {
+    RX_HDR,       /* reading the 4-byte frame word */
+    RX_DATA,      /* reading a data frame into a slot */
+    RX_CTRL,      /* reading the fixed part of a control frame */
+    RX_CTRL_BODY, /* reading the data part of READ_RESP or WRITE_REQ */
+};
+
+enum slot_state {
+    SLOT_FREE = 0,
+    SLOT_READY = 1,
+    SLOT_HELD = 2,
+};
+
+/*
+ * Outstanding one-sided operation issued by this endpoint. seq is the wire id; done_seq is the sequence
+ * number that completes with it (larger when zero-copy sends were posted behind it).
+ */
+struct pending_op {
+    uint64_t seq;
+    uint64_t done_seq;
+    enum duct_rma_op op;
+    uint8_t *laddr;
+    size_t len;
+};
 
 struct tcp_ep {
     struct duct_ep base;
     int fd;
+    int epfd;
+    uint32_t epmask; /* events currently registered for fd in epfd */
     uint32_t max_msg;
-    uint8_t *rx_buf; /* FRAME_HEADER + max_msg bytes */
-    uint8_t *tx_buf; /* FRAME_HEADER + peer_max_msg bytes */
-    size_t rx_off;   /* bytes of the current frame received so far */
-    int rx_busy;     /* a delivered message has not been released */
-    int broken;      /* sticky error (negative code) */
+    uint32_t recv_depth;
+    uint32_t send_depth;
+    int broken; /* sticky error (negative code) */
+
+    /* receive state machine */
+    enum rx_state rxs;
+    uint8_t hdr[FRAME_HEADER];
+    size_t hdr_off;
+    uint32_t flen;   /* payload length of the current frame */
+    uint32_t cur;    /* slot of the current data frame */
+    size_t data_off; /* bytes of the current data payload read */
+    uint8_t ctl[CTRL_MAX_FIXED];
+    size_t ctl_need;
+    size_t ctl_off;
+    uint8_t *body; /* destination of the control body, NULL to discard */
+    size_t body_len;
+    size_t body_off;
+    int body_ok; /* WRITE_REQ: destination valid */
+
+    /* receive slots */
+    uint32_t nslots;
+    uint8_t **slot_buf;
+    uint32_t *slot_len;
+    uint8_t *slot_state;
+    uint32_t *ready; /* FIFO of READY slots */
+    uint32_t rhead;
+    uint32_t rcount;
+    uint32_t held;
+
+    /* send queue */
+    uint8_t *q;
+    size_t qlen; /* bytes stored */
+    size_t qoff; /* bytes already written */
+    size_t qcap;
+    size_t qlimit;
+
+    /* one-sided operations issued by this side */
+    struct pending_op *ops; /* FIFO of send_depth entries */
+    uint32_t ohead;
+    uint32_t ocount;
+    uint64_t posted;
+    uint64_t done;
 };
 
 struct tcp_listener {
@@ -38,6 +144,26 @@ struct tcp_listener {
     int fd;
     int port;
 };
+
+static void put_le32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static void put_le64(uint8_t *p, uint64_t v) {
+    put_le32(p, (uint32_t)v);
+    put_le32(p + 4, (uint32_t)(v >> 32));
+}
+
+static uint32_t get_le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t get_le64(const uint8_t *p) {
+    return (uint64_t)get_le32(p) | ((uint64_t)get_le32(p + 4) << 32);
+}
 
 static int set_nonblock(int fd) {
     int fl = fcntl(fd, F_GETFL);
@@ -51,7 +177,7 @@ static int set_nonblock(int fd) {
 static int wait_fd(int fd, short events, int64_t deadline) {
     for (;;) {
         struct pollfd p = {.fd = fd, .events = events};
-        int rc = poll(&p, 1, duct_remaining_ms(deadline));
+        int rc = poll(&p, events != 0 ? 1 : 0, duct_remaining_ms(deadline));
         if (rc > 0) {
             return 0;
         }
@@ -64,7 +190,7 @@ static int wait_fd(int fd, short events, int64_t deadline) {
     }
 }
 
-/* Reads exactly n bytes into buf starting at *off. Updates *off; returns 0, -ETIMEDOUT, DUCT_ECLOSED or -errno. */
+/* Reads exactly n bytes into buf starting at *off (blocking until the deadline; handshake only). */
 static int read_full(int fd, uint8_t *buf, size_t *off, size_t n, int64_t deadline) {
     while (*off < n) {
         ssize_t r = recv(fd, buf + *off, n - *off, 0);
@@ -86,13 +212,13 @@ static int read_full(int fd, uint8_t *buf, size_t *off, size_t n, int64_t deadli
     return 0;
 }
 
-/* Writes n bytes. *sent receives the number of bytes written even on failure. */
-static int write_full(int fd, const uint8_t *buf, size_t n, size_t *sent, int64_t deadline) {
-    *sent = 0;
-    while (*sent < n) {
-        ssize_t w = send(fd, buf + *sent, n - *sent, MSG_NOSIGNAL);
+/* Writes n bytes (blocking until the deadline; handshake only). */
+static int write_full(int fd, const uint8_t *buf, size_t n, int64_t deadline) {
+    size_t sent = 0;
+    while (sent < n) {
+        ssize_t w = send(fd, buf + sent, n - sent, MSG_NOSIGNAL);
         if (w >= 0) {
-            *sent += (size_t)w;
+            sent += (size_t)w;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
             int rc = wait_fd(fd, POLLOUT, deadline);
             if (rc != 0) {
@@ -107,13 +233,542 @@ static int write_full(int fd, const uint8_t *buf, size_t n, size_t *sent, int64_
     return 0;
 }
 
+/*
+ * Reads up to n bytes without blocking. Returns the byte count (> 0), 0 when the socket has no data,
+ * or a negative error (DUCT_ECLOSED for an orderly or abortive close).
+ */
+static ssize_t read_some(struct tcp_ep *e, uint8_t *buf, size_t n) {
+    for (;;) {
+        ssize_t r = recv(e->fd, buf, n, 0);
+        if (r > 0) {
+            return r;
+        }
+        if (r == 0) {
+            return DUCT_ECLOSED;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0;
+        }
+        if (errno == ECONNRESET) {
+            return DUCT_ECLOSED;
+        }
+        if (errno != EINTR) {
+            return -errno;
+        }
+    }
+}
+
+/* ---- send queue ------------------------------------------------------------------------------------ */
+
+static size_t queued(const struct tcp_ep *e) {
+    return e->qlen - e->qoff;
+}
+
+/* Appends bytes to the send queue. Returns 0 or -ENOMEM. */
+static int q_append(struct tcp_ep *e, const void *data, size_t n) {
+    if (n == 0) {
+        return 0;
+    }
+    if (e->qoff > 0 && e->qoff == e->qlen) {
+        e->qoff = 0;
+        e->qlen = 0;
+    }
+    if (e->qlen + n > e->qcap) {
+        if (e->qoff > 0) {
+            memmove(e->q, e->q + e->qoff, e->qlen - e->qoff);
+            e->qlen -= e->qoff;
+            e->qoff = 0;
+        }
+        if (e->qlen + n > e->qcap) {
+            size_t cap = e->qcap > 0 ? e->qcap : 4096;
+            while (cap < e->qlen + n) {
+                cap *= 2;
+            }
+            uint8_t *q = realloc(e->q, cap);
+            if (q == NULL) {
+                return -ENOMEM;
+            }
+            e->q = q;
+            e->qcap = cap;
+        }
+    }
+    memcpy(e->q + e->qlen, data, n);
+    e->qlen += n;
+    return 0;
+}
+
+/* Writes queued bytes without blocking. Returns 0 or a sticky error. */
+static int q_flush(struct tcp_ep *e) {
+    while (queued(e) > 0) {
+        ssize_t w = send(e->fd, e->q + e->qoff, queued(e), MSG_NOSIGNAL);
+        if (w > 0) {
+            e->qoff += (size_t)w;
+            continue;
+        }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return 0;
+        }
+        if (w < 0 && errno == EINTR) {
+            continue;
+        }
+        e->broken = (w < 0 && errno != EPIPE && errno != ECONNRESET) ? -errno : DUCT_ECLOSED;
+        return e->broken;
+    }
+    e->qoff = 0;
+    e->qlen = 0;
+    return 0;
+}
+
+/*
+ * Writes a frame made of up to three parts. Parts the socket does not accept immediately are queued, so
+ * the frame is always either completely written or completely queued after the call.
+ */
+static int emit(struct tcp_ep *e, const void *p0, size_t n0, const void *p1, size_t n1, const void *p2,
+                size_t n2) {
+    struct iovec iov[3] = {{(void *)p0, n0}, {(void *)p1, n1}, {(void *)p2, n2}};
+    size_t total = n0 + n1 + n2;
+    size_t written = 0;
+    if (queued(e) == 0) {
+        for (;;) {
+            struct msghdr mh = {.msg_iov = iov, .msg_iovlen = 3};
+            ssize_t w = sendmsg(e->fd, &mh, MSG_NOSIGNAL);
+            if (w >= 0) {
+                written = (size_t)w;
+                break;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            if (errno != EINTR) {
+                e->broken = (errno != EPIPE && errno != ECONNRESET) ? -errno : DUCT_ECLOSED;
+                return e->broken;
+            }
+        }
+    }
+    if (written == total) {
+        return 0;
+    }
+    for (int i = 0; i < 3; i++) {
+        size_t n = iov[i].iov_len;
+        if (written >= n) {
+            written -= n;
+            continue;
+        }
+        int rc = q_append(e, (const uint8_t *)iov[i].iov_base + written, n - written);
+        if (rc != 0) {
+            e->broken = rc;
+            return rc;
+        }
+        written = 0;
+    }
+    return q_flush(e);
+}
+
+/* ---- receive slots --------------------------------------------------------------------------------- */
+
+/* Returns a free slot with an allocated buffer, or UINT32_MAX. */
+static uint32_t slot_take(struct tcp_ep *e) {
+    for (uint32_t i = 0; i < e->nslots; i++) {
+        if (e->slot_state[i] != SLOT_FREE) {
+            continue;
+        }
+        if (e->slot_buf[i] == NULL) {
+            e->slot_buf[i] = malloc(e->max_msg > 0 ? e->max_msg : 1);
+            if (e->slot_buf[i] == NULL) {
+                return UINT32_MAX;
+            }
+        }
+        return i;
+    }
+    return UINT32_MAX;
+}
+
+/* ---- control frames -------------------------------------------------------------------------------- */
+
+/* Fixed payload size of a control frame type, or 0 for an unknown type. */
+static size_t ctrl_fixed(uint8_t type) {
+    switch (type) {
+    case CT_READ_REQ:
+    case CT_WRITE_REQ:
+        return 28;
+    case CT_READ_RESP:
+    case CT_WRITE_RESP:
+        return 20;
+    case CT_ATOMIC_REQ:
+        return 44;
+    case CT_ATOMIC_RESP:
+        return 28;
+    default:
+        return 0;
+    }
+}
+
+/* Builds the frame word and common prefix of a control frame into out (FRAME_HEADER + CTRL_PREFIX bytes). */
+static void ctrl_prefix(uint8_t *out, uint32_t payload, uint8_t type, uint8_t aop, uint64_t id) {
+    put_le32(out, CTRL_FLAG | payload);
+    out[4] = type;
+    out[5] = aop;
+    out[6] = 0;
+    out[7] = 0;
+    put_le64(out + 8, id);
+}
+
+/* Sends a response with status and optional trailing data or value. */
+static int send_resp(struct tcp_ep *e, uint8_t type, uint64_t id, uint32_t status, const void *data, size_t n,
+                     const uint64_t *value) {
+    uint8_t f[FRAME_HEADER + 28];
+    size_t fixed = ctrl_fixed(type);
+    ctrl_prefix(f, (uint32_t)(fixed + n), type, 0, id);
+    put_le32(f + FRAME_HEADER + 12, status);
+    put_le32(f + FRAME_HEADER + 16, 0);
+    if (value != NULL) {
+        put_le64(f + FRAME_HEADER + 20, *value);
+    }
+    return emit(e, f, FRAME_HEADER + fixed, data, n, NULL, 0);
+}
+
+/* Head of the outstanding-operation FIFO, or NULL. */
+static struct pending_op *op_head(struct tcp_ep *e) {
+    return e->ocount > 0 ? &e->ops[e->ohead] : NULL;
+}
+
+static void op_pop(struct tcp_ep *e) {
+    e->done = e->ops[e->ohead].done_seq;
+    e->ohead = (e->ohead + 1) % e->send_depth;
+    e->ocount--;
+}
+
+/*
+ * Handles the fixed part of a control frame (in e->ctl). Sets up the body phase for READ_RESP and
+ * WRITE_REQ. Returns 0 or a sticky error.
+ */
+static int ctrl_fixed_done(struct tcp_ep *e) {
+    uint8_t type = e->ctl[0];
+    uint64_t id = get_le64(e->ctl + 4);
+    const uint8_t *f = e->ctl + CTRL_PREFIX;
+    size_t extra = e->flen - ctrl_fixed(type);
+    switch (type) {
+    case CT_READ_REQ: {
+        uint64_t addr = get_le64(f);
+        uint32_t key = get_le32(f + 8);
+        uint32_t len = get_le32(f + 12);
+        if (extra != 0) {
+            return DUCT_EPROTO;
+        }
+        uint8_t *src = duct_mr_resolve(e->base.ctx, key, addr, len, DUCT_ACCESS_REMOTE_READ);
+        int rc = send_resp(e, CT_READ_RESP, id, src != NULL ? 0 : 1, src, src != NULL ? len : 0, NULL);
+        e->rxs = RX_HDR;
+        return rc;
+    }
+    case CT_WRITE_REQ: {
+        uint64_t addr = get_le64(f);
+        uint32_t key = get_le32(f + 8);
+        uint32_t len = get_le32(f + 12);
+        if (extra != len) {
+            return DUCT_EPROTO;
+        }
+        e->body = duct_mr_resolve(e->base.ctx, key, addr, len, DUCT_ACCESS_REMOTE_WRITE);
+        e->body_ok = e->body != NULL;
+        e->body_len = len;
+        e->body_off = 0;
+        e->rxs = RX_CTRL_BODY;
+        return 0;
+    }
+    case CT_ATOMIC_REQ: {
+        uint64_t addr = get_le64(f);
+        uint32_t key = get_le32(f + 8);
+        uint64_t a = get_le64(f + 16);
+        uint64_t b = get_le64(f + 24);
+        if (extra != 0) {
+            return DUCT_EPROTO;
+        }
+        uint8_t *p = duct_mr_resolve(e->base.ctx, key, addr, 8, DUCT_ACCESS_REMOTE_ATOMIC);
+        uint64_t old = 0;
+        uint32_t status = 1;
+        if (p != NULL && ((uintptr_t)p & 7u) == 0) {
+            uint64_t *w = (uint64_t *)p;
+            if (e->ctl[1] == DUCT_RMA_FADD) {
+                old = __atomic_fetch_add(w, a, __ATOMIC_SEQ_CST);
+                status = 0;
+            } else if (e->ctl[1] == DUCT_RMA_CSWAP) {
+                old = a;
+                __atomic_compare_exchange_n(w, &old, b, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+                status = 0;
+            } else {
+                return DUCT_EPROTO;
+            }
+        }
+        e->rxs = RX_HDR;
+        return send_resp(e, CT_ATOMIC_RESP, id, status, NULL, 0, &old);
+    }
+    case CT_READ_RESP:
+    case CT_WRITE_RESP:
+    case CT_ATOMIC_RESP: {
+        struct pending_op *op = op_head(e);
+        enum duct_rma_op want = type == CT_READ_RESP    ? DUCT_RMA_READ
+                                : type == CT_WRITE_RESP ? DUCT_RMA_WRITE
+                                                        : 0;
+        if (op == NULL || op->seq != id || (want != 0 && op->op != want) ||
+            (want == 0 && op->op != DUCT_RMA_FADD && op->op != DUCT_RMA_CSWAP)) {
+            return DUCT_EPROTO;
+        }
+        uint32_t status = get_le32(f);
+        if (status != 0) {
+            return extra == 0 ? DUCT_EACCESS : DUCT_EPROTO;
+        }
+        if (type == CT_READ_RESP) {
+            if (extra != op->len) {
+                return DUCT_EPROTO;
+            }
+            e->body = op->laddr;
+            e->body_ok = 1;
+            e->body_len = op->len;
+            e->body_off = 0;
+            e->rxs = RX_CTRL_BODY;
+            return 0;
+        }
+        if (extra != 0) {
+            return DUCT_EPROTO;
+        }
+        if (type == CT_ATOMIC_RESP) {
+            uint64_t v = get_le64(f + 8);
+            memcpy(op->laddr, &v, sizeof(v));
+        }
+        op_pop(e);
+        e->rxs = RX_HDR;
+        return 0;
+    }
+    default:
+        return DUCT_EPROTO;
+    }
+}
+
+/* Handles the end of a control body. */
+static int ctrl_body_done(struct tcp_ep *e) {
+    e->rxs = RX_HDR;
+    if (e->ctl[0] == CT_WRITE_REQ) {
+        return send_resp(e, CT_WRITE_RESP, get_le64(e->ctl + 4), e->body_ok ? 0 : 1, NULL, 0, NULL);
+    }
+    op_pop(e); /* READ_RESP */
+    return 0;
+}
+
+/*
+ * Reads and processes frames as far as the socket allows without blocking. Returns 1 if anything was
+ * read, 0 if nothing was available (or a data frame waits for a free slot), or a sticky error.
+ */
+static int pump(struct tcp_ep *e) {
+    int any = 0;
+    uint8_t discard[512];
+    for (;;) {
+        if (e->broken != 0) {
+            return e->broken;
+        }
+        ssize_t r = 0;
+        int rc = 0;
+        switch (e->rxs) {
+        case RX_HDR:
+            r = read_some(e, e->hdr + e->hdr_off, FRAME_HEADER - e->hdr_off);
+            if (r <= 0) {
+                break;
+            }
+            e->hdr_off += (size_t)r;
+            any = 1;
+            if (e->hdr_off < FRAME_HEADER) {
+                continue;
+            }
+            e->hdr_off = 0;
+            uint32_t word = get_le32(e->hdr);
+            if (word & CTRL_FLAG) {
+                e->flen = word & ~CTRL_FLAG;
+                e->ctl_off = 0;
+                e->ctl_need = 0;
+                if (e->flen < CTRL_PREFIX) {
+                    rc = DUCT_EPROTO;
+                    break;
+                }
+                e->rxs = RX_CTRL;
+            } else {
+                if (word > e->max_msg) {
+                    rc = DUCT_EPROTO;
+                    break;
+                }
+                e->flen = word;
+                e->cur = UINT32_MAX;
+                e->data_off = 0;
+                e->rxs = RX_DATA;
+            }
+            r = 1;
+            break;
+        case RX_DATA:
+            if (e->cur == UINT32_MAX) {
+                e->cur = slot_take(e);
+                if (e->cur == UINT32_MAX) {
+                    return any; /* all slots in use: wait for a release */
+                }
+                e->slot_state[e->cur] = SLOT_HELD; /* reserved while being filled */
+            }
+            r = e->flen > e->data_off ? read_some(e, e->slot_buf[e->cur] + e->data_off, e->flen - e->data_off)
+                                      : 1;
+            if (r <= 0) {
+                break;
+            }
+            if (e->flen > e->data_off) {
+                e->data_off += (size_t)r;
+            }
+            if (e->data_off == e->flen) {
+                e->slot_state[e->cur] = SLOT_READY;
+                e->slot_len[e->cur] = e->flen;
+                e->ready[(e->rhead + e->rcount) % e->nslots] = e->cur;
+                e->rcount++;
+                e->rxs = RX_HDR;
+            }
+            break;
+        case RX_CTRL:
+            if (e->ctl_need == 0) {
+                /* the type byte decides the fixed size */
+                r = read_some(e, e->ctl, 1);
+                if (r <= 0) {
+                    break;
+                }
+                any = 1;
+                e->ctl_off = 1;
+                e->ctl_need = ctrl_fixed(e->ctl[0]);
+                if (e->ctl_need == 0 || e->flen < e->ctl_need) {
+                    rc = DUCT_EPROTO;
+                    break;
+                }
+            }
+            r = e->ctl_off < e->ctl_need ? read_some(e, e->ctl + e->ctl_off, e->ctl_need - e->ctl_off) : 1;
+            if (r <= 0) {
+                break;
+            }
+            if (e->ctl_off < e->ctl_need) {
+                e->ctl_off += (size_t)r;
+            }
+            if (e->ctl_off == e->ctl_need) {
+                rc = ctrl_fixed_done(e);
+            }
+            break;
+        case RX_CTRL_BODY:
+            if (e->body_off == e->body_len) {
+                rc = ctrl_body_done(e);
+                r = 1;
+                break;
+            }
+            if (e->body_ok) {
+                r = read_some(e, e->body + e->body_off, e->body_len - e->body_off);
+            } else {
+                size_t n = e->body_len - e->body_off;
+                r = read_some(e, discard, n < sizeof(discard) ? n : sizeof(discard));
+            }
+            if (r > 0) {
+                e->body_off += (size_t)r;
+                if (e->body_off == e->body_len) {
+                    rc = ctrl_body_done(e);
+                }
+            }
+            break;
+        }
+        if (rc == 0 && r < 0) {
+            rc = (int)r;
+        }
+        if (rc != 0) {
+            e->broken = rc;
+            return rc;
+        }
+        if (r == 0) {
+            return any;
+        }
+        any = 1;
+    }
+}
+
+/* One non-blocking round of work. Returns 1 if anything happened, 0 if not, or a sticky error. */
+static int work(struct tcp_ep *e) {
+    size_t before = queued(e);
+    int rc = q_flush(e);
+    if (rc != 0) {
+        return rc;
+    }
+    rc = pump(e);
+    if (rc < 0) {
+        return rc;
+    }
+    if (queued(e) > 0) {
+        int frc = q_flush(e);
+        if (frc != 0) {
+            return frc;
+        }
+    }
+    return rc > 0 || queued(e) < before;
+}
+
+/* Blocks until the socket is readable (if reading can progress), writable (if data is queued), or the
+ * deadline passes. */
+static int wait_io(struct tcp_ep *e, int64_t deadline) {
+    short ev = 0;
+    if (!(e->rxs == RX_DATA && e->cur == UINT32_MAX)) {
+        ev |= POLLIN;
+    }
+    if (queued(e) > 0) {
+        ev |= POLLOUT;
+    }
+    if (ev == 0) {
+        /* Nothing can progress until the application releases a message; sleep to the deadline. */
+        int left = duct_remaining_ms(deadline);
+        if (left != 0) {
+            struct pollfd none;
+            poll(&none, 0, left < 0 || left > 10 ? 10 : left);
+        }
+        return deadline >= 0 && duct_remaining_ms(deadline) == 0 ? -ETIMEDOUT : 0;
+    }
+    int rc = wait_fd(e->fd, ev, deadline);
+    return rc == -ETIMEDOUT ? -ETIMEDOUT : rc;
+}
+
+/* ---- endpoint operations --------------------------------------------------------------------------- */
+
 static void tcp_ep_free(struct tcp_ep *e) {
     if (e->fd >= 0) {
         close(e->fd);
     }
-    free(e->rx_buf);
-    free(e->tx_buf);
+    if (e->epfd >= 0) {
+        close(e->epfd);
+    }
+    if (e->slot_buf != NULL) {
+        for (uint32_t i = 0; i < e->nslots; i++) {
+            free(e->slot_buf[i]);
+        }
+    }
+    free(e->slot_buf);
+    free(e->slot_len);
+    free(e->slot_state);
+    free(e->ready);
+    free(e->ops);
+    free(e->q);
     free(e);
+}
+
+/* Waits until a frame of `need` bytes fits into the send queue limit. */
+static int wait_send_space(struct tcp_ep *e, size_t need, int64_t deadline) {
+    while (queued(e) > 0 && queued(e) + need > e->qlimit) {
+        int rc = work(e);
+        if (rc < 0) {
+            return rc;
+        }
+        if (queued(e) == 0 || queued(e) + need <= e->qlimit) {
+            break;
+        }
+        if (deadline >= 0 && duct_remaining_ms(deadline) == 0) {
+            return -ETIMEDOUT;
+        }
+        rc = wait_io(e, deadline);
+        if (rc != 0 && rc != -ETIMEDOUT) {
+            return rc;
+        }
+    }
+    return 0;
 }
 
 static int tcp_send(duct_ep *base, const void *data, size_t len, int timeout_ms) {
@@ -121,20 +776,13 @@ static int tcp_send(duct_ep *base, const void *data, size_t len, int timeout_ms)
     if (e->broken != 0) {
         return e->broken;
     }
-    uint8_t *f = e->tx_buf;
-    f[0] = (uint8_t)len;
-    f[1] = (uint8_t)(len >> 8);
-    f[2] = (uint8_t)(len >> 16);
-    f[3] = (uint8_t)(len >> 24);
-    if (len > 0) {
-        memcpy(f + FRAME_HEADER, data, len);
+    int rc = wait_send_space(e, FRAME_HEADER + len, duct_deadline(timeout_ms));
+    if (rc != 0) {
+        return rc;
     }
-    size_t sent;
-    int rc = write_full(e->fd, f, FRAME_HEADER + len, &sent, duct_deadline(timeout_ms));
-    if (rc != 0 && sent > 0) {
-        e->broken = rc == -ETIMEDOUT ? -ECONNABORTED : rc;
-    }
-    return rc;
+    uint8_t h[FRAME_HEADER];
+    put_le32(h, (uint32_t)len);
+    return emit(e, h, sizeof(h), data, len, NULL, 0);
 }
 
 static int tcp_send_batch(duct_ep *base, const struct duct_msg *msgs, unsigned n, int timeout_ms) {
@@ -147,56 +795,231 @@ static int tcp_send_batch(duct_ep *base, const struct duct_msg *msgs, unsigned n
     return 0;
 }
 
-static int tcp_recv(duct_ep *base, struct duct_rx *rx, int timeout_ms) {
+static int tcp_send_mr(duct_ep *base, const duct_mr *mr, size_t off, size_t len, int timeout_ms,
+                       uint64_t *seq) {
+    struct tcp_ep *e = (struct tcp_ep *)base;
+    int rc = tcp_send(base, mr->addr + off, len, timeout_ms);
+    if (rc != 0) {
+        return rc;
+    }
+    /* The frame was written or copied into the send queue: the region is reusable at once. */
+    e->posted++;
+    if (e->ocount == 0) {
+        e->done = e->posted;
+    } else {
+        /* Completion order is posting order: complete together with the operations ahead of it. */
+        e->ops[(e->ohead + e->ocount - 1) % e->send_depth].done_seq = e->posted;
+    }
+    if (seq != NULL) {
+        *seq = e->posted;
+    }
+    return 0;
+}
+
+static int tcp_rma(duct_ep *base, const struct duct_rma *op, int timeout_ms, uint64_t *seq) {
     struct tcp_ep *e = (struct tcp_ep *)base;
     if (e->broken != 0) {
         return e->broken;
     }
-    if (e->rx_busy) {
-        return -EBUSY;
-    }
     int64_t deadline = duct_deadline(timeout_ms);
-    int rc = read_full(e->fd, e->rx_buf, &e->rx_off, FRAME_HEADER, deadline);
-    if (rc != 0) {
-        if (rc != -ETIMEDOUT) {
-            e->broken = rc;
+    while (e->ocount == e->send_depth) {
+        int rc = work(e);
+        if (rc < 0) {
+            return rc;
         }
+        if (e->ocount < e->send_depth) {
+            break;
+        }
+        if (deadline >= 0 && duct_remaining_ms(deadline) == 0) {
+            return -ETIMEDOUT;
+        }
+        rc = wait_io(e, deadline);
+        if (rc != 0 && rc != -ETIMEDOUT) {
+            return rc;
+        }
+    }
+    size_t body = op->op == DUCT_RMA_WRITE ? op->len : 0;
+    int rc = wait_send_space(e, FRAME_HEADER + CTRL_MAX_FIXED + body, deadline);
+    if (rc != 0) {
         return rc;
     }
-    uint32_t len = (uint32_t)e->rx_buf[0] | ((uint32_t)e->rx_buf[1] << 8) | ((uint32_t)e->rx_buf[2] << 16) |
-                   ((uint32_t)e->rx_buf[3] << 24);
-    if (len > e->max_msg) {
-        e->broken = DUCT_EPROTO;
-        return DUCT_EPROTO;
+    uint64_t id = e->posted + 1;
+    uint8_t f[FRAME_HEADER + CTRL_MAX_FIXED];
+    uint8_t *p = f + FRAME_HEADER + CTRL_PREFIX;
+    size_t fixed;
+    if (op->op == DUCT_RMA_READ || op->op == DUCT_RMA_WRITE) {
+        uint8_t type = op->op == DUCT_RMA_READ ? CT_READ_REQ : CT_WRITE_REQ;
+        fixed = ctrl_fixed(type);
+        ctrl_prefix(f, (uint32_t)(fixed + body), type, 0, id);
+        put_le64(p, op->raddr);
+        put_le32(p + 8, op->rkey);
+        put_le32(p + 12, (uint32_t)op->len);
+    } else {
+        fixed = ctrl_fixed(CT_ATOMIC_REQ);
+        ctrl_prefix(f, (uint32_t)fixed, CT_ATOMIC_REQ, (uint8_t)op->op, id);
+        put_le64(p, op->raddr);
+        put_le32(p + 8, op->rkey);
+        put_le32(p + 12, 0);
+        put_le64(p + 16, op->a);
+        put_le64(p + 24, op->b);
     }
-    rc = read_full(e->fd, e->rx_buf, &e->rx_off, FRAME_HEADER + len, deadline);
+    rc = emit(e, f, FRAME_HEADER + fixed, op->op == DUCT_RMA_WRITE ? op->laddr : NULL, body, NULL, 0);
     if (rc != 0) {
-        if (rc != -ETIMEDOUT) {
-            e->broken = rc;
-        }
         return rc;
     }
-    e->rx_busy = 1;
-    rx->data = e->rx_buf + FRAME_HEADER;
-    rx->len = len;
-    rx->token = 0;
+    e->posted = id;
+    e->ops[(e->ohead + e->ocount) % e->send_depth] =
+        (struct pending_op){.seq = id, .done_seq = id, .op = op->op, .laddr = op->laddr, .len = op->len};
+    e->ocount++;
+    if (seq != NULL) {
+        *seq = id;
+    }
     return 0;
+}
+
+static uint64_t tcp_completed(duct_ep *base) {
+    struct tcp_ep *e = (struct tcp_ep *)base;
+    if (e->broken == 0) {
+        work(e);
+    }
+    return e->done;
+}
+
+static int tcp_wait(duct_ep *base, uint64_t seq, int timeout_ms) {
+    struct tcp_ep *e = (struct tcp_ep *)base;
+    int64_t deadline = duct_deadline(timeout_ms);
+    for (;;) {
+        if (e->done >= seq) {
+            return 0;
+        }
+        int rc = work(e);
+        if (rc < 0) {
+            return rc;
+        }
+        if (e->done >= seq) {
+            return 0;
+        }
+        if (rc > 0) {
+            continue;
+        }
+        if (deadline >= 0 && duct_remaining_ms(deadline) == 0) {
+            return -ETIMEDOUT;
+        }
+        rc = wait_io(e, deadline);
+        if (rc != 0 && rc != -ETIMEDOUT) {
+            return rc;
+        }
+    }
+}
+
+static int tcp_recv(duct_ep *base, struct duct_rx *rx, int timeout_ms) {
+    struct tcp_ep *e = (struct tcp_ep *)base;
+    int64_t deadline = duct_deadline(timeout_ms);
+    for (;;) {
+        if (e->rcount > 0 && e->held < e->recv_depth) {
+            uint32_t s = e->ready[e->rhead];
+            e->rhead = (e->rhead + 1) % e->nslots;
+            e->rcount--;
+            e->slot_state[s] = SLOT_HELD;
+            e->held++;
+            rx->data = e->slot_buf[s];
+            rx->len = e->slot_len[s];
+            rx->token = s;
+            return 0;
+        }
+        if (e->broken != 0) {
+            return e->broken; /* messages received before the failure were delivered first */
+        }
+        int rc = work(e);
+        if (rc < 0) {
+            if (e->rcount > 0 && e->held < e->recv_depth) {
+                continue;
+            }
+            return rc;
+        }
+        if (rc > 0) {
+            continue;
+        }
+        if (deadline >= 0 && duct_remaining_ms(deadline) == 0) {
+            return -ETIMEDOUT;
+        }
+        rc = wait_io(e, deadline);
+        if (rc != 0 && rc != -ETIMEDOUT) {
+            e->broken = rc;
+            return rc;
+        }
+    }
 }
 
 static int tcp_release(duct_ep *base, struct duct_rx *rx) {
     struct tcp_ep *e = (struct tcp_ep *)base;
-    if (!e->rx_busy) {
+    if (rx->data == NULL || rx->token >= e->nslots || e->slot_state[rx->token] != SLOT_HELD ||
+        rx->data != e->slot_buf[rx->token]) {
         return -EINVAL;
     }
-    e->rx_busy = 0;
-    e->rx_off = 0;
+    e->slot_state[rx->token] = SLOT_FREE;
+    e->held--;
     rx->data = NULL;
     rx->len = 0;
     return 0;
 }
 
+static int tcp_progress(duct_ep *base) {
+    struct tcp_ep *e = (struct tcp_ep *)base;
+    int rc = work(e);
+    return rc < 0 ? rc : 0;
+}
+
+static int tcp_fd(const duct_ep *base) {
+    return ((const struct tcp_ep *)base)->epfd;
+}
+
+static int tcp_arm(duct_ep *base) {
+    struct tcp_ep *e = (struct tcp_ep *)base;
+    int rc = work(e);
+    if (rc < 0) {
+        return -EAGAIN; /* the error is reported by the next call */
+    }
+    if (rc > 0 || (e->rcount > 0 && e->held < e->recv_depth)) {
+        return -EAGAIN;
+    }
+    /* While every receive slot is in use the socket is not watched: only a release can make progress. */
+    int slot_blocked = e->rxs == RX_DATA && e->cur == UINT32_MAX;
+    uint32_t mask = (slot_blocked ? 0 : EPOLLIN) | (queued(e) > 0 ? EPOLLOUT : 0);
+    if (mask != e->epmask) {
+        struct epoll_event ev = {.events = mask, .data.fd = e->fd};
+        if (epoll_ctl(e->epfd, EPOLL_CTL_MOD, e->fd, &ev) != 0) {
+            return -errno;
+        }
+        e->epmask = mask;
+    }
+    return 0;
+}
+
+static unsigned tcp_send_space(duct_ep *base) {
+    struct tcp_ep *e = (struct tcp_ep *)base;
+    if (e->broken != 0) {
+        return 0;
+    }
+    q_flush(e);
+    if (queued(e) == 0) {
+        return e->send_depth;
+    }
+    size_t frame = FRAME_HEADER + (size_t)e->base.peer_max_msg;
+    return queued(e) >= e->qlimit ? 0 : (unsigned)((e->qlimit - queued(e)) / frame);
+}
+
 static void tcp_close(duct_ep *base) {
-    tcp_ep_free((struct tcp_ep *)base);
+    struct tcp_ep *e = (struct tcp_ep *)base;
+    /* Deliver queued data before closing, as the RDMA transport waits for sends in flight. */
+    int64_t deadline = duct_deadline(CLOSE_FLUSH_MS);
+    while (e->broken == 0 && queued(e) > 0 && duct_remaining_ms(deadline) > 0) {
+        if (q_flush(e) != 0 || queued(e) == 0) {
+            break;
+        }
+        wait_fd(e->fd, POLLOUT, deadline);
+    }
+    tcp_ep_free(e);
 }
 
 static const struct duct_ep_ops tcp_ep_ops = {
@@ -205,6 +1028,14 @@ static const struct duct_ep_ops tcp_ep_ops = {
     .recv = tcp_recv,
     .release = tcp_release,
     .close = tcp_close,
+    .fd = tcp_fd,
+    .arm = tcp_arm,
+    .progress = tcp_progress,
+    .send_space = tcp_send_space,
+    .send_mr = tcp_send_mr,
+    .rma = tcp_rma,
+    .completed = tcp_completed,
+    .wait = tcp_wait,
 };
 
 /* Exchanges handshakes on a connected, non-blocking socket and builds the endpoint. */
@@ -219,8 +1050,7 @@ static int tcp_ep_create(duct_ctx *ctx, int fd, int64_t deadline, duct_ep **out)
     uint8_t hello[DUCT_HELLO_SIZE];
     struct duct_hello mine = {.max_msg = ctx->opts.max_msg, .recv_depth = ctx->opts.recv_depth};
     duct_hello_encode(&mine, hello);
-    size_t sent;
-    rc = write_full(fd, hello, sizeof(hello), &sent, deadline);
+    rc = write_full(fd, hello, sizeof(hello), deadline);
     size_t got = 0;
     if (rc == 0) {
         rc = read_full(fd, hello, &got, sizeof(hello), deadline);
@@ -243,13 +1073,31 @@ static int tcp_ep_create(duct_ctx *ctx, int fd, int64_t deadline, duct_ep **out)
     /* The effective send limit is the smaller of both sides' limits (same rule as the RDMA transport). */
     e->base.peer_max_msg = theirs.max_msg < ctx->opts.max_msg ? theirs.max_msg : ctx->opts.max_msg;
     e->fd = fd;
+    e->epfd = -1;
     e->max_msg = ctx->opts.max_msg;
-    e->rx_buf = malloc(FRAME_HEADER + (size_t)e->max_msg);
-    e->tx_buf = malloc(FRAME_HEADER + (size_t)e->base.peer_max_msg);
-    if (e->rx_buf == NULL || e->tx_buf == NULL) {
+    e->recv_depth = ctx->opts.recv_depth;
+    e->send_depth = ctx->opts.send_depth;
+    e->nslots = 2 * e->recv_depth;
+    e->qlimit = (size_t)e->send_depth * (FRAME_HEADER + (size_t)e->base.peer_max_msg);
+    e->slot_buf = calloc(e->nslots, sizeof(*e->slot_buf));
+    e->slot_len = calloc(e->nslots, sizeof(*e->slot_len));
+    e->slot_state = calloc(e->nslots, sizeof(*e->slot_state));
+    e->ready = calloc(e->nslots, sizeof(*e->ready));
+    e->ops = calloc(e->send_depth, sizeof(*e->ops));
+    e->epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (e->slot_buf == NULL || e->slot_len == NULL || e->slot_state == NULL || e->ready == NULL ||
+        e->ops == NULL || e->epfd < 0) {
+        rc = e->epfd < 0 ? -errno : -ENOMEM;
         tcp_ep_free(e);
-        return -ENOMEM;
+        return rc;
     }
+    struct epoll_event ev = {.events = EPOLLIN, .data.fd = fd};
+    if (epoll_ctl(e->epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
+        rc = -errno;
+        tcp_ep_free(e);
+        return rc;
+    }
+    e->epmask = EPOLLIN;
     *out = &e->base;
     return 0;
 }
@@ -310,6 +1158,10 @@ static int tcp_listener_port(const duct_listener *base) {
     return ((const struct tcp_listener *)base)->port;
 }
 
+static int tcp_listener_fd(const duct_listener *base) {
+    return ((const struct tcp_listener *)base)->fd;
+}
+
 static void tcp_listener_close(duct_listener *base) {
     struct tcp_listener *l = (struct tcp_listener *)base;
     close(l->fd);
@@ -320,6 +1172,7 @@ static const struct duct_listener_ops tcp_listener_ops = {
     .accept = tcp_listener_accept,
     .port = tcp_listener_port,
     .close = tcp_listener_close,
+    .fd = tcp_listener_fd,
 };
 
 int duct_tcp_listen(duct_ctx *ctx, const char *addr, const char *port, duct_listener **out) {

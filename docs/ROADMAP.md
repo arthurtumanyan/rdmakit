@@ -7,7 +7,7 @@ developed further. Dates refer to the history of this repository.
 
 | Area | Done | Open |
 |---|---|---|
-| rdmaduct | RDMA and TCP transports, credit-based flow control, batching, event-driven waiting, graceful close, fault injection and fuzzing of handshake and framing | zero-copy send, one-sided operations, connection reuse after errors, coverage-guided fuzzing |
+| rdmaduct | RDMA and TCP transports, credit-based flow control, batching, event-driven waiting, graceful close, pollable descriptors, registered regions, zero-copy send, one-sided read/write and atomics (emulated on TCP), fault injection and fuzzing of handshake, framing and control frames | GPU memory, multiple devices, TCP progress thread, coverage-guided fuzzing |
 | kvpace | closed and open loop, Zipfian and uniform keys, KV-cache scenario, RESP, memcached and native drivers, server CPU sampling | multiplexed connections per thread, trace replay, distributed generation |
 | arenakv | engine, server, client, in-place overwrite, tests under three sanitizers | worker-per-core serving, zero-copy GET from registered memory, one-sided GET, index growth, persistence |
 | benchmarks | orchestrator, environment capture, figures, tables, claim verification | runs on RDMA hardware, runs with the `performance` CPU governor, cross-host runs |

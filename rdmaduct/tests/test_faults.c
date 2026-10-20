@@ -2,7 +2,8 @@
  * test_faults.c - fault injection and failure-handling tests.
  *
  * TCP framing and handshake are attacked through a raw socket that speaks the wire protocol by hand:
- * oversize frames, frames split across pauses, truncation, garbage handshakes, random byte streams.
+ * oversize frames, frames split across pauses, truncation, garbage handshakes, random byte streams, and
+ * random control frames (emulated one-sided requests and unsolicited responses).
  * Transport-independent behavior (accept timeout, refused connections, asymmetric limits, abrupt
  * close in both wait modes, connect/disconnect cycles without descriptor leaks) runs on TCP and, when
  * DUCT_TEST_ADDR is set, on RDMA.
@@ -282,6 +283,102 @@ static void test_tcp_fuzz(duct_ctx *ctx) {
     duct_listener_close(l);
 }
 
+/*
+ * Control-frame fuzz: after a valid handshake the raw peer sends frames with bit 31 set, a random or
+ * valid type byte, valid or random lengths, and random fields (keys that name no region, responses that
+ * match no request). The library must answer requests with error responses or reject the stream; only
+ * DUCT_EPROTO, DUCT_ECLOSED or a delivered data frame are acceptable outcomes. A registered region exists
+ * so that some requests with the right key succeed.
+ */
+static void test_tcp_ctrl_fuzz(duct_ctx *ctx) {
+    duct_listener *l;
+    EXPECT(duct_listen(ctx, "127.0.0.1", "0", &l) == 0, "listen");
+    int port = duct_listener_port(l);
+    static uint64_t region[64];
+    duct_mr *mr;
+    EXPECT(duct_mr_reg(ctx, region, sizeof(region),
+                       DUCT_ACCESS_REMOTE_READ | DUCT_ACCESS_REMOTE_WRITE | DUCT_ACCESS_REMOTE_ATOMIC,
+                       &mr) == 0,
+           "register fuzz region");
+    struct duct_mr_desc md;
+    duct_mr_export(mr, &md);
+    struct duct_desc d;
+    duct_desc_decode(&md, &d);
+    static const uint32_t fixed[7] = {0, 28, 20, 28, 20, 44, 28};
+    unsigned seed = 777;
+    int answered = 0;
+    int rejected = 0;
+    for (int iter = 0; iter < 1500; iter++) {
+        struct accept_result a = {.l = l};
+        pthread_t th;
+        pthread_create(&th, NULL, accept_thread, &a);
+        int raw = raw_connect(port);
+        raw_handshake(raw, MAX_MSG);
+        pthread_join(th, NULL);
+        if (a.rc != 0) {
+            EXPECT(0, "ctrl fuzz accept: %s", duct_strerror(a.rc));
+            close(raw);
+            continue;
+        }
+        uint8_t f[4 + 64 + 64];
+        seed = seed * 1664525u + 1013904223u;
+        uint8_t type = (uint8_t)((seed >> 24) % 8);
+        seed = seed * 1664525u + 1013904223u;
+        for (size_t i = 4; i < sizeof(f); i++) {
+            seed = seed * 1664525u + 1013904223u;
+            f[i] = (uint8_t)(seed >> 24);
+        }
+        uint32_t body = (type == 3) ? (seed >> 8) % 64 : 0;
+        uint32_t len = (type >= 1 && type <= 6 && (iter % 3) != 0) ? fixed[type] + body : (seed >> 4) % 100;
+        f[4] = type;
+        f[5] = (uint8_t)(3 + (seed >> 20) % 2); /* FADD or CSWAP */
+        if ((iter % 4) == 1) {
+            /* plausible request on the registered region */
+            uint64_t addr = d.addr + ((seed >> 12) % 16) * 8;
+            for (int k = 0; k < 8; k++) {
+                f[4 + 12 + k] = (uint8_t)(addr >> (8 * k));
+            }
+            for (int k = 0; k < 4; k++) {
+                f[4 + 20 + k] = (uint8_t)(d.key >> (8 * k));
+            }
+            uint32_t n = type == 3 ? body : 8;
+            for (int k = 0; k < 4; k++) {
+                f[4 + 24 + k] = (uint8_t)(n >> (8 * k));
+            }
+        }
+        uint32_t word = 0x80000000u | len;
+        f[0] = (uint8_t)word;
+        f[1] = (uint8_t)(word >> 8);
+        f[2] = (uint8_t)(word >> 16);
+        f[3] = (uint8_t)(word >> 24);
+        size_t n = 4 + (len < sizeof(f) - 4 ? len : sizeof(f) - 4);
+        raw_write(raw, f, n);
+        /* Give the library time to answer, then read and discard whatever it sent. */
+        for (int guard = 0; guard < 8; guard++) {
+            int rc = duct_progress(a.ep);
+            if (rc != 0) {
+                EXPECT(rc == DUCT_EPROTO || rc == DUCT_ECLOSED, "ctrl fuzz outcome %s", duct_strerror(rc));
+                rejected += rc == DUCT_EPROTO;
+                break;
+            }
+            struct pollfd pfd = {.fd = raw, .events = POLLIN};
+            if (poll(&pfd, 1, 5) > 0) {
+                uint8_t sink[4096];
+                if (read(raw, sink, sizeof(sink)) > 0) {
+                    answered++;
+                    break;
+                }
+            }
+        }
+        close(raw);
+        duct_ep_close(a.ep);
+    }
+    printf("ctrl fuzz: %d answered, %d rejected\n", answered, rejected);
+    EXPECT(answered > 0 && rejected > 0, "ctrl fuzz exercised both answers and rejections");
+    duct_mr_dereg(mr);
+    duct_listener_close(l);
+}
+
 /* ---- transport-independent tests ----------------------------------------------------------------- */
 
 static void test_connect_refused(duct_ctx *ctx, const char *addr) {
@@ -468,6 +565,7 @@ int main(void) {
     test_tcp_truncated(tcp);
     test_tcp_bad_handshakes(tcp);
     test_tcp_fuzz(tcp);
+    test_tcp_ctrl_fuzz(tcp);
     test_connect_refused(tcp, "127.0.0.1");
     duct_ctx_destroy(tcp);
 

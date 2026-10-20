@@ -30,11 +30,22 @@
  * reliable-connection completions are ordered, so a signaled completion releases every earlier slot.
  * Payloads up to max_inline bytes are sent inline and are not copied into the arena.
  *
- * Wait modes. In polling mode a blocked call spins on the completion queue. In event mode the
- * completion queue is bound to a completion channel; a blocked call arms the queue, re-checks it to
- * close the race with completions that arrived before arming, and sleeps in ppoll() on the channel
- * and on the connection-manager channel. Credit-word updates raise no completion, so a call blocked
- * on credits wakes every CREDIT_RECHECK_NS to read the word.
+ * Wait modes. In polling mode a blocked call spins on the completion queue. In event mode a blocked call
+ * arms the completion queue, re-checks it to close the race with completions that arrived before arming,
+ * and sleeps in ppoll() on the completion channel and on the connection-manager channel. Credit-word
+ * updates raise no completion, so a call blocked on credits wakes every CREDIT_RECHECK_NS to read the
+ * word.
+ *
+ * Event-loop descriptor. Every endpoint has a completion channel (in both wait modes) and an epoll
+ * descriptor that contains the channel, the connection-manager channel and a timerfd. duct_ep_arm()
+ * arms the completion queue and, while a sender is blocked on credits or a disconnect grace period
+ * runs, the timer, which replaces the timed re-check of the blocking event mode.
+ *
+ * Posted operations. Zero-copy sends, RDMA READ/WRITE and atomics occupy one send ring slot each and are
+ * always signaled. slot_seq records the sequence number of the operation in a slot; reclaiming a slot
+ * advances the completed sequence number. Reliable-connection send queues complete in order, so the
+ * number is cumulative. Remote access violations complete with an error status and fail the endpoint
+ * with DUCT_EACCESS.
  *
  * Device binding: the context binds to the device of the first connection (protection domain
  * allocated once). Connections on other devices are rejected with DUCT_ENODEV.
@@ -49,7 +60,9 @@
 #include <rdma/rdma_cma.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/mman.h>
+#include <sys/timerfd.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -63,6 +76,8 @@
 #define CREDIT_PAGE 4096u
 #define CREDIT_RECHECK_NS 200000L
 #define CLOSE_GRACE_MS 3
+/* Upper bound for outstanding RDMA READ and atomic operations per connection (negotiated with the device). */
+#define MAX_RD_ATOM 16
 
 struct rdma_dev {
     pthread_mutex_t lock;
@@ -80,7 +95,11 @@ struct rdma_ep {
     struct rdma_event_channel *ec;
     struct rdma_cm_id *id;
     struct ibv_cq *cq;
-    struct ibv_comp_channel *chan; /* event mode only */
+    struct ibv_comp_channel *chan;
+    int epfd; /* event-loop descriptor: chan, ec and tfd */
+    int tfd;  /* timerfd for credit re-checks and the disconnect grace period */
+    int timer_armed;
+    uint8_t rd_atom; /* outstanding READ/atomic operations negotiated for this connection */
     struct ibv_mr *arena_mr;
     struct ibv_mr *credit_mr;
     uint8_t *map;
@@ -99,6 +118,11 @@ struct rdma_ep {
     uint32_t send_inflight;
     uint32_t since_signal;
     uint32_t signal_interval;
+    uint64_t
+        *slot_seq;   /* sequence number of the posted operation in each send slot, 0 for internal requests */
+    uint64_t posted; /* sequence number of the latest posted operation */
+    uint64_t done;   /* sequence number of the latest completed operation */
+    int credit_blocked; /* a send found no credits and has not succeeded since */
 
     /* flow control */
     uint32_t peer_recv_depth;
@@ -299,9 +323,15 @@ static void absorb_ack(struct rdma_ep *e, uint32_t v) {
     e->peer_ack_total = v;
 }
 
-/* Marks send ring slots up to and including `slot` as reusable. */
+/* Marks send ring slots up to and including `slot` as reusable and advances the completed sequence number. */
 static void ring_reclaim(struct rdma_ep *e, uint32_t slot) {
     uint32_t n = (slot + e->send_depth - e->send_tail) % e->send_depth + 1;
+    for (uint32_t i = 0, s = e->send_tail; i < n; i++, s = (s + 1) % e->send_depth) {
+        if (e->slot_seq[s] != 0) {
+            e->done = e->slot_seq[s];
+            e->slot_seq[s] = 0;
+        }
+    }
     e->send_tail = (slot + 1) % e->send_depth;
     e->send_inflight -= n;
 }
@@ -359,7 +389,19 @@ static int ep_progress(struct rdma_ep *e) {
     e->idle_polls = 0;
     for (int i = 0; i < n; i++) {
         if (wc[i].status != IBV_WC_SUCCESS) {
-            e->broken = wc[i].status == IBV_WC_WR_FLUSH_ERR ? DUCT_ECLOSED : DUCT_EWC;
+            switch (wc[i].status) {
+            case IBV_WC_WR_FLUSH_ERR:
+                e->broken = DUCT_ECLOSED;
+                break;
+            case IBV_WC_REM_ACCESS_ERR:
+            case IBV_WC_REM_INV_REQ_ERR:
+            case IBV_WC_LOC_PROT_ERR:
+                e->broken = DUCT_EACCESS;
+                break;
+            default:
+                e->broken = DUCT_EWC;
+                break;
+            }
             return e->broken;
         }
         uint32_t slot = (uint32_t)(wc[i].wr_id & 0xffffffffu);
@@ -532,6 +574,7 @@ static int post_chunk(struct rdma_ep *e, const struct duct_msg *msgs, unsigned k
     e->send_inflight += k;
     e->sent_total += k;
     e->announced_total = e->released_total; /* the immediate data carried the current counter */
+    e->credit_blocked = 0;
     return 0;
 }
 
@@ -554,6 +597,9 @@ static int rdma_send_batch(duct_ep *base, const struct duct_msg *msgs, unsigned 
             k = ring_free(e);
         }
         if (k == 0) {
+            if (credits_available(e) == 0) {
+                e->credit_blocked = 1;
+            }
             int rc = wait_step(e, deadline, credits_available(e) == 0);
             if (rc < 0) {
                 return rc;
@@ -610,6 +656,202 @@ static int rdma_release(duct_ep *base, struct duct_rx *rx) {
 }
 
 /*
+ * Waits until a send ring slot (and, with need_credit, a flow-control credit) is available.
+ * Returns 0, -ETIMEDOUT, or a transport error.
+ */
+static int wait_slot(struct rdma_ep *e, int64_t deadline, int need_credit) {
+    for (;;) {
+        if (e->broken != 0) {
+            return e->broken;
+        }
+        int credit_ok = !need_credit || credits_available(e) > 0;
+        if (ring_free(e) > 0 && credit_ok) {
+            return 0;
+        }
+        if (!credit_ok) {
+            e->credit_blocked = 1;
+        }
+        int rc = wait_step(e, deadline, !credit_ok);
+        if (rc < 0) {
+            return rc;
+        }
+    }
+}
+
+/* Posts one signaled user operation into the next ring slot and assigns its sequence number. */
+static int post_user(struct rdma_ep *e, struct ibv_send_wr *wr, uint64_t *seq) {
+    uint32_t slot = e->send_head;
+    wr->wr_id = SEND_FLAG | slot;
+    wr->send_flags |= IBV_SEND_SIGNALED;
+    struct ibv_send_wr *bad;
+    int rc = ibv_post_send(e->id->qp, wr, &bad);
+    if (rc != 0) {
+        e->broken = -rc;
+        return -rc;
+    }
+    e->send_head = (slot + 1) % e->send_depth;
+    e->send_inflight++;
+    e->slot_seq[slot] = ++e->posted;
+    if (seq != NULL) {
+        *seq = e->posted;
+    }
+    return 0;
+}
+
+static int rdma_send_mr(duct_ep *base, const duct_mr *mr, size_t off, size_t len, int timeout_ms,
+                        uint64_t *seq) {
+    struct rdma_ep *e = (struct rdma_ep *)base;
+    int rc = wait_slot(e, duct_deadline(timeout_ms), 1);
+    if (rc != 0) {
+        return rc;
+    }
+    struct ibv_sge sge = {.addr = (uintptr_t)(mr->addr + off), .length = (uint32_t)len, .lkey = mr->lkey};
+    struct ibv_send_wr wr = {
+        .sg_list = &sge,
+        .num_sge = len > 0 ? 1 : 0,
+        .opcode = IBV_WR_SEND_WITH_IMM,
+        .imm_data = htonl(e->released_total),
+    };
+    rc = post_user(e, &wr, seq);
+    if (rc == 0) {
+        e->sent_total++;
+        e->announced_total = e->released_total;
+        e->credit_blocked = 0;
+    }
+    return rc;
+}
+
+static int rdma_rma(duct_ep *base, const struct duct_rma *op, int timeout_ms, uint64_t *seq) {
+    struct rdma_ep *e = (struct rdma_ep *)base;
+    int rc = wait_slot(e, duct_deadline(timeout_ms), 0);
+    if (rc != 0) {
+        return rc;
+    }
+    struct ibv_sge sge = {.addr = (uintptr_t)op->laddr, .length = (uint32_t)op->len, .lkey = op->lkey};
+    struct ibv_send_wr wr = {.sg_list = &sge, .num_sge = 1};
+    switch (op->op) {
+    case DUCT_RMA_READ:
+        wr.opcode = IBV_WR_RDMA_READ;
+        wr.wr.rdma.remote_addr = op->raddr;
+        wr.wr.rdma.rkey = op->rkey;
+        break;
+    case DUCT_RMA_WRITE:
+        wr.opcode = IBV_WR_RDMA_WRITE;
+        wr.wr.rdma.remote_addr = op->raddr;
+        wr.wr.rdma.rkey = op->rkey;
+        break;
+    case DUCT_RMA_FADD:
+        wr.opcode = IBV_WR_ATOMIC_FETCH_AND_ADD;
+        wr.wr.atomic.remote_addr = op->raddr;
+        wr.wr.atomic.rkey = op->rkey;
+        wr.wr.atomic.compare_add = op->a;
+        break;
+    case DUCT_RMA_CSWAP:
+        wr.opcode = IBV_WR_ATOMIC_CMP_AND_SWP;
+        wr.wr.atomic.remote_addr = op->raddr;
+        wr.wr.atomic.rkey = op->rkey;
+        wr.wr.atomic.compare_add = op->a;
+        wr.wr.atomic.swap = op->b;
+        break;
+    }
+    return post_user(e, &wr, seq);
+}
+
+static uint64_t rdma_completed(duct_ep *base) {
+    struct rdma_ep *e = (struct rdma_ep *)base;
+    ep_progress(e);
+    return e->done;
+}
+
+static int rdma_wait(duct_ep *base, uint64_t seq, int timeout_ms) {
+    struct rdma_ep *e = (struct rdma_ep *)base;
+    int64_t deadline = duct_deadline(timeout_ms);
+    while (e->done < seq) {
+        int rc = wait_step(e, deadline, 0);
+        if (rc < 0 && e->done < seq) {
+            return rc;
+        }
+    }
+    return 0;
+}
+
+static int rdma_progress(duct_ep *base) {
+    struct rdma_ep *e = (struct rdma_ep *)base;
+    int rc = ep_progress(e);
+    if (rc < 0) {
+        return rc;
+    }
+    announce(e, 0);
+    return e->broken;
+}
+
+static unsigned rdma_send_space(duct_ep *base) {
+    struct rdma_ep *e = (struct rdma_ep *)base;
+    if (ep_progress(e) < 0) {
+        return 0;
+    }
+    uint32_t c = credits_available(e);
+    uint32_t r = ring_free(e);
+    return c < r ? c : r;
+}
+
+static int rdma_fd(const duct_ep *base) {
+    return ((const struct rdma_ep *)base)->epfd;
+}
+
+/* Arms (ns > 0) or disarms (ns == 0) the endpoint's timer. */
+static void timer_set(struct rdma_ep *e, long ns) {
+    if (ns == 0 && !e->timer_armed) {
+        return;
+    }
+    struct itimerspec its = {.it_value = {.tv_sec = 0, .tv_nsec = ns}};
+    timerfd_settime(e->tfd, 0, &its, NULL);
+    e->timer_armed = ns != 0;
+}
+
+static int rdma_arm(duct_ep *base) {
+    struct rdma_ep *e = (struct rdma_ep *)base;
+    if (e->broken != 0) {
+        return -EAGAIN;
+    }
+    /* Consume pending notifications: completion events must be acknowledged, timer expirations read. */
+    struct ibv_cq *ev_cq;
+    void *ev_ctx;
+    while (ibv_get_cq_event(e->chan, &ev_cq, &ev_ctx) == 0) {
+        ibv_ack_cq_events(ev_cq, 1);
+    }
+    uint64_t expirations;
+    if (read(e->tfd, &expirations, sizeof(expirations)) > 0) {
+        e->timer_armed = 0;
+    }
+    ep_check_disconnect(e);
+    int rc = ep_progress(e);
+    announce(e, 1);
+    if (rc != 0 || e->rcount > 0) {
+        return -EAGAIN;
+    }
+    if (e->credit_blocked && credits_available(e) > 0 && ring_free(e) > 0) {
+        return -EAGAIN;
+    }
+    if (ibv_req_notify_cq(e->cq, 0) != 0) {
+        return -errno;
+    }
+    /* Look again: a completion that arrived before arming would not raise an event. */
+    rc = ep_progress(e);
+    if (rc != 0 || e->rcount > 0) {
+        return -EAGAIN;
+    }
+    if (e->peer_closed) {
+        timer_set(e, 1000000L);
+    } else if (e->credit_blocked && credits_available(e) == 0) {
+        timer_set(e, CREDIT_RECHECK_NS);
+    } else {
+        timer_set(e, 0);
+    }
+    return 0;
+}
+
+/*
  * Waits (at most 1 s) until every send posted so far has completed, so that closing does not discard
  * messages still in flight. Errors are ignored: the endpoint is being closed anyway.
  */
@@ -641,6 +883,12 @@ static void rdma_ep_free(struct rdma_ep *e) {
     if (e->chan != NULL) {
         ibv_destroy_comp_channel(e->chan);
     }
+    if (e->epfd >= 0) {
+        close(e->epfd);
+    }
+    if (e->tfd >= 0) {
+        close(e->tfd);
+    }
     if (e->arena_mr != NULL) {
         ibv_dereg_mr(e->arena_mr);
     }
@@ -657,6 +905,7 @@ static void rdma_ep_free(struct rdma_ep *e) {
         rdma_destroy_event_channel(e->ec);
     }
     free(e->ready);
+    free(e->slot_seq);
     free(e);
 }
 
@@ -670,6 +919,14 @@ static const struct duct_ep_ops rdma_ep_ops = {
     .recv = rdma_recv,
     .release = rdma_release,
     .close = rdma_close,
+    .fd = rdma_fd,
+    .arm = rdma_arm,
+    .progress = rdma_progress,
+    .send_space = rdma_send_space,
+    .send_mr = rdma_send_mr,
+    .rma = rdma_rma,
+    .completed = rdma_completed,
+    .wait = rdma_wait,
 };
 
 /* Allocates the queue pair, completion queue and registered memory of endpoint e (e->id is set). */
@@ -703,15 +960,32 @@ static int ep_resources(duct_ctx *ctx, struct rdma_ep *e) {
         return -errno;
     }
     e->event_mode = ctx->opts.wait == DUCT_WAIT_EVENT;
-    if (e->event_mode) {
-        e->chan = ibv_create_comp_channel(e->id->verbs);
-        if (e->chan == NULL) {
+    e->chan = ibv_create_comp_channel(e->id->verbs);
+    if (e->chan == NULL) {
+        return -errno;
+    }
+    int fl = fcntl(e->chan->fd, F_GETFL);
+    if (fl < 0 || fcntl(e->chan->fd, F_SETFL, fl | O_NONBLOCK) < 0) {
+        return -errno;
+    }
+    e->tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    e->epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (e->tfd < 0 || e->epfd < 0) {
+        return -errno;
+    }
+    int watch[3] = {e->chan->fd, e->ec->fd, e->tfd};
+    for (int i = 0; i < 3; i++) {
+        struct epoll_event ev = {.events = EPOLLIN, .data.fd = watch[i]};
+        if (epoll_ctl(e->epfd, EPOLL_CTL_ADD, watch[i], &ev) != 0) {
             return -errno;
         }
-        int fl = fcntl(e->chan->fd, F_GETFL);
-        if (fl < 0 || fcntl(e->chan->fd, F_SETFL, fl | O_NONBLOCK) < 0) {
-            return -errno;
-        }
+    }
+    struct ibv_device_attr da;
+    if (ibv_query_device(e->id->verbs, &da) == 0) {
+        int n = da.max_qp_rd_atom < da.max_qp_init_rd_atom ? da.max_qp_rd_atom : da.max_qp_init_rd_atom;
+        e->rd_atom = (uint8_t)(n < 1 ? 1 : n > MAX_RD_ATOM ? MAX_RD_ATOM : n);
+    } else {
+        e->rd_atom = 1;
     }
     e->cq = ibv_create_cq(e->id->verbs, (int)(e->recv_depth + e->send_depth), NULL, e->chan, 0);
     if (e->cq == NULL) {
@@ -735,7 +1009,8 @@ static int ep_resources(duct_ctx *ctx, struct rdma_ep *e) {
         return -ENOTSUP;
     }
     e->ready = malloc(sizeof(struct rdma_ready) * e->recv_depth);
-    if (e->ready == NULL) {
+    e->slot_seq = calloc(e->send_depth, sizeof(*e->slot_seq));
+    if (e->ready == NULL || e->slot_seq == NULL) {
         return -ENOMEM;
     }
     for (uint32_t i = 0; i < e->recv_depth; i++) {
@@ -776,6 +1051,8 @@ static struct rdma_ep *ep_alloc(duct_ctx *ctx) {
     if (e != NULL) {
         e->base.ops = &rdma_ep_ops;
         e->base.ctx = ctx;
+        e->epfd = -1;
+        e->tfd = -1;
     }
     return e;
 }
@@ -785,12 +1062,17 @@ static int set_event_nonblock(struct rdma_event_channel *ec) {
     return (fl < 0 || fcntl(ec->fd, F_SETFL, fl | O_NONBLOCK) < 0) ? -errno : 0;
 }
 
-static void conn_param(struct rdma_conn_param *p, const uint8_t *hello) {
+/*
+ * Fills connection parameters. initiator and responder are the outstanding READ/atomic operations this
+ * side issues and accepts.
+ */
+static void conn_param(struct rdma_conn_param *p, const uint8_t *hello, uint8_t initiator,
+                       uint8_t responder) {
     memset(p, 0, sizeof(*p));
     p->private_data = hello;
     p->private_data_len = DUCT_HELLO_SIZE;
-    p->responder_resources = 1;
-    p->initiator_depth = 1;
+    p->responder_resources = responder;
+    p->initiator_depth = initiator;
     p->retry_count = 7;
     p->rnr_retry_count = 7;
 }
@@ -840,7 +1122,7 @@ int duct_rdma_connect(duct_ctx *ctx, const char *addr, const char *port, duct_ep
     struct duct_hello mine = local_hello(ctx, e);
     duct_hello_encode(&mine, hello);
     struct rdma_conn_param p;
-    conn_param(&p, hello);
+    conn_param(&p, hello, e->rd_atom, e->rd_atom);
     if (rdma_connect(e->id, &p) != 0) {
         rc = -errno;
         goto fail;
@@ -880,6 +1162,9 @@ static int rdma_listener_accept(duct_listener *base, int timeout_ms, duct_ep **o
     struct rdma_cm_id *id = ev->id;
     struct duct_hello theirs;
     rc = duct_hello_decode(ev->param.conn.private_data, ev->param.conn.private_data_len, &theirs);
+    /* The peer's initiator depth bounds what this side must accept, and its responder resources what it may issue. */
+    uint8_t peer_initiator = ev->param.conn.initiator_depth;
+    uint8_t peer_responder = ev->param.conn.responder_resources;
     rdma_ack_cm_event(ev);
     struct rdma_ep *e = ep_alloc(ctx);
     if (e == NULL) {
@@ -917,8 +1202,10 @@ static int rdma_listener_accept(duct_listener *base, int timeout_ms, duct_ep **o
     uint8_t hello[DUCT_HELLO_SIZE];
     struct duct_hello mine = local_hello(ctx, e);
     duct_hello_encode(&mine, hello);
+    uint8_t initiator = e->rd_atom < peer_responder ? e->rd_atom : peer_responder;
+    uint8_t responder = e->rd_atom < peer_initiator ? e->rd_atom : peer_initiator;
     struct rdma_conn_param p;
-    conn_param(&p, hello);
+    conn_param(&p, hello, initiator, responder);
     if (rdma_accept(id, &p) != 0) {
         rc = -errno;
         goto fail;
@@ -950,10 +1237,15 @@ static void rdma_listener_close(duct_listener *base) {
     free(l);
 }
 
+static int rdma_listener_fd(const duct_listener *base) {
+    return ((const struct rdma_listener *)base)->ec->fd;
+}
+
 static const struct duct_listener_ops rdma_listener_ops = {
     .accept = rdma_listener_accept,
     .port = rdma_listener_port,
     .close = rdma_listener_close,
+    .fd = rdma_listener_fd,
 };
 
 int duct_rdma_listen(duct_ctx *ctx, const char *addr, const char *port, duct_listener **out) {
@@ -988,4 +1280,53 @@ int duct_rdma_listen(duct_ctx *ctx, const char *addr, const char *port, duct_lis
     }
     *out = &l->base;
     return 0;
+}
+
+int duct_rdma_mr_reg(duct_ctx *ctx, struct duct_mr *mr) {
+    struct rdma_dev *d = ctx->rdma;
+    struct ibv_pd *pd = NULL;
+    pthread_mutex_lock(&d->lock);
+    struct ibv_context *verbs = d->verbs;
+    pthread_mutex_unlock(&d->lock);
+    if (verbs == NULL) {
+        /* Bind to the first device known to librdmacm: its contexts are the ones rdma_cm ids use. */
+        int n = 0;
+        struct ibv_context **list = rdma_get_devices(&n);
+        if (list == NULL || n == 0) {
+            if (list != NULL) {
+                rdma_free_devices(list);
+            }
+            return DUCT_ENODEV;
+        }
+        verbs = list[0];
+        rdma_free_devices(list);
+    }
+    int rc = dev_bind(ctx, verbs, &pd);
+    if (rc != 0) {
+        return rc;
+    }
+    int flags = IBV_ACCESS_LOCAL_WRITE;
+    if (mr->access & DUCT_ACCESS_REMOTE_READ) {
+        flags |= IBV_ACCESS_REMOTE_READ;
+    }
+    if (mr->access & DUCT_ACCESS_REMOTE_WRITE) {
+        flags |= IBV_ACCESS_REMOTE_WRITE;
+    }
+    if (mr->access & DUCT_ACCESS_REMOTE_ATOMIC) {
+        flags |= IBV_ACCESS_REMOTE_ATOMIC;
+    }
+    struct ibv_mr *ib = ibv_reg_mr(pd, mr->addr, mr->len, flags);
+    if (ib == NULL) {
+        return -errno;
+    }
+    mr->ibmr = ib;
+    mr->key = ib->rkey;
+    mr->lkey = ib->lkey;
+    return 0;
+}
+
+void duct_rdma_mr_dereg(struct duct_mr *mr) {
+    if (mr->ibmr != NULL) {
+        ibv_dereg_mr(mr->ibmr);
+    }
 }

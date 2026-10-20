@@ -1,4 +1,5 @@
 /* test_hello.c - handshake encoding and validation tests. */
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -25,7 +26,7 @@ int main(void) {
     duct_hello_encode(&in, wire);
 
     static const uint8_t expect[DUCT_HELLO_SIZE] = {
-        0x52, 0x54, 0x50, 0x31, 0x02, 0x00, 0x00, 0x00, 0x04, 0x03, 0x02, 0x01, 0x06, 0x05, 0x00, 0x00,
+        0x52, 0x54, 0x50, 0x31, 0x03, 0x00, 0x00, 0x00, 0x04, 0x03, 0x02, 0x01, 0x06, 0x05, 0x00, 0x00,
         0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x24, 0x23, 0x22, 0x21, 0x00, 0x00, 0x00, 0x00};
     EXPECT(memcmp(wire, expect, sizeof(wire)) == 0, "wire layout is little-endian and fixed");
 
@@ -43,8 +44,26 @@ int main(void) {
     EXPECT(duct_hello_decode(bad, sizeof(bad), &out) == DUCT_EPROTO, "bad magic");
 
     memcpy(bad, wire, sizeof(bad));
-    bad[4] = 3;
+    bad[4] = 2;
+    EXPECT(duct_hello_decode(bad, sizeof(bad), &out) == DUCT_EPROTO, "previous version rejected");
+    bad[4] = 4;
     EXPECT(duct_hello_decode(bad, sizeof(bad), &out) == DUCT_EPROTO, "unsupported version");
+
+    /* Region descriptor: fixed little-endian layout and round trip. */
+    struct duct_desc dd = {
+        .access = 5, .addr = 0x0102030405060708ull, .len = 0x1112131415161718ull, .key = 0x21222324u};
+    struct duct_mr_desc dw;
+    duct_desc_encode(&dd, &dw);
+    static const uint8_t dexpect[DUCT_MR_DESC_SIZE] = {
+        0x44, 0x4d, 0x52, 0x31, 0x05, 0x00, 0x00, 0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+        0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x24, 0x23, 0x22, 0x21, 0x00, 0x00, 0x00, 0x00};
+    EXPECT(memcmp(dw.bytes, dexpect, sizeof(dexpect)) == 0, "descriptor layout is little-endian and fixed");
+    struct duct_desc dr;
+    EXPECT(duct_desc_decode(&dw, &dr) == 0 && dr.access == dd.access && dr.addr == dd.addr &&
+               dr.len == dd.len && dr.key == dd.key,
+           "descriptor round trip");
+    dw.bytes[0] ^= 1;
+    EXPECT(duct_desc_decode(&dw, &dr) == -EINVAL, "descriptor with bad magic rejected");
 
     struct duct_hello zero = {.max_msg = 0, .recv_depth = 1};
     duct_hello_encode(&zero, bad);

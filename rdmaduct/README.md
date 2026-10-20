@@ -1,9 +1,14 @@
 # rdmaduct
 
-A small C library that sends discrete messages between two endpoints over **RDMA reliable connections** or
-**TCP**, with the same API and the same behavior on both.
+A small C library for communication between two endpoints over **RDMA reliable connections** or **TCP**, with
+the same API and the same behavior on both.
 
-- Reliable, ordered, message-preserving delivery; a message is received whole or not at all.
+- Two-sided messages: reliable, ordered, message-preserving delivery; a message is received whole or not at all.
+- Registered memory regions, zero-copy sends from them, and one-sided **RDMA READ, WRITE and 64-bit atomics**
+  (fetch-and-add, compare-and-swap) on a peer's region. On TCP the peer's library emulates them.
+- Posted operations with sequence numbers, so many operations are in flight behind one wait.
+- **Event-loop integration:** every endpoint and listener has a pollable descriptor, so thousands of connections
+  can share one epoll loop.
 - Credit-based flow control on RDMA: a sender never overruns the receiver's posted buffers.
 - Blocking calls with timeouts; polling or event-driven waiting for RDMA endpoints.
 - Batched sends (one doorbell per up to 16 messages) on RDMA.
@@ -22,29 +27,32 @@ choice between hand-written verbs code and a framework far bigger than the probl
 
 `rdmaduct` is a deliberately small middle ground:
 
-- **One message API, identical semantics on RDMA and TCP.** Ordering, message boundaries, flow control, timeouts
-  and the error model are the same on both transports, and one test suite runs unchanged on both. Code developed
-  on a machine without RDMA hardware behaves the same on an RDMA cluster.
+- **One API, identical semantics on RDMA and TCP.** Messages, one-sided operations, atomics, ordering, flow
+  control, timeouts and the error model are the same on both transports, and the same test suites run unchanged
+  on both. Code developed on a machine without RDMA hardware behaves the same on an RDMA cluster.
 - **Flow control that cannot overrun the receiver.** Credits track the peer's posted buffers. A test with a slow
   consumer checks the device's receiver-not-ready counters.
 - **Failure paths tested, not assumed:** two million fuzzed handshakes, a raw socket that attacks the TCP
   framing, abrupt closes in both waiting modes, and descriptor-leak checks over connect/disconnect cycles.
-- **Small dependency set:** libc and pthreads for TCP; libibverbs and librdmacm for RDMA. About 1,800 lines with
+- **Small dependency set:** libc and pthreads for TCP; libibverbs and librdmacm for RDMA. About 3,500 lines with
   headers.
 
-It does not do one-sided operations, GPU memory, multi-rail or collectives. For those, use UCX, libfabric or MPI
+It does not do GPU memory, multi-rail, tag matching or collectives. For those, use UCX, libfabric or MPI
 ([`../docs/PRIOR_ART.md`](../docs/PRIOR_ART.md)).
 
 ### Comparison
 
 | | rdmaduct | UCX | libfabric | rsocket (librdmacm) |
 |---|---|---|---|---|
-| Programming model | two-sided messages | tag matching, streams, active messages, RMA, atomics | messages, tagged messages, RMA, atomics | stream sockets |
+| Programming model | two-sided messages, RMA read/write, atomics | tag matching, streams, active messages, RMA, atomics | messages, tagged messages, RMA, atomics | stream sockets |
 | Transports | RDMA reliable connections, TCP | many (verbs, shared memory, TCP, GPU) | many providers (verbs, TCP, shared memory, EFA, CXI) | RDMA |
 | Same semantics on every transport | yes; one test suite runs on both | capabilities depend on the transport | capabilities depend on the provider | single transport |
 | Message boundaries preserved | yes | yes | yes | no (byte stream) |
-| One-sided operations, GPU memory, multi-rail | no | yes | yes | no |
-| Source size | about 1,800 lines | large framework | large framework | part of librdmacm |
+| One-sided read/write and 64-bit atomics | yes (emulated on TCP) | yes | yes | write only (`riowrite`) |
+| Zero-copy send from registered memory | yes | yes | yes | no |
+| Pollable descriptor for event loops | yes (endpoint and listener) | yes (worker) | yes (wait sets) | `rpoll()`, not epoll |
+| GPU memory, multi-rail, tag matching | no | yes | yes | no |
+| Source size | about 3,500 lines | large framework | large framework | part of librdmacm |
 
 Statements about other systems reflect their public documentation at the time of writing.
 
@@ -172,7 +180,49 @@ Full contracts are in [`include/rdmaduct.h`](include/rdmaduct.h).
 | `duct_connect`, `duct_ep_close`, `duct_ep_peer_max_msg` | client side and endpoint management |
 | `duct_send`, `duct_send_batch` | send one message or a batch (copying) |
 | `duct_recv`, `duct_rx_release` | receive a message and return its buffer |
+| `duct_ep_fd`, `duct_ep_arm`, `duct_progress`, `duct_ep_send_space`, `duct_listener_fd` | event-loop integration |
+| `duct_mr_reg`, `duct_mr_dereg`, `duct_mr_export`, `duct_mr_addr` | registered regions and their descriptors |
+| `duct_send_mr` | zero-copy send of part of a region |
+| `duct_read`, `duct_write`, `duct_atomic_fadd`, `duct_atomic_cswap` | one-sided operations on a peer's region |
+| `duct_ep_completed`, `duct_wait` | completion of posted operations |
 | `duct_strerror` | text of an error code |
+
+### Event loop
+
+```c
+/* add duct_ep_fd(ep) to an epoll set for EPOLLIN, then: */
+for (;;) {
+    struct duct_rx rx;
+    while (duct_recv(ep, &rx, 0) == 0) {          /* drain without blocking */
+        handle(rx.data, rx.len);
+        duct_rx_release(ep, &rx);
+    }
+    if (duct_ep_arm(ep) == -EAGAIN) {
+        continue;                                 /* work arrived while arming */
+    }
+    break;                                        /* wait for epoll to report the descriptor */
+}
+```
+
+### One-sided operations
+
+```c
+/* target */
+duct_mr *mr;
+duct_mr_reg(ctx, buf, len, DUCT_ACCESS_REMOTE_READ | DUCT_ACCESS_REMOTE_WRITE, &mr);
+struct duct_mr_desc d;
+duct_mr_export(mr, &d);
+duct_send(ep, &d, sizeof(d), 1000);               /* the descriptor travels as an ordinary message */
+
+/* initiator (local region lmr registered with DUCT_ACCESS_LOCAL) */
+uint64_t seq;
+duct_read(ep, lmr, 0, &d, 4096, 65536, 1000, &seq);   /* 64 KiB from offset 4096 of the target region */
+duct_wait(ep, seq, 1000);
+```
+
+On TCP the target's library executes the operation while the target application calls any function on that
+endpoint (`duct_recv`, `duct_progress`, an event loop); on RDMA the network adapter executes it without the
+target's CPU.
 
 ### Options (`struct duct_opts`)
 
@@ -191,8 +241,11 @@ The effective send limit of an endpoint is the smaller of the local and the peer
 
 - Messages arrive in the order sent, whole, or the endpoint fails.
 - `duct_send` copies the data; the caller's buffer is reusable on return.
-- Timeouts return `-ETIMEDOUT` and leave the endpoint usable. Every other transport error is sticky: the
-  endpoint must be closed.
+- An endpoint may hold up to `recv_depth` received messages unreleased, on both transports.
+- Posted operations complete in posting order; `duct_ep_completed()` is cumulative.
+- Timeouts return `-ETIMEDOUT` and leave the endpoint usable; a timed-out send has sent nothing. Arguments that are
+  invalid by local information return `-EINVAL` and also leave it usable. Every other transport error is sticky:
+  the endpoint must be closed.
 - Messages received before a disconnect are delivered before `DUCT_ECLOSED` is reported.
 - `duct_ep_close` waits (at most one second) for sends in flight, so a message sent just before closing is not lost.
 - A peer that stops releasing received messages stalls the sender (flow control); it does not cause errors.
@@ -200,7 +253,8 @@ The effective send limit of an endpoint is the smaller of the local and the peer
 ### Error codes
 
 Negative `errno` values (`-ETIMEDOUT`, `-EMSGSIZE`, `-ECONNREFUSED`, ...) and `DUCT_ECLOSED` (peer closed),
-`DUCT_EPROTO` (protocol violation), `DUCT_EWC` (RDMA work completion error), `DUCT_ENODEV` (no usable RDMA device).
+`DUCT_EPROTO` (protocol violation), `DUCT_EWC` (RDMA work completion error), `DUCT_ENODEV` (no usable RDMA device),
+`DUCT_EACCESS` (a one-sided operation violated the remote region's range or rights).
 
 ## Waiting modes
 
@@ -226,10 +280,12 @@ DUCT_TEST_ADDR=<rdma-interface-ip> make test   # select the RDMA address explici
 DUCT_STRESS_COUNT=100000000 make test-rdma     # long streaming stress
 ```
 
-The suites cover the handshake codec (including two million fuzzed inputs), TCP framing attacked through a raw
-socket (oversize frames, split frames, truncation, garbage), flow control under a slow consumer with a check that
-the device reports no receiver-not-ready errors, abrupt close in both waiting modes, asymmetric limits,
-connect/disconnect cycles with a descriptor-leak check, and the examples. Details:
+The suites cover the handshake codec (including two million fuzzed inputs), TCP framing and control frames
+attacked through a raw socket (oversize frames, split frames, truncation, garbage, random emulated requests),
+flow control under a slow consumer with a check that the device reports no receiver-not-ready errors, 64
+connections through one epoll loop without missed wake-ups, one-sided operations and atomics including remote
+access violations, abrupt close in both waiting modes, asymmetric limits, connect/disconnect cycles with a
+descriptor-leak check, and the examples. Details:
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#testing).
 
 Test results: all suites pass on x86-64 and aarch64, including the RDMA suite over Soft-RoCE in both waiting modes.
@@ -241,14 +297,17 @@ and clang on x86-64 and arm64.
 | `test_hello` | handshake encoding and validation, two million fuzzed inputs |
 | `test_tcp` | echo suite over TCP on loopback |
 | `test_rdma` | the same echo suite over RDMA, receiver-not-ready counter check under a slow consumer |
-| `test_faults` | TCP framing and handshake attacked through a raw socket; accept timeout, refused connections, asymmetric limits, abrupt close |
+| `test_poll` | 64 connections per side driven by one epoll set per side with non-blocking sends; fails on any missed wake-up |
+| `test_mr` | write/read back up to 256 KiB, 64 pipelined writes, fetch-and-add and compare-and-swap, zero-copy send, local validation, `DUCT_EACCESS` for forged and deregistered regions |
+| `test_faults` | TCP framing, handshake and 1500 random control frames attacked through a raw socket; accept timeout, refused connections, asymmetric limits, abrupt close |
 | `run_examples.sh` | the example server and client |
 
 ## Limitations
 
-- One thread per endpoint; no connection multiplexing.
-- No one-sided operations, no multiple NICs, no GPU memory.
-- RDMA receive and send buffers are copied (no zero-copy send yet).
+- An endpoint is used by one thread at a time; many endpoints can share one thread through their descriptors.
+- No multiple NICs, no GPU memory, no tag matching or collectives.
+- Received messages land in the endpoint's buffers (no zero-copy receive); `duct_send_mr` avoids the send copy.
+- On TCP, one-sided operations progress only while the target application calls into the library on that endpoint.
 - No encryption or authentication: use it on a trusted network.
 - Received-completion visibility after a peer disconnect is handled with a short grace period (see
   `docs/ARCHITECTURE.md`); the underlying cause was not identified.
@@ -259,7 +318,7 @@ and clang on x86-64 and arm64.
 | Path | Content |
 |---|---|
 | `include/rdmaduct.h` | public API |
-| `src/` | implementation (`duct.c` dispatch, `tcp.c`, `rdma.c`, `hello.c` handshake codec, `internal.h`) |
+| `src/` | implementation (`duct.c` dispatch and validation, `tcp.c`, `rdma.c`, `hello.c` wire codecs, `internal.h`) |
 | `tools/` | `duct_echo`, `duct_bench` |
 | `examples/` | `hello_server`, `hello_client` |
 | `tests/` | test suites |

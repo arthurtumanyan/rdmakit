@@ -33,8 +33,8 @@ measurements that anyone can re-derive:
 1. **A cache shaped for large blocks** (`arenakv`): log-structured memory, so a fixed-size block costs no
    per-object allocation. A vector-compared hash index and second-chance eviction, with a tested guarantee
    that a lookup never returns a stale value.
-2. **A transport that is the same on RDMA and TCP** (`rdmaduct`): one message API with identical ordering, flow
-   control and error semantics on both. Code developed on a laptop runs unchanged on an RDMA cluster.
+2. **A transport that is the same on RDMA and TCP** (`rdmaduct`): messages, one-sided reads, writes and atomics,
+   and event-loop descriptors, with identical ordering, flow control and error semantics on both. Code developed on a laptop runs unchanged on an RDMA cluster.
 3. **A measurement tool that removes the tool as a variable** (`kvpace`): one implementation drives all compared
    servers, measures open-loop latency from the intended send time, and models KV-cache reuse. Every published
    number is tied to raw data by a verifier.
@@ -64,12 +64,14 @@ Statements about other systems reflect their public documentation at the time of
 
 | | rdmaduct | UCX | libfabric |
 |---|---|---|---|
-| Programming model | two-sided messages | tag matching, streams, active messages, RMA, atomics | messages, tagged messages, RMA, atomics |
+| Programming model | two-sided messages, RMA read/write, atomics | tag matching, streams, active messages, RMA, atomics | messages, tagged messages, RMA, atomics |
 | Transports | RDMA reliable connections (verbs + rdma_cm), TCP | many (verbs, shared memory, TCP, GPU) | many providers (verbs, TCP, shared memory, EFA, CXI) |
 | Same semantics on every transport | yes; one test suite runs on both | capabilities depend on the transport | capabilities depend on the provider |
 | Flow control | credit-based, tested against receiver-not-ready errors | internal | provider-specific |
-| One-sided operations, GPU memory, multi-rail | no | yes | yes |
-| Source size | about 1,800 lines | large framework | large framework |
+| One-sided read/write, 64-bit atomics | yes (emulated on TCP) | yes | yes |
+| Zero-copy send, pollable descriptors for event loops | yes | yes | yes |
+| GPU memory, multi-rail, tag matching | no | yes | yes |
+| Source size | about 3,500 lines | large framework | large framework |
 
 ### kvpace and key-value load generators
 

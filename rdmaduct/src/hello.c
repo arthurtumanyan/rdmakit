@@ -1,4 +1,5 @@
-/* hello.c - connection handshake encoding, see internal.h for the layout. */
+/* hello.c - wire encodings: connection handshake and region descriptor, see internal.h for the layouts. */
+#include <errno.h>
 #include <string.h>
 
 #include "internal.h"
@@ -60,5 +61,27 @@ int duct_hello_decode(const uint8_t *in, size_t len, struct duct_hello *h) {
         h->recv_depth > DUCT_LIMIT_DEPTH) {
         return DUCT_EPROTO;
     }
+    return 0;
+}
+
+void duct_desc_encode(const struct duct_desc *d, struct duct_mr_desc *out) {
+    uint8_t *b = out->bytes;
+    put_le32(b, DUCT_MR_MAGIC);
+    put_le32(b + 4, d->access);
+    put_le64(b + 8, d->addr);
+    put_le64(b + 16, d->len);
+    put_le32(b + 24, d->key);
+    put_le32(b + 28, 0);
+}
+
+int duct_desc_decode(const struct duct_mr_desc *in, struct duct_desc *d) {
+    const uint8_t *b = in->bytes;
+    if (get_le32(b) != DUCT_MR_MAGIC) {
+        return -EINVAL;
+    }
+    d->access = get_le32(b + 4);
+    d->addr = get_le64(b + 8);
+    d->len = get_le64(b + 16);
+    d->key = get_le32(b + 24);
     return 0;
 }
