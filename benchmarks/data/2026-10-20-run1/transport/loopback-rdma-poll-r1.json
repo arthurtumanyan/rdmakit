@@ -1,0 +1,10 @@
+{"tool": "rtp_bench", "transport": "rdma", "wait": "poll", "pingpong_max": 5000, "stream_max": 20000, "results": [
+  {"size": 64, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 6.86, "p50": 6.65, "p99": 9.65, "p999": 16.30, "min": 4.38, "max": 19.93}, "pingpong_mb_s": 18.50, "stream_msgs_per_s": 762612, "stream_mb_s": 48.81},
+  {"size": 256, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 6.75, "p50": 6.61, "p99": 8.51, "p999": 12.69, "min": 5.52, "max": 83.02}, "pingpong_mb_s": 75.28, "stream_msgs_per_s": 739395, "stream_mb_s": 189.29},
+  {"size": 1024, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 7.49, "p50": 7.17, "p99": 10.46, "p999": 13.70, "min": 5.22, "max": 16.62}, "pingpong_mb_s": 271.56, "stream_msgs_per_s": 648340, "stream_mb_s": 663.90},
+  {"size": 4096, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 12.11, "p50": 11.75, "p99": 16.48, "p999": 25.93, "min": 9.51, "max": 267.79}, "pingpong_mb_s": 673.26, "stream_msgs_per_s": 212034, "stream_mb_s": 868.49},
+  {"size": 16384, "pingpong_count": 4096, "stream_count": 16384, "rtt_us": {"mean": 32.09, "p50": 31.11, "p99": 46.49, "p999": 84.04, "min": 26.87, "max": 169.49}, "pingpong_mb_s": 1019.28, "stream_msgs_per_s": 67648, "stream_mb_s": 1108.34},
+  {"size": 65536, "pingpong_count": 1024, "stream_count": 4096, "rtt_us": {"mean": 116.74, "p50": 112.11, "p99": 163.26, "p999": 380.72, "min": 94.21, "max": 461.00}, "pingpong_mb_s": 1122.17, "stream_msgs_per_s": 19045, "stream_mb_s": 1248.12},
+  {"size": 262144, "pingpong_count": 256, "stream_count": 1024, "rtt_us": {"mean": 460.97, "p50": 457.98, "p99": 592.34, "p999": 687.87, "min": 429.48, "max": 687.87}, "pingpong_mb_s": 1137.10, "stream_msgs_per_s": 4276, "stream_mb_s": 1120.90},
+  {"size": 1048576, "pingpong_count": 200, "stream_count": 256, "rtt_us": {"mean": 1985.39, "p50": 1937.72, "p99": 2847.10, "p999": 3096.32, "min": 1819.24, "max": 3096.32}, "pingpong_mb_s": 1056.21, "stream_msgs_per_s": 1002, "stream_mb_s": 1050.47}
+]}

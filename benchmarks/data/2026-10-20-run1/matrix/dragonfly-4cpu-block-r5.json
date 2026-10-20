@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "tool": {"name": "kvbench", "commit": "fc0dc39", "timestamp": "2026-10-20T13:19:35Z"},
+  "environment": {"cpu": "12th Gen Intel(R) Core(TM) i9-12900K", "logical_cpus": 24, "kernel": "7.0.0-34-generic", "machine": "x86_64", "compiler": "13.3.0"},
+  "config": {"label": "dragonfly dragonfly-4cpu-block-r5", "driver": "resp", "host": "127.0.0.1", "port": "7100", "threads": 16, "warmup_s": 3.0, "duration_s": 8.0, "keys": 20000, "dist": "uniform", "theta": 0.990, "value_size": 16384, "read_ratio": 0.900, "seed": 1, "preload": 1, "rate": 0.0, "arrival": "constant", "argv": ["kvbench/build/x86_64/kvbench", "--driver", "resp", "--host", "127.0.0.1", "--port", "7100", "--threads", "16", "--warmup", "3", "--duration", "8", "--keys", "20000", "--value-size", "16384", "--read-ratio", "0.9", "--dist", "uniform", "--pin", "8,10,12,14", "--server-pid", "3783114", "--label", "dragonfly dragonfly-4cpu-block-r5", "--out", "benchmarks/data/2026-10-20-run1/matrix/dragonfly-4cpu-block-r5.json"]},
+  "results": {
+    "seconds": 8.000, "ops": 3226022, "gets": 2903472, "puts": 322550, "misses": 0, "errors": 0, "ops_per_sec": 403249.4,
+    "get_latency_ns": {"count": 2903472, "min": 8891, "mean": 39434.4, "p50": 37631, "p90": 52735, "p99": 92671, "p999": 309247, "max": 3853657},
+    "put_latency_ns": {"count": 322550, "min": 12356, "mean": 41375.4, "p50": 39167, "p90": 54783, "p99": 97279, "p999": 317439, "max": 3785600},
+    "service_time_ns": {"count": 3226022, "min": 8891, "mean": 39628.5, "p50": 37887, "p90": 52991, "p99": 93183, "p999": 309247, "max": 3853657},
+    "max_lag_ns": 0,
+    "series": [438041, 423767, 370607, 394341, 379438, 423182, 371827, 424795],
+    "server": {"cpu_seconds": 31.050, "cpu_us_per_op": 9.625, "rss_bytes": 362807296}
+  }
+}

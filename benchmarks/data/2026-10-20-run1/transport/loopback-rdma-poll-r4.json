@@ -1,0 +1,10 @@
+{"tool": "rtp_bench", "transport": "rdma", "wait": "poll", "pingpong_max": 5000, "stream_max": 20000, "results": [
+  {"size": 64, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 6.88, "p50": 6.73, "p99": 8.82, "p999": 10.96, "min": 5.05, "max": 15.02}, "pingpong_mb_s": 18.46, "stream_msgs_per_s": 637597, "stream_mb_s": 40.81},
+  {"size": 256, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 6.99, "p50": 6.81, "p99": 9.11, "p999": 10.76, "min": 5.06, "max": 14.99}, "pingpong_mb_s": 72.73, "stream_msgs_per_s": 763103, "stream_mb_s": 195.35},
+  {"size": 1024, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 7.05, "p50": 7.02, "p99": 8.53, "p999": 9.75, "min": 5.35, "max": 24.85}, "pingpong_mb_s": 288.18, "stream_msgs_per_s": 764250, "stream_mb_s": 782.59},
+  {"size": 4096, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 11.29, "p50": 11.16, "p99": 13.22, "p999": 14.53, "min": 9.52, "max": 16.74}, "pingpong_mb_s": 722.15, "stream_msgs_per_s": 216947, "stream_mb_s": 888.62},
+  {"size": 16384, "pingpong_count": 4096, "stream_count": 16384, "rtt_us": {"mean": 30.24, "p50": 30.02, "p99": 35.81, "p999": 41.87, "min": 27.10, "max": 52.62}, "pingpong_mb_s": 1081.74, "stream_msgs_per_s": 70499, "stream_mb_s": 1155.05},
+  {"size": 65536, "pingpong_count": 1024, "stream_count": 4096, "rtt_us": {"mean": 108.44, "p50": 108.24, "p99": 116.62, "p999": 121.18, "min": 101.27, "max": 122.18}, "pingpong_mb_s": 1208.05, "stream_msgs_per_s": 19673, "stream_mb_s": 1289.29},
+  {"size": 262144, "pingpong_count": 256, "stream_count": 1024, "rtt_us": {"mean": 443.31, "p50": 441.40, "p99": 479.75, "p999": 527.71, "min": 413.83, "max": 527.71}, "pingpong_mb_s": 1182.47, "stream_msgs_per_s": 4497, "stream_mb_s": 1178.79},
+  {"size": 1048576, "pingpong_count": 200, "stream_count": 256, "rtt_us": {"mean": 1928.12, "p50": 1904.21, "p99": 2702.34, "p999": 2811.05, "min": 1793.83, "max": 2811.05}, "pingpong_mb_s": 1087.57, "stream_msgs_per_s": 1073, "stream_mb_s": 1124.94}
+]}

@@ -1,0 +1,10 @@
+{"tool": "rtp_bench", "transport": "tcp", "wait": "poll", "pingpong_max": 5000, "stream_max": 20000, "results": [
+  {"size": 64, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 11.26, "p50": 8.58, "p99": 23.57, "p999": 32.13, "min": 7.89, "max": 97.33}, "pingpong_mb_s": 11.34, "stream_msgs_per_s": 411676, "stream_mb_s": 26.35},
+  {"size": 256, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 8.34, "p50": 8.25, "p99": 9.70, "p999": 11.81, "min": 8.09, "max": 21.23}, "pingpong_mb_s": 61.26, "stream_msgs_per_s": 401592, "stream_mb_s": 102.81},
+  {"size": 1024, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 8.66, "p50": 8.54, "p99": 10.93, "p999": 11.49, "min": 7.99, "max": 13.12}, "pingpong_mb_s": 236.11, "stream_msgs_per_s": 318033, "stream_mb_s": 325.67},
+  {"size": 4096, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 9.50, "p50": 9.40, "p99": 10.85, "p999": 12.48, "min": 8.43, "max": 15.24}, "pingpong_mb_s": 861.12, "stream_msgs_per_s": 305386, "stream_mb_s": 1250.86},
+  {"size": 16384, "pingpong_count": 4096, "stream_count": 16384, "rtt_us": {"mean": 11.87, "p50": 11.89, "p99": 13.76, "p999": 14.66, "min": 10.04, "max": 26.72}, "pingpong_mb_s": 2755.77, "stream_msgs_per_s": 234715, "stream_mb_s": 3845.57},
+  {"size": 65536, "pingpong_count": 1024, "stream_count": 4096, "rtt_us": {"mean": 22.85, "p50": 22.64, "p99": 24.74, "p999": 26.16, "min": 22.33, "max": 47.45}, "pingpong_mb_s": 5732.69, "stream_msgs_per_s": 111877, "stream_mb_s": 7331.97},
+  {"size": 262144, "pingpong_count": 256, "stream_count": 1024, "rtt_us": {"mean": 58.05, "p50": 57.66, "p99": 63.63, "p999": 79.79, "min": 55.53, "max": 79.79}, "pingpong_mb_s": 9027.18, "stream_msgs_per_s": 34207, "stream_mb_s": 8967.08},
+  {"size": 1048576, "pingpong_count": 200, "stream_count": 256, "rtt_us": {"mean": 248.09, "p50": 247.52, "p99": 264.85, "p999": 268.39, "min": 243.93, "max": 268.39}, "pingpong_mb_s": 8452.26, "stream_msgs_per_s": 7881, "stream_mb_s": 8263.60}
+]}

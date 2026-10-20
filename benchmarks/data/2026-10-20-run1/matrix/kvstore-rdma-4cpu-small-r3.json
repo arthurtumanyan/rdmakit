@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "tool": {"name": "kvbench", "commit": "fc0dc39", "timestamp": "2026-10-20T13:08:08Z"},
+  "environment": {"cpu": "12th Gen Intel(R) Core(TM) i9-12900K", "logical_cpus": 24, "kernel": "7.0.0-34-generic", "machine": "x86_64", "compiler": "13.3.0"},
+  "config": {"label": "kvstore-rdma kvstore-rdma-4cpu-small-r3", "driver": "native", "host": "192.0.2.10", "port": "7100", "threads": 16, "warmup_s": 3.0, "duration_s": 8.0, "keys": 100000, "dist": "uniform", "theta": 0.990, "value_size": 64, "read_ratio": 0.900, "seed": 1, "preload": 1, "rate": 0.0, "arrival": "constant", "argv": ["kvbench/build/x86_64/kvbench", "--driver", "native", "--driver-opt", "transport=rdma", "--host", "192.0.2.10", "--port", "7100", "--threads", "16", "--warmup", "3", "--duration", "8", "--keys", "100000", "--value-size", "64", "--read-ratio", "0.9", "--dist", "uniform", "--pin", "8,10,12,14", "--server-pid", "3762248", "--label", "kvstore-rdma kvstore-rdma-4cpu-small-r3", "--out", "benchmarks/data/2026-10-20-run1/matrix/kvstore-rdma-4cpu-small-r3.json"]},
+  "results": {
+    "seconds": 8.000, "ops": 1919319, "gets": 1727484, "puts": 191835, "misses": 0, "errors": 0, "ops_per_sec": 239913.2,
+    "get_latency_ns": {"count": 1727484, "min": 9452, "mean": 66627.8, "p50": 52735, "p90": 69119, "p99": 440319, "p999": 1048575, "max": 7883546},
+    "put_latency_ns": {"count": 191835, "min": 13103, "mean": 66713.2, "p50": 52735, "p90": 69119, "p99": 430079, "p999": 1064959, "max": 9955810},
+    "service_time_ns": {"count": 1919319, "min": 9452, "mean": 66636.3, "p50": 52735, "p90": 69119, "p99": 438271, "p999": 1048575, "max": 9955810},
+    "max_lag_ns": 0,
+    "series": [255026, 217367, 247591, 219065, 251565, 251516, 224652, 252523],
+    "server": {"cpu_seconds": 21.890, "cpu_us_per_op": 11.405, "rss_bytes": 389799936}
+  }
+}

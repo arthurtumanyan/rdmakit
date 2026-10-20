@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "tool": {"name": "kvbench", "commit": "fc0dc39", "timestamp": "2026-10-20T13:24:27Z"},
+  "environment": {"cpu": "12th Gen Intel(R) Core(TM) i9-12900K", "logical_cpus": 24, "kernel": "7.0.0-34-generic", "machine": "x86_64", "compiler": "13.3.0"},
+  "config": {"label": "dragonfly dragonfly-4cpu-kvcache-r5", "driver": "resp", "host": "127.0.0.1", "port": "7100", "threads": 16, "warmup_s": 3.0, "duration_s": 8.0, "keys": 100000, "dist": "uniform", "theta": 0.900, "value_size": 64, "read_ratio": 0.900, "seed": 1, "preload": 1, "rate": 0.0, "arrival": "constant", "argv": ["kvbench/build/x86_64/kvbench", "--driver", "resp", "--host", "127.0.0.1", "--port", "7100", "--threads", "16", "--warmup", "3", "--duration", "8", "--scenario", "kvcache", "--block-size", "16384", "--groups", "16", "--shared-blocks", "32", "--turn-blocks", "8", "--active-conv", "256", "--max-turns", "16", "--new-conv-prob", "0.05", "--theta", "0.9", "--pin", "8,10,12,14", "--server-pid", "3791497", "--label", "dragonfly dragonfly-4cpu-kvcache-r5", "--out", "benchmarks/data/2026-10-20-run1/matrix/dragonfly-4cpu-kvcache-r5.json"]},
+  "results": {
+    "seconds": 8.000, "ops": 1746245, "gets": 1576925, "puts": 169320, "misses": 21165, "errors": 0, "ops_per_sec": 218278.9,
+    "get_latency_ns": {"count": 0, "min": 0, "mean": 0.0, "p50": 0, "p90": 0, "p99": 0, "p999": 0, "max": 0},
+    "put_latency_ns": {"count": 0, "min": 0, "mean": 0.0, "p50": 0, "p90": 0, "p99": 0, "p999": 0, "max": 0},
+    "service_time_ns": {"count": 21165, "min": 1329798, "mean": 6043236.8, "p50": 3670015, "p90": 13303807, "p99": 35651583, "p999": 59244543, "max": 75194883},
+    "max_lag_ns": 0,
+    "series": [4704, 4649, 1956, 2540, 2165, 1981, 1535, 1635],
+    "kvcache": {"block_size": 16384, "groups": 16, "shared_blocks": 32, "turn_blocks": 8, "active_conv": 256, "max_turns": 16, "new_conv_prob": 0.050, "theta": 0.900, "requests": 21165, "block_gets": 1576925, "block_hits": 1555760, "hit_rate": 0.9866, "reuse_rate": 0.9018, "block_puts": 169320, "bytes_get": 25489571840, "bytes_put": 2774138880, "corrupt": 0,
+    "request_latency_ns": {"count": 21165, "min": 1329798, "mean": 6043236.8, "p50": 3670015, "p90": 13303807, "p99": 35651583, "p999": 59244543, "max": 75194883}},
+    "server": {"cpu_seconds": 21.160, "cpu_us_per_op": 12.117, "rss_bytes": 5024223232}
+  }
+}

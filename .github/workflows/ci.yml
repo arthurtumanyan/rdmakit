@@ -1,0 +1,47 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test-tcp:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        cc: [gcc, clang]
+    runs-on: ${{ matrix.os }}
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y build-essential clang clang-format
+      - name: Format check
+        if: matrix.cc == 'gcc' && matrix.os == 'ubuntu-24.04'
+        run: make format-check
+      - name: Build and test without RDMA
+        run: make test-tcp
+
+  sanitizers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y build-essential
+      - name: AddressSanitizer and UndefinedBehaviorSanitizer
+        run: for p in rdmaduct arenakv kvpace; do make -C $p RDMA=0 SAN=1 test || exit 1; done
+
+  rdma-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y build-essential libibverbs-dev librdmacm-dev
+      - name: Compile with RDMA support (RDMA suites need a device and run elsewhere)
+        run: make
+
+  benchmark-verification:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y python3-matplotlib
+      - name: Verify figures, tables and claims against the raw data
+        run: make verify

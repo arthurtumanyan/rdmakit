@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "tool": {"name": "kvbench", "commit": "fc0dc39", "timestamp": "2026-10-20T13:31:43Z"},
+  "environment": {"cpu": "12th Gen Intel(R) Core(TM) i9-12900K", "logical_cpus": 24, "kernel": "7.0.0-34-generic", "machine": "x86_64", "compiler": "13.3.0"},
+  "config": {"label": "memcached memcached-220000-r2", "driver": "memcached", "host": "127.0.0.1", "port": "7100", "threads": 16, "warmup_s": 2.0, "duration_s": 6.0, "keys": 100000, "dist": "uniform", "theta": 0.990, "value_size": 64, "read_ratio": 0.900, "seed": 1, "preload": 1, "rate": 220000.0, "arrival": "constant", "argv": ["kvbench/build/x86_64/kvbench", "--driver", "memcached", "--host", "127.0.0.1", "--port", "7100", "--threads", "16", "--warmup", "2", "--duration", "6", "--keys", "100000", "--value-size", "64", "--read-ratio", "0.9", "--dist", "uniform", "--rate", "220000", "--arrival", "constant", "--pin", "8,10,12,14", "--server-pid", "3806507", "--label", "memcached memcached-220000-r2", "--out", "benchmarks/data/2026-10-20-run1/sweep/memcached-220000-r2.json"]},
+  "results": {
+    "seconds": 6.000, "ops": 1319766, "gets": 1187907, "puts": 131859, "misses": 0, "errors": 0, "ops_per_sec": 219958.8,
+    "get_latency_ns": {"count": 1187907, "min": 7756, "mean": 1469239.3, "p50": 109055, "p90": 1974271, "p99": 32899071, "p999": 43253759, "max": 45014761},
+    "put_latency_ns": {"count": 131859, "min": 8190, "mean": 1474084.8, "p50": 109055, "p90": 1933311, "p99": 33161215, "p999": 42991615, "max": 44969720},
+    "service_time_ns": {"count": 1319766, "min": 7560, "mean": 63159.2, "p50": 63999, "p90": 86527, "p99": 181247, "p999": 638975, "max": 3534610},
+    "max_lag_ns": 44942169,
+    "series": [220220, 219999, 219993, 219999, 219989, 219552],
+    "server": {"cpu_seconds": 5.830, "cpu_us_per_op": 4.417, "rss_bytes": 22446080}
+  }
+}

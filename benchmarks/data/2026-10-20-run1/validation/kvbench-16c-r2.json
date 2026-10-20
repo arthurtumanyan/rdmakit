@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "tool": {"name": "kvbench", "commit": "fc0dc39", "timestamp": "2026-10-20T14:00:28Z"},
+  "environment": {"cpu": "12th Gen Intel(R) Core(TM) i9-12900K", "logical_cpus": 24, "kernel": "7.0.0-34-generic", "machine": "x86_64", "compiler": "13.3.0"},
+  "config": {"label": "valkey kvbench-16c-r2", "driver": "resp", "host": "127.0.0.1", "port": "7100", "threads": 16, "warmup_s": 3.0, "duration_s": 8.0, "keys": 100000, "dist": "uniform", "theta": 0.990, "value_size": 64, "read_ratio": 0.900, "seed": 1, "preload": 1, "rate": 0.0, "arrival": "constant", "argv": ["kvbench/build/x86_64/kvbench", "--driver", "resp", "--host", "127.0.0.1", "--port", "7100", "--threads", "16", "--warmup", "3", "--duration", "8", "--keys", "100000", "--value-size", "64", "--read-ratio", "0.9", "--dist", "uniform", "--pin", "8,10,12,14", "--server-pid", "3860790", "--label", "valkey kvbench-16c-r2", "--out", "benchmarks/data/2026-10-20-run1/validation/kvbench-16c-r2.json"]},
+  "results": {
+    "seconds": 8.000, "ops": 1616742, "gets": 1455038, "puts": 161704, "misses": 0, "errors": 0, "ops_per_sec": 202090.4,
+    "get_latency_ns": {"count": 1455038, "min": 16122, "mean": 79083.9, "p50": 75775, "p90": 92159, "p99": 146431, "p999": 278527, "max": 4186017},
+    "put_latency_ns": {"count": 161704, "min": 17135, "mean": 79556.7, "p50": 75775, "p90": 93695, "p99": 147455, "p999": 272383, "max": 3827233},
+    "service_time_ns": {"count": 1616742, "min": 16122, "mean": 79131.2, "p50": 75775, "p90": 92159, "p99": 146431, "p999": 278527, "max": 4186017},
+    "max_lag_ns": 0,
+    "series": [204395, 206192, 197951, 201669, 203138, 198198, 200674, 204508],
+    "server": {"cpu_seconds": 8.000, "cpu_us_per_op": 4.948, "rss_bytes": 24027136}
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "tool": {"name": "kvbench", "commit": "fc0dc39", "timestamp": "2026-10-20T13:00:39Z"},
+  "environment": {"cpu": "12th Gen Intel(R) Core(TM) i9-12900K", "logical_cpus": 24, "kernel": "7.0.0-34-generic", "machine": "x86_64", "compiler": "13.3.0"},
+  "config": {"label": "memcached memcached-1cpu-kvcache-r2", "driver": "memcached", "host": "127.0.0.1", "port": "7100", "threads": 16, "warmup_s": 3.0, "duration_s": 8.0, "keys": 100000, "dist": "uniform", "theta": 0.900, "value_size": 64, "read_ratio": 0.900, "seed": 1, "preload": 1, "rate": 0.0, "arrival": "constant", "argv": ["kvbench/build/x86_64/kvbench", "--driver", "memcached", "--host", "127.0.0.1", "--port", "7100", "--threads", "16", "--warmup", "3", "--duration", "8", "--scenario", "kvcache", "--block-size", "16384", "--groups", "16", "--shared-blocks", "32", "--turn-blocks", "8", "--active-conv", "256", "--max-turns", "16", "--new-conv-prob", "0.05", "--theta", "0.9", "--pin", "8,10,12,14", "--server-pid", "3748227", "--label", "memcached memcached-1cpu-kvcache-r2", "--out", "benchmarks/data/2026-10-20-run1/matrix/memcached-1cpu-kvcache-r2.json"]},
+  "results": {
+    "seconds": 8.000, "ops": 1017127, "gets": 909487, "puts": 107640, "misses": 13455, "errors": 0, "ops_per_sec": 127139.3,
+    "get_latency_ns": {"count": 0, "min": 0, "mean": 0.0, "p50": 0, "p90": 0, "p99": 0, "p999": 0, "max": 0},
+    "put_latency_ns": {"count": 0, "min": 0, "mean": 0.0, "p50": 0, "p90": 0, "p99": 0, "p999": 0, "max": 0},
+    "service_time_ns": {"count": 13455, "min": 2582424, "mean": 9510957.4, "p50": 8060927, "p90": 16252927, "p99": 25559039, "p999": 34340863, "max": 67296852},
+    "max_lag_ns": 0,
+    "series": [1735, 1760, 1625, 1616, 1596, 1690, 1714, 1719],
+    "kvcache": {"block_size": 16384, "groups": 16, "shared_blocks": 32, "turn_blocks": 8, "active_conv": 256, "max_turns": 16, "new_conv_prob": 0.050, "theta": 0.900, "requests": 13455, "block_gets": 909487, "block_hits": 896032, "hit_rate": 0.9852, "reuse_rate": 0.8928, "block_puts": 107640, "bytes_get": 14680588288, "bytes_put": 1763573760, "corrupt": 0,
+    "request_latency_ns": {"count": 13455, "min": 2582424, "mean": 9510957.4, "p50": 8060927, "p90": 16252927, "p99": 25559039, "p999": 34340863, "max": 67296852}},
+    "server": {"cpu_seconds": 7.990, "cpu_us_per_op": 7.855, "rss_bytes": 2731991040}
+  }
+}

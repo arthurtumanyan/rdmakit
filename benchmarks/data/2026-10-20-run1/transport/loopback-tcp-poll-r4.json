@@ -1,0 +1,10 @@
+{"tool": "rtp_bench", "transport": "tcp", "wait": "poll", "pingpong_max": 5000, "stream_max": 20000, "results": [
+  {"size": 64, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 16.80, "p50": 8.36, "p99": 64.04, "p999": 136.10, "min": 7.92, "max": 381.85}, "pingpong_mb_s": 7.60, "stream_msgs_per_s": 423564, "stream_mb_s": 27.11},
+  {"size": 256, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 8.63, "p50": 8.42, "p99": 12.36, "p999": 30.93, "min": 8.13, "max": 108.90}, "pingpong_mb_s": 59.18, "stream_msgs_per_s": 400186, "stream_mb_s": 102.45},
+  {"size": 1024, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 8.91, "p50": 8.66, "p99": 13.22, "p999": 18.61, "min": 8.32, "max": 102.84}, "pingpong_mb_s": 229.43, "stream_msgs_per_s": 311703, "stream_mb_s": 319.18},
+  {"size": 4096, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 10.78, "p50": 9.69, "p99": 20.48, "p999": 65.00, "min": 8.90, "max": 99.96}, "pingpong_mb_s": 758.51, "stream_msgs_per_s": 293466, "stream_mb_s": 1202.03},
+  {"size": 16384, "pingpong_count": 4096, "stream_count": 16384, "rtt_us": {"mean": 11.91, "p50": 11.89, "p99": 13.54, "p999": 14.72, "min": 10.39, "max": 19.42}, "pingpong_mb_s": 2748.18, "stream_msgs_per_s": 229416, "stream_mb_s": 3758.75},
+  {"size": 65536, "pingpong_count": 1024, "stream_count": 4096, "rtt_us": {"mean": 23.22, "p50": 23.17, "p99": 24.92, "p999": 25.36, "min": 22.85, "max": 25.80}, "pingpong_mb_s": 5640.11, "stream_msgs_per_s": 108487, "stream_mb_s": 7109.81},
+  {"size": 262144, "pingpong_count": 256, "stream_count": 1024, "rtt_us": {"mean": 58.13, "p50": 58.20, "p99": 62.19, "p999": 64.16, "min": 56.33, "max": 64.16}, "pingpong_mb_s": 9016.02, "stream_msgs_per_s": 34248, "stream_mb_s": 8977.85},
+  {"size": 1048576, "pingpong_count": 200, "stream_count": 256, "rtt_us": {"mean": 249.16, "p50": 248.73, "p99": 254.63, "p999": 270.76, "min": 246.42, "max": 270.76}, "pingpong_mb_s": 8415.86, "stream_msgs_per_s": 7695, "stream_mb_s": 8068.48}
+]}

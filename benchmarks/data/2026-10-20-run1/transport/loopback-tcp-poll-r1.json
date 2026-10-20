@@ -1,0 +1,10 @@
+{"tool": "rtp_bench", "transport": "tcp", "wait": "poll", "pingpong_max": 5000, "stream_max": 20000, "results": [
+  {"size": 64, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 12.37, "p50": 9.83, "p99": 33.55, "p999": 61.43, "min": 7.42, "max": 245.05}, "pingpong_mb_s": 10.32, "stream_msgs_per_s": 394699, "stream_mb_s": 25.26},
+  {"size": 256, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 8.32, "p50": 8.15, "p99": 9.52, "p999": 11.25, "min": 7.99, "max": 371.47}, "pingpong_mb_s": 61.44, "stream_msgs_per_s": 407063, "stream_mb_s": 104.21},
+  {"size": 1024, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 8.81, "p50": 8.32, "p99": 17.12, "p999": 98.72, "min": 7.83, "max": 112.37}, "pingpong_mb_s": 232.05, "stream_msgs_per_s": 317556, "stream_mb_s": 325.18},
+  {"size": 4096, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 10.50, "p50": 10.20, "p99": 14.86, "p999": 26.68, "min": 8.72, "max": 104.11}, "pingpong_mb_s": 778.72, "stream_msgs_per_s": 291584, "stream_mb_s": 1194.33},
+  {"size": 16384, "pingpong_count": 4096, "stream_count": 16384, "rtt_us": {"mean": 14.51, "p50": 12.63, "p99": 25.14, "p999": 107.90, "min": 10.67, "max": 133.51}, "pingpong_mb_s": 2255.10, "stream_msgs_per_s": 224044, "stream_mb_s": 3670.74},
+  {"size": 65536, "pingpong_count": 1024, "stream_count": 4096, "rtt_us": {"mean": 24.11, "p50": 23.86, "p99": 26.85, "p999": 32.97, "min": 23.00, "max": 183.29}, "pingpong_mb_s": 5432.88, "stream_msgs_per_s": 109736, "stream_mb_s": 7191.67},
+  {"size": 262144, "pingpong_count": 256, "stream_count": 1024, "rtt_us": {"mean": 59.78, "p50": 59.74, "p99": 68.71, "p999": 72.23, "min": 56.15, "max": 72.23}, "pingpong_mb_s": 8768.06, "stream_msgs_per_s": 33575, "stream_mb_s": 8801.59},
+  {"size": 1048576, "pingpong_count": 200, "stream_count": 256, "rtt_us": {"mean": 243.16, "p50": 241.60, "p99": 267.73, "p999": 272.65, "min": 237.90, "max": 272.65}, "pingpong_mb_s": 8623.37, "stream_msgs_per_s": 7708, "stream_mb_s": 8082.94}
+]}

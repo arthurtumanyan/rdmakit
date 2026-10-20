@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "tool": {"name": "kvbench", "commit": "fc0dc39", "timestamp": "2026-10-20T13:16:45Z"},
+  "environment": {"cpu": "12th Gen Intel(R) Core(TM) i9-12900K", "logical_cpus": 24, "kernel": "7.0.0-34-generic", "machine": "x86_64", "compiler": "13.3.0"},
+  "config": {"label": "kvstore kvstore-4cpu-block-r4", "driver": "native", "host": "127.0.0.1", "port": "7100", "threads": 16, "warmup_s": 3.0, "duration_s": 8.0, "keys": 20000, "dist": "uniform", "theta": 0.990, "value_size": 16384, "read_ratio": 0.900, "seed": 1, "preload": 1, "rate": 0.0, "arrival": "constant", "argv": ["kvbench/build/x86_64/kvbench", "--driver", "native", "--driver-opt", "transport=tcp", "--host", "127.0.0.1", "--port", "7100", "--threads", "16", "--warmup", "3", "--duration", "8", "--keys", "20000", "--value-size", "16384", "--read-ratio", "0.9", "--dist", "uniform", "--pin", "8,10,12,14", "--server-pid", "3777932", "--label", "kvstore kvstore-4cpu-block-r4", "--out", "benchmarks/data/2026-10-20-run1/matrix/kvstore-4cpu-block-r4.json"]},
+  "results": {
+    "seconds": 8.000, "ops": 3714112, "gets": 3342741, "puts": 371371, "misses": 0, "errors": 0, "ops_per_sec": 464260.2,
+    "get_latency_ns": {"count": 3342741, "min": 9739, "mean": 34299.4, "p50": 32767, "p90": 44799, "p99": 68095, "p999": 187391, "max": 2949838},
+    "put_latency_ns": {"count": 371371, "min": 12704, "mean": 35480.1, "p50": 33535, "p90": 46847, "p99": 70655, "p999": 201727, "max": 2041464},
+    "service_time_ns": {"count": 3714112, "min": 9739, "mean": 34417.5, "p50": 33023, "p90": 45055, "p99": 68607, "p999": 189439, "max": 2949838},
+    "max_lag_ns": 0,
+    "series": [490294, 479237, 484995, 472895, 420584, 477896, 414507, 473674],
+    "server": {"cpu_seconds": 31.880, "cpu_us_per_op": 8.583, "rss_bytes": 341164032}
+  }
+}
