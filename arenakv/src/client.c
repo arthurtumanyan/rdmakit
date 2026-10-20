@@ -1,9 +1,11 @@
-/* client.c - synchronous client for the akvproto protocol, see akvclient.h. */
+/* client.c - client for the native arenakv protocol, see akvclient.h. */
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "akvclient.h"
+#include "hash.h"
 
 struct akvc {
     duct_ctx *ctx;
@@ -13,6 +15,8 @@ struct akvc {
     size_t req_cap;
     struct duct_rx rx;
     int rx_held;
+    unsigned outstanding;
+    unsigned window;
 };
 
 int akvc_connect(akvc **out, const struct duct_opts *opts, const char *host, const char *port) {
@@ -33,6 +37,11 @@ int akvc_connect(akvc **out, const struct duct_opts *opts, const char *host, con
         akvc_close(c);
         return rc;
     }
+    /* Responses are held one at a time; requests in flight are bounded by both directions' buffers. */
+    c->window = opts->recv_depth < opts->send_depth ? opts->recv_depth : opts->send_depth;
+    if (c->window > 1) {
+        c->window--;
+    }
     c->next_id = 1;
     *out = c;
     return 0;
@@ -51,112 +60,209 @@ void akvc_close(akvc *c) {
     free(c);
 }
 
-/* Sends c->req[0, len) and waits for the response; the response message stays held in c->rx. */
-static int exchange(akvc *c, size_t len) {
+unsigned akvc_window(const akvc *c) {
+    return c->window;
+}
+
+/* Builds a request in c->req and returns its length, or 0 when it does not fit. */
+static size_t build(akvc *c, uint8_t op, const void *key, size_t klen, const void *val, size_t vlen,
+                    const struct akvp_ext *ext) {
+    size_t x = ext != NULL ? AKVP_EXT : 0;
+    if (AKVP_REQ_HDR + x + klen + vlen > c->req_cap || klen > 0xffff || vlen > UINT32_MAX) {
+        return 0;
+    }
+    struct akvp_req r = {.op = op,
+                         .flags = ext != NULL ? AKVP_F_EXT : 0,
+                         .klen = (uint16_t)klen,
+                         .reqid = c->next_id++,
+                         .vlen = (uint32_t)vlen};
+    akvp_req_encode(c->req, &r);
+    if (ext != NULL) {
+        akvp_ext_encode(c->req + AKVP_REQ_HDR, ext);
+    }
+    if (klen > 0) {
+        memcpy(c->req + AKVP_REQ_HDR + x, key, klen);
+    }
+    if (vlen > 0) {
+        memcpy(c->req + AKVP_REQ_HDR + x + klen, val, vlen);
+    }
+    return AKVP_REQ_HDR + x + klen + vlen;
+}
+
+int akvc_post(akvc *c, uint8_t op, const void *key, size_t klen, const void *val, size_t vlen,
+              const struct akvp_ext *ext, uint32_t *reqid) {
+    if (c->outstanding >= c->window) {
+        return -EBUSY;
+    }
+    size_t n = build(c, op, key, klen, val, vlen, ext);
+    if (n == 0) {
+        return AKVP_TOOBIG;
+    }
+    int rc = duct_send(c->ep, c->req, n, 10000);
+    if (rc != 0) {
+        return rc;
+    }
+    c->outstanding++;
+    if (reqid != NULL) {
+        *reqid = c->next_id - 1;
+    }
+    return 0;
+}
+
+int akvc_next(akvc *c, struct akvc_resp *r, int timeout_ms) {
+    if (c->outstanding == 0) {
+        return -EINVAL;
+    }
     if (c->rx_held) {
         duct_rx_release(c->ep, &c->rx);
         c->rx_held = 0;
     }
-    int rc = duct_send(c->ep, c->req, len, 10000);
-    if (rc != 0) {
-        return rc;
-    }
-    rc = duct_recv(c->ep, &c->rx, 10000);
+    int rc = duct_recv(c->ep, &c->rx, timeout_ms);
     if (rc != 0) {
         return rc;
     }
     c->rx_held = 1;
+    c->outstanding--;
+    struct akvp_resp rs;
+    if (akvp_resp_decode(c->rx.data, c->rx.len, &rs) != 0) {
+        return DUCT_EPROTO;
+    }
+    r->reqid = rs.reqid;
+    r->status = rs.status;
+    r->payload = (const uint8_t *)c->rx.data + AKVP_RESP_HDR;
+    r->len = rs.vlen;
     return 0;
 }
 
-/* Builds a request of the given op in c->req and returns its length, or 0 when it does not fit. */
-static size_t build(akvc *c, uint8_t op, const void *key, size_t klen, const void *val, size_t vlen) {
-    if (AKVP_REQ_HDR + klen + vlen > c->req_cap || klen > 0xffff) {
-        return 0;
+/* Sends one request and waits for its response. Returns the status or a negative error. */
+static int call(akvc *c, uint8_t op, const void *key, size_t klen, const void *val, size_t vlen,
+                const struct akvp_ext *ext, struct akvc_resp *r) {
+    while (c->outstanding > 0) { /* collect responses of earlier pipelined requests first */
+        struct akvc_resp skip;
+        int rc = akvc_next(c, &skip, 10000);
+        if (rc != 0) {
+            return rc;
+        }
     }
-    struct akvp_req r = {.op = op, .klen = (uint16_t)klen, .reqid = c->next_id++, .vlen = (uint32_t)vlen};
-    akvp_req_encode(c->req, &r);
-    if (klen > 0) {
-        memcpy(c->req + AKVP_REQ_HDR, key, klen);
+    uint32_t id;
+    int rc = akvc_post(c, op, key, klen, val, vlen, ext, &id);
+    if (rc != 0) {
+        return rc;
     }
-    if (vlen > 0) {
-        memcpy(c->req + AKVP_REQ_HDR + klen, val, vlen);
+    rc = akvc_next(c, r, 10000);
+    if (rc != 0) {
+        return rc;
     }
-    return AKVP_REQ_HDR + klen + vlen;
+    return r->reqid == id ? r->status : DUCT_EPROTO;
 }
 
-/* Validates the held response against the last request id; returns the status or a negative error. */
-static int status_of(akvc *c, struct akvp_resp *rs) {
-    if (akvp_resp_decode(c->rx.data, c->rx.len, rs) != 0 || rs->reqid != c->next_id - 1) {
-        return DUCT_EPROTO;
+int akvc_auth(akvc *c, const char *credentials) {
+    struct akvc_resp r;
+    return call(c, AKVP_AUTH, NULL, 0, credentials, strlen(credentials), NULL, &r);
+}
+
+int akvc_store(akvc *c, uint8_t op, const void *key, size_t klen, const void *val, size_t vlen,
+               const struct akvp_ext *ext, uint64_t *cas_out) {
+    struct akvc_resp r;
+    int rc = call(c, op, key, klen, val, vlen, ext, &r);
+    if (rc == AKVP_OK && cas_out != NULL) {
+        *cas_out = r.len == 8 ? akvp_get64(r.payload) : 0;
     }
-    return rs->status;
+    return rc;
 }
 
 int akvc_put(akvc *c, const void *key, size_t klen, const void *val, size_t vlen) {
-    size_t n = build(c, AKVP_PUT, key, klen, val, vlen);
-    if (n == 0) {
-        return AKVP_TOOBIG;
-    }
-    int rc = exchange(c, n);
-    if (rc != 0) {
-        return rc;
-    }
-    struct akvp_resp rs;
-    return status_of(c, &rs);
+    return akvc_store(c, AKVP_PUT, key, klen, val, vlen, NULL, NULL);
 }
 
 int akvc_get(akvc *c, const void *key, size_t klen, void *buf, size_t cap, size_t *vlen) {
-    size_t n = build(c, AKVP_GET, key, klen, NULL, 0);
-    if (n == 0) {
-        return AKVP_TOOBIG;
-    }
-    int rc = exchange(c, n);
-    if (rc != 0) {
-        return rc;
-    }
-    struct akvp_resp rs;
-    rc = status_of(c, &rs);
+    struct akvc_resp r;
+    int rc = call(c, AKVP_GET, key, klen, NULL, 0, NULL, &r);
     if (rc != AKVP_OK) {
         return rc;
     }
-    *vlen = rs.vlen;
-    if (rs.vlen > cap) {
+    *vlen = r.len;
+    if (r.len > cap) {
         return AKVP_TOOBIG;
     }
-    memcpy(buf, (const uint8_t *)c->rx.data + AKVP_RESP_HDR, rs.vlen);
+    memcpy(buf, r.payload, r.len);
+    return AKVP_OK;
+}
+
+int akvc_get_meta(akvc *c, const void *key, size_t klen, void *buf, size_t cap, size_t *vlen, uint32_t *flags,
+                  uint64_t *cas, int64_t *ttl_ms, int64_t touch_ttl_ms) {
+    struct akvp_ext x = {.ttl_ms = touch_ttl_ms};
+    struct akvc_resp r;
+    int rc = call(c, AKVP_GETM, key, klen, NULL, 0, &x, &r);
+    if (rc != AKVP_OK) {
+        return rc;
+    }
+    if (r.len < AKVP_META) {
+        return DUCT_EPROTO;
+    }
+    if (flags != NULL) {
+        *flags = akvp_get32(r.payload);
+    }
+    if (cas != NULL) {
+        *cas = akvp_get64(r.payload + 8);
+    }
+    if (ttl_ms != NULL) {
+        *ttl_ms = (int64_t)akvp_get64(r.payload + 16);
+    }
+    *vlen = r.len - AKVP_META;
+    if (*vlen > cap) {
+        return AKVP_TOOBIG;
+    }
+    memcpy(buf, r.payload + AKVP_META, *vlen);
     return AKVP_OK;
 }
 
 int akvc_del(akvc *c, const void *key, size_t klen) {
-    size_t n = build(c, AKVP_DEL, key, klen, NULL, 0);
-    if (n == 0) {
-        return AKVP_TOOBIG;
+    struct akvc_resp r;
+    return call(c, AKVP_DEL, key, klen, NULL, 0, NULL, &r);
+}
+
+int akvc_exists(akvc *c, const void *key, size_t klen) {
+    struct akvc_resp r;
+    return call(c, AKVP_HAS, key, klen, NULL, 0, NULL, &r);
+}
+
+int akvc_touch(akvc *c, const void *key, size_t klen, int64_t ttl_ms) {
+    struct akvp_ext x = {.ttl_ms = ttl_ms};
+    struct akvc_resp r;
+    return call(c, AKVP_TOUCH, key, klen, NULL, 0, &x, &r);
+}
+
+int akvc_incr(akvc *c, const void *key, size_t klen, int64_t delta, int is_signed, int64_t *result) {
+    uint8_t d[8];
+    akvp_put64(d, (uint64_t)delta);
+    struct akvc_resp r;
+    int rc = call(c, is_signed ? AKVP_INCRS : AKVP_INCR, key, klen, d, 8, NULL, &r);
+    if (rc == AKVP_OK) {
+        if (r.len != 8) {
+            return DUCT_EPROTO;
+        }
+        *result = (int64_t)akvp_get64(r.payload);
     }
-    int rc = exchange(c, n);
-    if (rc != 0) {
-        return rc;
-    }
-    struct akvp_resp rs;
-    return status_of(c, &rs);
+    return rc;
+}
+
+int akvc_flush(akvc *c) {
+    struct akvc_resp r;
+    return call(c, AKVP_FLUSH, NULL, 0, NULL, 0, NULL, &r);
 }
 
 int akvc_stats(akvc *c, uint64_t out[AKVP_STATS_FIELDS]) {
-    size_t n = build(c, AKVP_STATS, NULL, 0, NULL, 0);
-    int rc = exchange(c, n);
-    if (rc != 0) {
-        return rc;
-    }
-    struct akvp_resp rs;
-    rc = status_of(c, &rs);
+    struct akvc_resp r;
+    int rc = call(c, AKVP_STATS, NULL, 0, NULL, 0, NULL, &r);
     if (rc != AKVP_OK) {
         return rc;
     }
-    if (rs.vlen != AKVP_STATS_BYTES) {
+    if (r.len != AKVP_STATS_BYTES) {
         return DUCT_EPROTO;
     }
     for (unsigned i = 0; i < AKVP_STATS_FIELDS; i++) {
-        out[i] = akvp_get64((const uint8_t *)c->rx.data + AKVP_RESP_HDR + 8 * i);
+        out[i] = akvp_get64(r.payload + 8 * i);
     }
     return AKVP_OK;
 }
@@ -165,12 +271,123 @@ int akvc_raw(akvc *c, const void *msg, size_t len, const uint8_t **resp, size_t 
     if (len > c->req_cap) {
         return -EMSGSIZE;
     }
-    memcpy(c->req, msg, len);
-    int rc = exchange(c, len);
+    while (c->outstanding > 0) {
+        struct akvc_resp skip;
+        int rc = akvc_next(c, &skip, 10000);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    if (c->rx_held) {
+        duct_rx_release(c->ep, &c->rx);
+        c->rx_held = 0;
+    }
+    int rc = duct_send(c->ep, msg, len, 10000);
     if (rc != 0) {
         return rc;
     }
+    rc = duct_recv(c->ep, &c->rx, 10000);
+    if (rc != 0) {
+        return rc;
+    }
+    c->rx_held = 1;
     *resp = c->rx.data;
     *resp_len = c->rx.len;
     return 0;
+}
+
+/* ---- pool ------------------------------------------------------------------------------------------------ */
+
+#define POOL_POINTS 160u
+#define POOL_SEED 0x6b6574616d61ull /* fixed: placement must not change between processes */
+
+struct point {
+    uint64_t pos;
+    unsigned server;
+};
+
+struct akvc_pool {
+    akvc **clients;
+    unsigned n;
+    struct point *ring;
+    size_t npoints;
+};
+
+static int cmp_point(const void *a, const void *b) {
+    const struct point *x = a;
+    const struct point *y = b;
+    return x->pos < y->pos ? -1 : x->pos > y->pos ? 1 : (int)x->server - (int)y->server;
+}
+
+int akvc_pool_create(akvc_pool **out, const struct duct_opts *opts, const char *const *servers, unsigned n) {
+    if (n == 0) {
+        return -EINVAL;
+    }
+    akvc_pool *p = calloc(1, sizeof(*p));
+    if (p == NULL) {
+        return -ENOMEM;
+    }
+    p->clients = calloc(n, sizeof(*p->clients));
+    p->ring = calloc((size_t)n * POOL_POINTS, sizeof(*p->ring));
+    if (p->clients == NULL || p->ring == NULL) {
+        akvc_pool_close(p);
+        return -ENOMEM;
+    }
+    p->n = n;
+    for (unsigned i = 0; i < n; i++) {
+        char host[256];
+        const char *colon = strrchr(servers[i], ':');
+        if (colon == NULL || (size_t)(colon - servers[i]) >= sizeof(host)) {
+            akvc_pool_close(p);
+            return -EINVAL;
+        }
+        memcpy(host, servers[i], (size_t)(colon - servers[i]));
+        host[colon - servers[i]] = '\0';
+        int rc = akvc_connect(&p->clients[i], opts, host, colon + 1);
+        if (rc != 0) {
+            akvc_pool_close(p);
+            return rc;
+        }
+        /* Points depend on the server's name only, so every client computes the same ring. */
+        for (unsigned k = 0; k < POOL_POINTS; k++) {
+            char label[300];
+            int len = snprintf(label, sizeof(label), "%s-%u", servers[i], k);
+            p->ring[p->npoints++] =
+                (struct point){.pos = akv_hash64(label, (size_t)len, POOL_SEED), .server = i};
+        }
+    }
+    qsort(p->ring, p->npoints, sizeof(*p->ring), cmp_point);
+    *out = p;
+    return 0;
+}
+
+unsigned akvc_pool_index(const akvc_pool *p, const void *key, size_t klen) {
+    uint64_t h = akv_hash64(key, klen, POOL_SEED);
+    size_t lo = 0;
+    size_t hi = p->npoints;
+    while (lo < hi) { /* first point at or after h, wrapping to the start of the ring */
+        size_t mid = lo + (hi - lo) / 2;
+        if (p->ring[mid].pos < h) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return p->ring[lo == p->npoints ? 0 : lo].server;
+}
+
+akvc *akvc_pool_pick(akvc_pool *p, const void *key, size_t klen) {
+    return p->clients[akvc_pool_index(p, key, klen)];
+}
+
+void akvc_pool_close(akvc_pool *p) {
+    if (p == NULL) {
+        return;
+    }
+    for (unsigned i = 0; p->clients != NULL && i < p->n; i++) {
+        akvc_close(p->clients[i]);
+    }
+    free(p->clients);
+    free(p->ring);
+    free(p);
 }

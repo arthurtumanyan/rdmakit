@@ -1,18 +1,25 @@
 # arenakv
 
-An in-memory key-value **cache** for large values, with a server (`arenakvd`) that speaks a small binary protocol
-over [`rdmaduct`](../rdmaduct) (TCP or RDMA). The engine keeps entries in log-structured memory, finds them through a
-hash index whose tags are compared with vector instructions, and evicts with a second chance.
+An in-memory key-value **cache** for large values. One server (`arenakvd`) serves the same engine over three
+protocols: its native binary protocol over [`rdmaduct`](../rdmaduct) (RDMA or TCP), the **memcached** text and meta
+protocol, and **RESP2** (the Redis protocol), so existing Redis and memcached clients work unchanged. The engine keeps
+entries in log-structured memory, finds them through a growing hash index whose tags are compared with vector
+instructions, and evicts with a second chance.
 
-- Fixed memory budget; the oldest entries are evicted when it is full. A lookup returns the most recent value stored
-  for a key or reports a miss; it never returns an older version.
-- Operations: `PUT`, `GET`, `DEL`, `STATS` (binary protocol, [`docs/PROTOCOL.md`](docs/PROTOCOL.md)).
-- Sharded engine: operations on different shards run in parallel.
-- Same-size overwrites are done in place; no dead entries accumulate for fixed-size blocks.
-- Tag comparison with SSE2 (x86-64) or NEON (aarch64), with a portable fallback.
-- Client library (`akvclient.h`) and a native driver for [`kvpace`](../kvpace).
+- Fixed memory budget; the oldest entries are evicted when it is full (or stores are refused with `--no-evict`).
+  A lookup returns the most recent value stored for a key or reports a miss; it never returns an older version.
+- Per-entry client flags, CAS versions and millisecond expiry; conditional stores (add, replace, append, prepend,
+  CAS), increments, touch, flush, multi-key reads.
+- Event-loop server: worker threads serve thousands of pipelined connections; native connections use rdmaduct's
+  pollable descriptors.
+- Authentication for all protocols, TLS for the text protocols (optional OpenSSL build), snapshots to disk with
+  CRC-checked blocks, configuration file, log rotation, systemd unit and container image.
+- Sharded engine: operations on different shards run in parallel. Tag comparison with SSE2 (x86-64) or NEON
+  (aarch64), with a portable fallback.
+- Client library (`akvclient.h`) with pipelining and consistent hashing over several servers, and a native driver
+  for [`kvpace`](../kvpace).
 
-**Status:** experimental, not for production use. No persistence, replication, authentication or encryption.
+**Status:** experimental, not for production use. No replication; strings only.
 
 ## Why this exists
 
@@ -27,9 +34,9 @@ use an RDMA transport. `arenakv` is a cache built for that access pattern:
   scalar fallback.
 - **No stale reads.** A lookup returns the latest value stored for a key or a miss, never an older version. A
   model test against a reference map checks this under eviction.
-- **Transport-independent server.** The server runs over [`rdmaduct`](../rdmaduct), so the same binary serves
-  TCP and RDMA clients.
-- **Small enough to audit:** about 1,400 lines including the server and the client.
+- **Transport-independent server.** The native protocol runs over [`rdmaduct`](../rdmaduct), so the same binary
+  serves TCP and RDMA clients, next to standard memcached and Redis clients on the text protocols.
+- **Small enough to audit:** about 6,500 lines including the server, three protocols, persistence and the client.
 
 memcached, Valkey and Dragonfly are mature and remain the right default for general caching. The measurements
 below show where `arenakv` is in the same range, where it is better, and where it is worse.
@@ -42,16 +49,22 @@ below show where `arenakv` is in the same range, where it is better, and where i
 | Target values | large, mostly immutable blocks | small to medium objects | data structures | data structures |
 | Memory layout | log-structured arena per shard | slab allocator | per-object allocation (jemalloc) | per-object allocation (mimalloc) |
 | Eviction | second chance in write order | segmented LRU | approximate LRU / LFU policies | cache mode (2Q-based) |
-| Network transport | TCP and RDMA reliable connections | TCP, UDP, Unix sockets | TCP, Unix sockets | TCP |
-| Protocol | compact binary ([PROTOCOL.md](docs/PROTOCOL.md)) | text and meta commands | RESP | RESP and memcached text |
-| Persistence, replication | no | no | yes | yes |
-| Hash index | sized at start from the expected entry size | grows | grows | grows |
+| Network transport | TCP, TLS, RDMA reliable connections | TCP, UDP, Unix sockets, TLS | TCP, Unix sockets, TLS | TCP, TLS |
+| Protocols | memcached text and meta, RESP2, native binary ([PROTOCOL.md](docs/PROTOCOL.md)) | text, meta, binary | RESP2, RESP3 | RESP2, RESP3, memcached text |
+| Expiry, CAS, conditional stores, increments | yes | yes | yes | yes |
+| Data types | strings | strings | strings, lists, hashes, sets, sorted sets, streams | as Valkey |
+| Authentication | shared credentials file | SASL, ASCII auth | ACL users | ACL users |
+| Persistence | snapshots (CRC-checked, atomic rename) | warm restart | RDB, AOF | snapshots |
+| Replication, cluster | no (client-side consistent hashing) | no (client-side hashing) | yes | replication |
+| Hash index | grows from a small size | grows | grows | grows |
 | Production use | not recommended | widely deployed | widely deployed | deployed |
 
 Statements about other systems reflect their public documentation at the time of writing.
 
 ### Measured results
 
+These numbers were measured with the previous server version (one thread per connection, index sized from
+`--avg-entry`, native protocol only) and are kept until the benchmark suite is repeated with this version.
 One machine with default configurations, server and load generator over loopback; "Soft-RoCE" is software RDMA.
 Tables are generated from the raw data in [`../benchmarks/data`](../benchmarks/data). `make verify` at the repository
 root checks them and every tagged statement. Method and caveats: [`../benchmarks/METHODOLOGY.md`](../benchmarks/METHODOLOGY.md).
@@ -152,9 +165,10 @@ Findings:
   server CPU time per operation than both [C5]. memcached has the highest throughput in five of six rows [C1].
 - At one server CPU arenakv is slower than all three on 64-byte values [C3].
 - At small capacities arenakv reuses more cached blocks than Valkey [C11]; memcached is at least as good [C12].
-- With 64-byte values arenakv uses more than eight times the resident memory of the others [C16], because the hash
-  index is sized from the configured capacity and `--avg-entry`. Setting `--avg-entry` close to the real entry size
-  shrinks the index; that effect was not measured.
+- With 64-byte values arenakv used more than eight times the resident memory of the others [C16], because the hash
+  index was sized from the configured capacity and `--avg-entry` and sparse keys touched its pages. The index now
+  starts small and grows with the data (200,000 entries: 4 MiB of index in `tests/test_akv.c`); the benchmark has not
+  been repeated yet.
 - Under open-loop load arenakv saturates earlier than the other three servers [C7].
 - Over Soft-RoCE throughput is lower than over TCP in five of six rows [C6]. Soft-RoCE is software; no RDMA
   hardware result exists.
@@ -169,44 +183,72 @@ Linux, a C compiler with `-std=gnu2x` (gcc 13 or newer, clang 18 or newer), `mak
 
 ```
 make                  # build/<arch>/libarenakv.a, arenakvd, akv_bench
-make test             # engine, primitives and server integration tests
+make TLS=1            # with TLS listeners (needs libssl-dev; build/<arch>-tls/)
+make test             # engine, protocol, network and server tests
 make RDMA=0 test      # without RDMA libraries (build/<arch>-tcp/)
 make SAN=1 test       # AddressSanitizer + UndefinedBehaviorSanitizer
 make TSAN=1 test      # ThreadSanitizer (the test binaries run with ASLR disabled)
-DUCT_TEST_ADDR=<rdma-interface-ip> make test    # also exercises the server over RDMA
+make compat           # valkey-cli, valkey-benchmark, memtier_benchmark, redis-py against the server (Docker)
+DUCT_TEST_ADDR=<rdma-interface-ip> make test    # also exercises the native protocol over RDMA
 ```
 
-Test results: all three suites pass on x86-64 and aarch64, including the RDMA cases over Soft-RoCE in both waiting
-modes. On x86-64 they also pass under AddressSanitizer with UndefinedBehaviorSanitizer and under ThreadSanitizer.
-CI runs the TCP cases with gcc and clang on x86-64 and arm64.
+Test results: all suites pass on x86-64, including the RDMA cases over Soft-RoCE in both waiting modes, under
+AddressSanitizer with UndefinedBehaviorSanitizer (also with TLS) and under ThreadSanitizer. `make compat` passes with
+valkey-cli, valkey-benchmark, memtier_benchmark (RESP and memcached text) and redis-py. CI runs the TCP cases with gcc
+and clang on x86-64 and arm64.
 
 | Suite | Covers |
 |---|---|
-| `test_akv` | basic operations, argument validation, model check against a reference map: exact results with ample memory, only the latest version under eviction |
+| `test_akv` | model check against a reference map (exact with ample memory, only the latest version under eviction) with a presized and a growing index; store modes, flags, CAS; expiry, touch, keep-ttl; increments; flush; enumeration; no-evict; eight-thread stress |
 | `test_primitives` | vector tag matching equals the scalar reference for all lane combinations; hash avalanche and bucket distribution |
-| `test_server` | protocol round trips, malformed requests, size limits on both sides, concurrent clients with self-describing values, connection accounting, shutdown with clients connected; over TCP, and over RDMA when `DUCT_TEST_ADDR` is set |
+| `test_proto` | memcached and RESP commands with exact replies, also fed one byte at a time; framing errors; authentication; one million fuzzed inputs |
+| `test_net` | pipelining, large values and backpressure on real sockets, 16 concurrent clients, connection limit, idle timeout, snapshots (round trip, corruption, truncation), TLS, native revision 2, consistent hashing |
+| `test_server` | native protocol round trips, malformed requests, size limits, concurrent clients, shutdown with clients connected; over TCP, and over RDMA when `DUCT_TEST_ADDR` is set |
 
 ## Run the server
 
 ```
-build/x86_64/arenakvd --transport tcp --port 7600 --capacity 8G --avg-entry 16384
-build/x86_64/arenakvd --transport rdma --addr 192.0.2.10 --port 7600 --capacity 8G
+# drop-in cache for Redis and memcached clients
+build/x86_64/arenakvd --port off --resp-port 6379 --memcached-port 11211 --capacity 8G
+
+# native protocol over RDMA, persistence, authentication
+build/x86_64/arenakvd --transport rdma --addr 192.0.2.10 --port 7600 --capacity 8G \
+    --snapshot /var/lib/arenakv/arenakv.snap --save-interval 300 --auth-file /etc/arenakv/credentials
+
+# everything from a file (contrib/arenakvd.conf)
+build/x86_64/arenakvd --config /etc/arenakv/arenakvd.conf
+```
+
+```
+$ valkey-cli -p 6379 SET block-17 payload EX 3600
+OK
+$ printf 'get block-17\r\n' | nc -q1 localhost 11211
+VALUE block-17 0 7
+payload
+END
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--transport tcp\|rdma\|auto` | `auto` | `auto` selects RDMA when a device exists |
-| `--wait poll\|event` | `event` | waiting strategy of RDMA connections; `poll` needs one core per connection |
-| `--addr`, `--port` | all IPv4 addresses, 7600 | listen address and port |
+| `--port PORT\|off`, `--addr`, `--transport tcp\|rdma\|auto`, `--wait poll\|event` | 7600, all, auto, event | native listener over rdmaduct |
+| `--memcached-port`, `--resp-port`, `--text-addr` | off, off, all | text protocol listeners |
+| `--tls-memcached-port`, `--tls-resp-port`, `--tls-cert`, `--tls-key`, `--tls-ca` | off | TLS listeners (TLS builds) |
 | `--capacity SIZE` | 256M | cache memory (suffix K, M, G) |
+| `--max-entry SIZE` | 1M | largest key + value |
 | `--shards N` | 64 | engine shards, power of two |
-| `--avg-entry BYTES` | 256 | expected mean entry size; sizes the hash index (set it close to the real value) |
-| `--max-msg BYTES` | 65536 | largest message; bounds key + value + 12 |
-| `--depth N` | 16 | receive and send buffers per connection |
+| `--avg-entry BYTES` | 0 | presize the index for this mean entry size (0: grow on demand) |
+| `--no-evict` | off | refuse stores when full instead of evicting |
+| `--threads N` | online CPUs | worker threads |
+| `--max-conns N`, `--idle-timeout SEC` | unlimited, never | connection limits |
+| `--auth-file FILE` | none | credentials (`user:password` or a password per line) |
+| `--snapshot FILE`, `--save-interval SEC`, `--no-save-on-stop` | none, off, save at stop | persistence |
+| `--max-msg BYTES`, `--depth N` | 65536, 16 | native message size and buffers per connection |
 | `--huge-pages` | off | advise transparent huge pages for the arenas |
-| `--stats SEC` | off | print a statistics line every SEC seconds |
+| `--log-level`, `--log-file`, `--stats SEC` | info, stderr, off | logging (SIGHUP reopens the file) |
+| `--config FILE` | none | read options from a file; the command line overrides it |
 
-Operations guide: [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+Operations guide (security, persistence, monitoring, deployment, compatibility notes):
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 ## Use the client library
 
@@ -215,49 +257,63 @@ Operations guide: [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 struct duct_opts opts;
 duct_opts_default(&opts);
-opts.transport = DUCT_TRANSPORT_TCP;
+opts.transport = DUCT_TRANSPORT_TCP;      /* or DUCT_TRANSPORT_RDMA */
 opts.max_msg = 64 * 1024;
 
 akvc *c;
 if (akvc_connect(&c, &opts, "192.0.2.10", "7600") != 0) { /* handle error */ }
 
-akvc_put(c, "block-17", 8, data, data_len);            /* AKVP_OK on success */
+struct akvp_ext x = {.ttl_ms = 3600 * 1000, .uflags = 7};
+akvc_store(c, AKVP_ADD, "block-17", 8, data, data_len, &x, NULL);   /* AKVP_EXISTS when present */
 
 size_t n;
 int rc = akvc_get(c, "block-17", 8, buf, sizeof(buf), &n);
 if (rc == AKVP_OK) { /* buf[0..n) holds the value */ }
-else if (rc == AKVP_NOTFOUND) { /* miss */ }
+else if (rc == AKVP_NOTFOUND) { /* miss or expired */ }
+
+/* pipelining: post up to akvc_window(c) requests, then collect the responses in order */
+uint32_t id;
+akvc_post(c, AKVP_GET, "a", 1, NULL, 0, NULL, &id);
+akvc_post(c, AKVP_GET, "b", 1, NULL, 0, NULL, &id);
+struct akvc_resp r;
+akvc_next(c, &r, 1000);                   /* response to "a" */
+akvc_next(c, &r, 1000);                   /* response to "b" */
 
 akvc_close(c);
 ```
 
-Return values are a `akvp_status` (0 or positive) when the server answered and a negative `rdmaduct` error code when
-the transport failed. Link with `build/<arch>/libarenakv.a`, `../rdmaduct/build/<arch>/librdmaduct.a`, `-lpthread` and,
-for RDMA builds, `-lrdmacm -libverbs`.
+Several servers: `akvc_pool_create(&pool, &opts, servers, n)` and `akvc_pool_pick(pool, key, klen)` (consistent
+hashing; removing a server moves only its keys). Return values are an `akvp_status` (0 or positive) when the server
+answered and a negative `rdmaduct` error code when the transport failed. Link with `build/<arch>/libarenakv.a`,
+`../rdmaduct/build/<arch>/librdmaduct.a`, `-lpthread` and, for RDMA builds, `-lrdmacm -libverbs`.
 
 ## Use the engine directly
 
-`include/akv.h` is a self-contained in-process cache (`akv_create`, `akv_put`, `akv_get`, `akv_del`,
-`akv_stats_get`); it has no dependency on the server or the transport.
+`include/akv.h` is a self-contained in-process cache (`akv_create`, `akv_store`, `akv_get_meta`, `akv_incr`,
+`akv_touch`, `akv_del`, `akv_flush`, `akv_foreach`, `akv_stats_get`); it has no dependency on the server or the
+transport.
 
 ## Engine guarantees and limits
 
 - Thread safety: all engine functions are thread-safe; an operation locks one shard.
 - Keys: 1 to 65535 bytes. Entry (key + value): at most `max_entry` (default 1 MiB) and at most half of a shard arena.
-- Memory: the arena is the configured capacity (divided over the shards); the hash index is additional and sized
-  once from `--avg-entry`. Resident memory approaches the configured capacity once the log has wrapped.
+- Memory: the arena is the configured capacity (divided over the shards); the hash index is additional and grows
+  with the number of entries. Resident memory approaches the configured capacity once the log has wrapped.
+- Expiry uses a monotonic clock; expired entries are never returned.
 - Eviction order approximates least recently used: entries are removed in write order unless they were read.
-- A `PUT` may fail with "too big"; a `GET` after a successful `PUT` may still miss because of eviction.
+- A store may fail with "too big" (or "no memory" with `--no-evict`); a read after a successful store may still
+  miss because of eviction or expiry.
 
 ## Layout
 
 | Path | Content |
 |---|---|
 | `include/` | public headers: `akv.h` (engine), `akvproto.h` (protocol), `akvd.h` (server), `akvclient.h` |
-| `src/` | `akv.c` engine, `simd.h`, `hash.h`, `server.c`, `client.c` |
+| `src/` | `akv.c` engine, `simd.h`, `hash.h`, `server.c` core, `proto_mc.c`, `proto_resp.c`, `snapshot.c`, `client.c` |
 | `tools/` | `arenakvd` daemon, `akv_bench` micro-benchmarks |
-| `tests/` | engine, primitives and server tests |
-| `docs/` | architecture, protocol and operations |
+| `tests/` | engine, protocol, network and server tests; `compat.sh` with third-party clients |
+| `contrib/` | example configuration, systemd unit, Dockerfile |
+| `docs/` | architecture, native protocol and operations |
 
 ## Further reading
 

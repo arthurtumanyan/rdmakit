@@ -7,12 +7,18 @@
  * - arena wrap-around with small gaps (tiny shard arena, entry sizes that leave 8 and 16 byte gaps)
  * - second chance: a frequently read entry survives while unread neighbors are evicted
  * - multi-threaded stress with self-describing values (run under ThreadSanitizer as well)
+ * - index growth from the minimal size without losing entries; the same model with a growing index
+ * - store modes (add, replace, append, prepend, CAS), client flags and CAS versions
+ * - expiry: time to live, touch, persist, keep-ttl, get-and-touch, reclamation counters
+ * - increments in memcached (unsigned, wrapping, floor at 0) and RESP (signed, overflow) semantics
+ * - flush, enumeration with remaining time to live, and stores without eviction
  */
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "akv.h"
 
@@ -79,12 +85,15 @@ static void key_of(uint64_t id, char *key, size_t *klen) {
     *klen = (size_t)snprintf(key, 32, "key-%llu", (unsigned long long)id);
 }
 
+/* Index sizing of make(): 128 preallocates the index, 0 lets it grow from the minimal size. */
+static uint32_t make_avg_entry = 128;
+
 static akv *make(uint64_t capacity, uint32_t shards) {
     akv_config cfg;
     akv_config_default(&cfg);
     cfg.capacity = capacity;
     cfg.shards = shards;
-    cfg.avg_entry = 128;
+    cfg.avg_entry = make_avg_entry;
     cfg.hash_seed = 12345;
     akv *s = akv_create(&cfg);
     EXPECT(s != NULL, "create capacity=%llu shards=%u", (unsigned long long)capacity, shards);
@@ -342,6 +351,299 @@ static void test_threads(void) {
     akv_destroy(s);
 }
 
+/* ---- index growth --------------------------------------------------------------------------------- */
+
+static void test_growth(void) {
+    akv_config cfg;
+    akv_config_default(&cfg);
+    cfg.capacity = 64 << 20;
+    cfg.shards = 4;
+    cfg.hash_seed = 3;
+    akv *s = akv_create(&cfg);
+    akv_stats st0;
+    akv_stats_get(s, &st0);
+    enum { N = 200000 };
+    char key[32];
+    size_t klen;
+    unsigned char val[64];
+    unsigned char out[64];
+    size_t n;
+    for (unsigned i = 0; i < N; i++) {
+        key_of(i, key, &klen);
+        memcpy(val, &i, sizeof(i));
+        EXPECT(akv_put(s, key, klen, val, sizeof(val)) == 0, "growth put %u", i);
+    }
+    unsigned missing = 0;
+    for (unsigned i = 0; i < N; i++) {
+        key_of(i, key, &klen);
+        unsigned got = 0;
+        if (akv_get(s, key, klen, out, sizeof(out), &n) != 0 || (memcpy(&got, out, sizeof(got)), got != i)) {
+            missing++;
+        }
+    }
+    akv_stats st;
+    akv_stats_get(s, &st);
+    EXPECT(missing == 0, "%u of %u entries lost while the index grew", missing, N);
+    EXPECT(st.index_evictions == 0 && st.evictions == 0, "evictions %llu/%llu with ample memory",
+           (unsigned long long)st.evictions, (unsigned long long)st.index_evictions);
+    EXPECT(st.index_grows > 0, "the index never grew");
+    EXPECT(st0.index_bytes == 4 * 16 * 128, "initial index %llu bytes", (unsigned long long)st0.index_bytes);
+    /* At most 2 / 0.75 slots of 8 bytes per entry plus rounding to a power of two: 32 bytes per entry. */
+    EXPECT(st.index_bytes <= (uint64_t)N * 32, "index %llu bytes for %u entries",
+           (unsigned long long)st.index_bytes, N);
+    printf("growth: %u entries, index %llu KiB after %llu doublings\n", N,
+           (unsigned long long)(st.index_bytes >> 10), (unsigned long long)st.index_grows);
+    akv_destroy(s);
+}
+
+/* ---- store modes, flags and CAS ------------------------------------------------------------------- */
+
+static void test_modes(void) {
+    akv *s = make(1 << 20, 2);
+    unsigned char out[256];
+    size_t n;
+    akv_meta m;
+    uint64_t cas1;
+    uint64_t cas2;
+    akv_store_opts add = {.mode = AKV_ADD, .flags = 7};
+    EXPECT(akv_store(s, "k", 1, "one", 3, &add, &cas1) == 0, "add new");
+    EXPECT(akv_store(s, "k", 1, "two", 3, &add, NULL) == -EEXIST, "add existing");
+    EXPECT(akv_get_meta(s, "k", 1, out, sizeof(out), &n, &m, AKV_TTL_KEEP) == 0 && n == 3 && m.flags == 7 &&
+               m.cas == cas1 && m.ttl_ms == -1,
+           "flags and cas of the added entry");
+    akv_store_opts rep = {.mode = AKV_REPLACE, .flags = 9};
+    EXPECT(akv_store(s, "absent", 6, "x", 1, &rep, NULL) == -ENOENT, "replace absent");
+    EXPECT(akv_store(s, "k", 1, "three", 5, &rep, &cas2) == 0 && cas2 != cas1, "replace present changes cas");
+    akv_store_opts app = {.mode = AKV_APPEND, .flags = 99};
+    EXPECT(akv_store(s, "k", 1, "-tail", 5, &app, NULL) == 0, "append");
+    akv_store_opts pre = {.mode = AKV_PREPEND};
+    EXPECT(akv_store(s, "k", 1, "head-", 5, &pre, NULL) == 0, "prepend");
+    EXPECT(akv_get_meta(s, "k", 1, out, sizeof(out), &n, &m, AKV_TTL_KEEP) == 0 && n == 15 &&
+               memcmp(out, "head-three-tail", 15) == 0 && m.flags == 9,
+           "append and prepend keep the flags: %.*s flags %u", (int)n, out, m.flags);
+    EXPECT(akv_store(s, "absent", 6, "x", 1, &app, NULL) == -ENOENT, "append absent");
+    /* same-size append (in place) */
+    EXPECT(akv_put(s, "p", 1, "ab", 2) == 0 && akv_store(s, "p", 1, "c", 1, &app, NULL) == 0 &&
+               akv_get(s, "p", 1, out, sizeof(out), &n) == 0 && n == 3 && memcmp(out, "abc", 3) == 0,
+           "in-place append");
+    EXPECT(akv_store(s, "p", 1, "z", 1, &pre, NULL) == 0 && akv_get(s, "p", 1, out, sizeof(out), &n) == 0 &&
+               n == 4 && memcmp(out, "zabc", 4) == 0,
+           "prepend");
+    akv_get_meta(s, "k", 1, out, sizeof(out), &n, &m, AKV_TTL_KEEP);
+    akv_store_opts cas = {.mode = AKV_CAS, .cas = m.cas + 1};
+    EXPECT(akv_store(s, "k", 1, "new", 3, &cas, NULL) == -EEXIST, "cas mismatch");
+    cas.cas = m.cas;
+    EXPECT(akv_store(s, "k", 1, "new", 3, &cas, &cas1) == 0 && cas1 != m.cas, "cas match");
+    EXPECT(akv_store(s, "k", 1, "again", 5, &cas, NULL) == -EEXIST, "stale cas after a store");
+    EXPECT(akv_store(s, "absent", 6, "x", 1, &cas, NULL) == -ENOENT, "cas on an absent key");
+    EXPECT(akv_exists(s, "k", 1) == 1 && akv_exists(s, "absent", 6) == 0, "exists");
+    akv_destroy(s);
+}
+
+/* ---- expiry ---------------------------------------------------------------------------------------- */
+
+static void sleep_ms(int ms) {
+    struct timespec ts = {.tv_sec = ms / 1000, .tv_nsec = (long)(ms % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+}
+
+static void test_ttl(void) {
+    akv *s = make(1 << 20, 1);
+    unsigned char out[64];
+    size_t n;
+    akv_meta m;
+    akv_store_opts t = {.ttl_ms = 60};
+    EXPECT(akv_store(s, "a", 1, "v", 1, &t, NULL) == 0, "store with ttl");
+    EXPECT(akv_get_meta(s, "a", 1, out, sizeof(out), &n, &m, AKV_TTL_KEEP) == 0 && m.ttl_ms > 0 &&
+               m.ttl_ms <= 60,
+           "remaining ttl %lld", (long long)m.ttl_ms);
+    sleep_ms(90);
+    EXPECT(akv_get(s, "a", 1, out, sizeof(out), &n) == -ENOENT, "expired entry is not returned");
+    EXPECT(akv_exists(s, "a", 1) == 0 && akv_del(s, "a", 1) == -ENOENT, "expired entry does not exist");
+    akv_store_opts add = {.mode = AKV_ADD};
+    EXPECT(akv_store(s, "a", 1, "w", 1, &add, NULL) == 0, "add over an expired entry");
+
+    t.ttl_ms = 60;
+    akv_store(s, "b", 1, "v", 1, &t, NULL);
+    EXPECT(akv_touch(s, "b", 1, 0) == 0, "persist");
+    sleep_ms(90);
+    EXPECT(akv_get_meta(s, "b", 1, out, sizeof(out), &n, &m, AKV_TTL_KEEP) == 0 && m.ttl_ms == -1,
+           "persisted entry survives");
+    EXPECT(akv_touch(s, "b", 1, 50000) == 0 &&
+               akv_get_meta(s, "b", 1, out, sizeof(out), &n, &m, AKV_TTL_KEEP) == 0 && m.ttl_ms > 49000,
+           "touch sets a ttl");
+    akv_store_opts keep = {.keep_ttl = 1};
+    EXPECT(akv_store(s, "b", 1, "xyz", 3, &keep, NULL) == 0 &&
+               akv_get_meta(s, "b", 1, out, sizeof(out), &n, &m, AKV_TTL_KEEP) == 0 && m.ttl_ms > 49000 &&
+               n == 3,
+           "keep_ttl keeps the expiry");
+    EXPECT(akv_store(s, "b", 1, "xyz", 3, NULL, NULL) == 0 &&
+               akv_get_meta(s, "b", 1, out, sizeof(out), &n, &m, AKV_TTL_KEEP) == 0 && m.ttl_ms == -1,
+           "a plain store clears the expiry");
+    EXPECT(akv_get_meta(s, "b", 1, out, sizeof(out), &n, &m, 30) == 0 &&
+               akv_get_meta(s, "b", 1, out, sizeof(out), &n, &m, AKV_TTL_KEEP) == 0 && m.ttl_ms > 0 &&
+               m.ttl_ms <= 30,
+           "get-and-touch");
+    EXPECT(akv_touch(s, "b", 1, -1) == 0 && akv_exists(s, "b", 1) == 0, "negative touch deletes");
+    t.ttl_ms = -1;
+    EXPECT(akv_put(s, "c", 1, "v", 1) == 0 && akv_store(s, "c", 1, "v", 1, &t, NULL) == 0 &&
+               akv_exists(s, "c", 1) == 0,
+           "store with a negative ttl removes the key");
+    EXPECT(akv_touch(s, "zz", 2, 10) == -ENOENT, "touch absent");
+
+    /* Expired entries are reclaimed by eviction without counting as evictions. */
+    t.ttl_ms = 20;
+    unsigned char big[900];
+    memset(big, 1, sizeof(big));
+    for (unsigned i = 0; i < 400; i++) {
+        char key[16];
+        size_t klen = (size_t)snprintf(key, sizeof(key), "t%u", i);
+        akv_store(s, key, klen, big, sizeof(big), &t, NULL);
+    }
+    sleep_ms(40);
+    akv_stats st0;
+    akv_stats_get(s, &st0);
+    /* 1100 entries of about 950 bytes exceed the 1 MiB arena, so the tail passes the expired ones. */
+    for (unsigned i = 0; i < 1100; i++) {
+        char key[16];
+        size_t klen = (size_t)snprintf(key, sizeof(key), "u%u", i);
+        akv_put(s, key, klen, big, sizeof(big));
+    }
+    akv_stats st;
+    akv_stats_get(s, &st);
+    EXPECT(st.expired > st0.expired, "expired entries reclaimed: %llu", (unsigned long long)st.expired);
+    akv_destroy(s);
+}
+
+/* ---- increments ------------------------------------------------------------------------------------ */
+
+static void test_incr(void) {
+    akv *s = make(1 << 20, 1);
+    unsigned char out[64];
+    size_t n;
+    int64_t r;
+    EXPECT(akv_incr(s, "n", 1, 1, AKV_INCR_UNSIGNED, &r, NULL) == -ENOENT, "unsigned incr of an absent key");
+    akv_store_opts f = {.flags = 5, .ttl_ms = 100000};
+    akv_store(s, "n", 1, "41", 2, &f, NULL);
+    EXPECT(akv_incr(s, "n", 1, 1, AKV_INCR_UNSIGNED, &r, NULL) == 0 && r == 42, "incr");
+    akv_meta m;
+    EXPECT(akv_get_meta(s, "n", 1, out, sizeof(out), &n, &m, AKV_TTL_KEEP) == 0 && n == 2 &&
+               memcmp(out, "42", 2) == 0 && m.flags == 5 && m.ttl_ms > 0,
+           "result stored as text with flags and expiry kept");
+    EXPECT(akv_incr(s, "n", 1, -100, AKV_INCR_UNSIGNED, &r, NULL) == 0 && r == 0, "decrement stops at 0");
+    akv_put(s, "w", 1, "18446744073709551615", 20);
+    EXPECT(akv_incr(s, "w", 1, 2, AKV_INCR_UNSIGNED, &r, NULL) == 0 && (uint64_t)r == 1, "unsigned wrap");
+    akv_put(s, "x", 1, "12a", 3);
+    EXPECT(akv_incr(s, "x", 1, 1, AKV_INCR_UNSIGNED, &r, NULL) == -EINVAL, "non-numeric value");
+    akv_put(s, "neg", 3, "-5", 2);
+    EXPECT(akv_incr(s, "neg", 3, 1, AKV_INCR_UNSIGNED, &r, NULL) == -EINVAL,
+           "negative value in unsigned mode");
+    EXPECT(akv_incr(s, "neg", 3, 1, AKV_INCR_SIGNED, &r, NULL) == 0 && r == -4, "signed incr");
+    EXPECT(akv_incr(s, "fresh", 5, -3, AKV_INCR_SIGNED, &r, NULL) == 0 && r == -3,
+           "signed incr creates the key");
+    akv_put(s, "max", 3, "9223372036854775807", 19);
+    EXPECT(akv_incr(s, "max", 3, 1, AKV_INCR_SIGNED, &r, NULL) == -ERANGE, "signed overflow");
+    EXPECT(akv_get(s, "max", 3, out, sizeof(out), &n) == 0 && n == 19, "value unchanged after overflow");
+    akv_put(s, "big", 3, "99999999999999999999", 20);
+    EXPECT(akv_incr(s, "big", 3, 1, AKV_INCR_SIGNED, &r, NULL) == -EINVAL, "out-of-range text");
+    akv_destroy(s);
+}
+
+/* ---- flush, enumeration, no eviction --------------------------------------------------------------- */
+
+struct seen {
+    unsigned count;
+    unsigned with_ttl;
+    int bad;
+};
+
+static int count_record(void *arg, const akv_record *r) {
+    struct seen *c = arg;
+    c->count++;
+    if (r->ttl_ms >= 0) {
+        c->with_ttl++;
+        if (r->ttl_ms > 100000) {
+            c->bad++;
+        }
+    }
+    if (r->vlen != 8 || r->klen == 0) {
+        c->bad++;
+    }
+    return 0;
+}
+
+static int stop_at_3(void *arg, const akv_record *r) {
+    (void)r;
+    return ++*(unsigned *)arg == 3 ? 42 : 0;
+}
+
+static void test_flush_foreach(void) {
+    akv *s = make(4 << 20, 4);
+    char key[32];
+    size_t klen;
+    for (unsigned i = 0; i < 1000; i++) {
+        key_of(i, key, &klen);
+        akv_store_opts o = {.ttl_ms = i % 2 ? 100000 : 0};
+        akv_store(s, key, klen, "12345678", 8, &o, NULL);
+    }
+    for (unsigned i = 0; i < 100; i++) {
+        key_of(i, key, &klen);
+        akv_del(s, key, klen);
+    }
+    akv_store_opts gone = {.ttl_ms = 1};
+    akv_store(s, "short", 5, "12345678", 8, &gone, NULL);
+    sleep_ms(5);
+    struct seen c = {0};
+    EXPECT(akv_foreach(s, count_record, &c) == 0, "foreach");
+    EXPECT(c.count == 900 && c.with_ttl == 450 && c.bad == 0, "foreach saw %u entries, %u with ttl, %d bad",
+           c.count, c.with_ttl, c.bad);
+    unsigned k = 0;
+    EXPECT(akv_foreach(s, stop_at_3, &k) == 42 && k == 3, "foreach stops at the first non-zero result");
+    akv_flush(s);
+    akv_stats st;
+    akv_stats_get(s, &st);
+    unsigned char out[16];
+    size_t n;
+    key_of(500, key, &klen);
+    EXPECT(st.entries == 0 && st.log_bytes == 0 && akv_get(s, key, klen, out, sizeof(out), &n) == -ENOENT,
+           "flush removes everything");
+    EXPECT(akv_put(s, key, klen, "x", 1) == 0 && akv_get(s, key, klen, out, sizeof(out), &n) == 0,
+           "store after flush");
+    akv_destroy(s);
+
+    akv_config cfg;
+    akv_config_default(&cfg);
+    cfg.capacity = 64 << 10;
+    cfg.shards = 1;
+    cfg.no_evict = 1;
+    s = akv_create(&cfg);
+    unsigned char val[1000];
+    memset(val, 3, sizeof(val));
+    unsigned stored = 0;
+    int rc = 0;
+    for (unsigned i = 0; i < 200 && rc == 0; i++) {
+        key_of(i, key, &klen);
+        rc = akv_put(s, key, klen, val, sizeof(val));
+        stored += rc == 0;
+    }
+    EXPECT(rc == -ENOMEM && stored > 30 && stored < 64, "no-evict store fails when full (stored %u, rc %d)",
+           stored, rc);
+    unsigned present = 0;
+    unsigned char big[1100];
+    for (unsigned i = 0; i < stored; i++) {
+        key_of(i, key, &klen);
+        present += akv_get(s, key, klen, big, sizeof(big), &n) == 0;
+    }
+    EXPECT(present == stored, "no entry was evicted (%u of %u present)", present, stored);
+    for (unsigned i = 0; i < 5; i++) {
+        key_of(i, key, &klen);
+        akv_del(s, key, klen); /* the oldest entries become reclaimable dead space */
+    }
+    key_of(9999, key, &klen);
+    EXPECT(akv_put(s, key, klen, val, sizeof(val)) == 0, "dead space is reused without evicting");
+    akv_destroy(s);
+}
+
 int main(void) {
     printf("vector implementation: %s\n", akv_simd_name());
     test_basic();
@@ -349,9 +651,20 @@ int main(void) {
     run_model(512 << 10, 4, 5000, 2000, 600000, 0); /* heavy eviction */
     run_model(16 << 10, 1, 800, 1500, 300000, 0);   /* tiny arena: wrap-around gaps of 8 and 16 bytes */
     run_model(64 << 10, 2, 100000, 100, 400000, 0); /* more keys than index slots: index evictions */
+    /* the same models with an index that grows from the minimal size */
+    make_avg_entry = 0;
+    run_model(64 << 20, 8, 2000, 1500, 300000, 1);
+    run_model(512 << 10, 4, 5000, 2000, 600000, 0);
+    run_model(64 << 10, 2, 100000, 100, 400000, 0);
+    make_avg_entry = 128;
     test_second_chance();
     test_inplace();
     test_threads();
+    test_growth();
+    test_modes();
+    test_ttl();
+    test_incr();
+    test_flush_foreach();
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

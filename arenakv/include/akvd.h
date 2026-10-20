@@ -1,8 +1,12 @@
 /*
- * akvd.h - key-value server: serves the akvproto protocol from a akv engine over rdmaduct.
+ * akvd.h - key-value server: serves an akv engine over the native protocol (akvproto.h, carried by
+ * rdmaduct over RDMA or TCP), the memcached text and meta protocols, and RESP2 (Redis protocol).
  *
- * One thread accepts connections; each connection is served by its own thread, which processes requests in
- * order (receive, execute on the engine, send the response). The server owns its engine and transport context.
+ * Threads: one accept thread waits on all listeners and hands each new connection to one of `threads`
+ * worker threads (round robin). A worker serves all its connections from one epoll loop: native
+ * connections through rdmaduct's pollable descriptors, text protocols on non-blocking sockets. Requests
+ * of a connection are executed in order and may be pipelined. A background thread runs periodic
+ * snapshots. The server owns its engine and transport context.
  */
 #ifndef AKVD_H
 #define AKVD_H
@@ -14,33 +18,99 @@
 
 typedef struct akvd akvd;
 
+/* Log levels of akvd_log(). */
+enum akvd_log_level {
+    AKVD_LOG_ERROR = 0,
+    AKVD_LOG_WARN = 1,
+    AKVD_LOG_INFO = 2,
+    AKVD_LOG_DEBUG = 3,
+};
+
 typedef struct akvd_config {
     akv_config store;
+    /* Native protocol listener (rdmaduct). port NULL disables it. */
     enum duct_transport transport;
     enum duct_wait wait;
-    const char *addr;    /* listen address; NULL = all IPv4 addresses */
-    const char *port;    /* listen port; "0" selects a free port */
-    uint32_t max_msg;    /* largest request/response message; 0 selects 64 KiB */
-    uint32_t recv_depth; /* receive buffers per connection; 0 selects 16 */
-    uint32_t send_depth; /* send buffers per connection; 0 selects 16 */
+    const char *addr;    /* listen address of the native listener; NULL = all IPv4 addresses */
+    const char *port;    /* native port; "0" selects a free port */
+    uint32_t max_msg;    /* largest native request/response message; 0 selects 64 KiB */
+    uint32_t recv_depth; /* receive buffers per native connection; 0 selects 16 */
+    uint32_t send_depth; /* send buffers per native connection; 0 selects 16 */
+    /* Text protocol listeners on plain TCP sockets. NULL disables a listener; "0" selects a free port. */
+    const char *text_addr;      /* listen address of the text listeners; NULL = all IPv4 addresses */
+    const char *memcached_port; /* memcached text and meta protocol */
+    const char *resp_port;      /* RESP2 */
+    /* TLS listeners (only when built with TLS=1); certificate and key files in PEM format. */
+    const char *tls_memcached_port;
+    const char *tls_resp_port;
+    const char *tls_cert;
+    const char *tls_key;
+    const char *tls_ca;      /* when set, clients must present a certificate signed by this CA */
+    unsigned threads;        /* worker threads; 0 selects the number of online CPUs */
+    unsigned max_conns;      /* connections above this number are closed after accept; 0 = unlimited */
+    unsigned idle_timeout_s; /* close connections idle for this many seconds; 0 = never */
+    /*
+     * Credentials file: one entry per line, "user:password" or a bare password (user "default"); empty
+     * lines and lines starting with '#' are ignored. When set, every protocol requires authentication
+     * before other commands. NULL disables authentication.
+     */
+    const char *auth_file;
+    /* Snapshot file; NULL disables persistence. Loaded at start when it exists. */
+    const char *snapshot_path;
+    unsigned save_interval_s; /* periodic snapshot when entries changed; 0 = only on request and exit */
+    int save_on_stop;         /* write a snapshot in akvd_stop() */
+    enum akvd_log_level log_level;
+    const char *log_path; /* NULL = standard error */
 } akvd_config;
 
-/* Fills cfg with defaults (see field comments, 256 MiB store, AUTO transport, port 7600). */
+/* Fills cfg with defaults: 256 MiB store, AUTO transport, native port 7600, text listeners off. */
 void akvd_config_default(akvd_config *cfg);
 
-/* Creates the engine, starts listening and starts the accept thread. Returns NULL on failure (errno-style code in *err if given). */
+/*
+ * Creates the engine, loads the snapshot (if configured and present), starts the listeners and threads.
+ * Returns NULL on failure with a negative error code in *err (if not NULL): rdmaduct or -errno codes,
+ * -EINVAL for an invalid configuration, -EBADMSG for a corrupt snapshot, -ENOTSUP for TLS options in a
+ * build without TLS.
+ */
 akvd *akvd_start(const akvd_config *cfg, int *err);
 
-/* Port the server listens on. */
+/* Port of the native listener (0 when disabled). */
 int akvd_port(const akvd *d);
 
-/* Engine of the server (for statistics). */
+/* Port of the memcached and RESP listeners (0 when disabled). */
+int akvd_memcached_port(const akvd *d);
+int akvd_resp_port(const akvd *d);
+int akvd_tls_memcached_port(const akvd *d);
+int akvd_tls_resp_port(const akvd *d);
+
+/* Engine of the server. */
 akv *akvd_store(akvd *d);
 
 /* Number of connections currently served. */
 unsigned akvd_connections(const akvd *d);
 
-/* Stops accepting, closes all connections, waits for the threads and frees everything. */
+/* Writes a snapshot now (synchronously). Returns 0, -EINVAL when persistence is not configured, or -errno. */
+int akvd_save(akvd *d);
+
+/* Starts a snapshot on a background thread. Returns 0, -EBUSY (one is running) or -EINVAL (not configured). */
+int akvd_bgsave(akvd *d);
+
+/* 1 while a background snapshot runs. */
+int akvd_bgsave_running(const akvd *d);
+
+/* Unix time of the last successful snapshot, 0 when none was written since the start. */
+uint64_t akvd_lastsave(const akvd *d);
+
+/* 1 when the last snapshot attempt succeeded (or none was attempted), 0 after a failure. */
+int akvd_last_save_ok(const akvd *d);
+
+/* Reopens the log file (for log rotation). */
+void akvd_reopen_log(akvd *d);
+
+/* Writes a line to the server log when level is at or below the configured level. */
+void akvd_log(akvd *d, enum akvd_log_level level, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+
+/* Stops accepting, saves the snapshot if configured, closes all connections, joins the threads, frees everything. */
 void akvd_stop(akvd *d);
 
 #endif

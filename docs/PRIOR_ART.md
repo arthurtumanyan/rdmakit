@@ -80,21 +80,24 @@ multiplexing many connections per thread (it uses one thread per connection).
 | RAMCloud, MICA | research systems that introduced log-structured memory and partitioned hash tables (FAST 2014, NSDI 2014) | the original designs and papers are of interest |
 | Mooncake Store, LMCache and similar | KV-cache storage integrated with inference serving engines | connectors to a serving engine are required |
 
-What `arenakv` provides: a small engine (about 1,400 lines including the server and client) that combines a
-log-structured arena, a bucketed hash index whose tags are compared with vector instructions (SSE2, NEON), and
-second-chance eviction, with a tested guarantee that a lookup never returns a stale value, plus a server whose
-transport can be RDMA. The measurements in `benchmarks/` compare it with Valkey, Dragonfly and memcached on the
+What `arenakv` provides: a small cache (about 6,500 lines including the server, three protocols, persistence and the
+client) that combines a log-structured arena, a growing bucketed hash index whose tags are compared with vector
+instructions (SSE2, NEON), and second-chance eviction, with a tested guarantee that a lookup never returns a stale
+value. The server speaks the memcached text and meta protocol and RESP2, so existing clients work, plus a native
+protocol whose transport can be RDMA; it offers expiry, CAS, conditional stores, increments, authentication, TLS and
+snapshots. The measurements in `benchmarks/` compare it with Valkey, Dragonfly and memcached on the
 same machine.
 
-What the measurements show so far (data and caveats in `benchmarks/README.md`): over TCP on the measured machine the
+What the measurements show so far (data and caveats in `benchmarks/README.md`; taken with the previous server
+version, before the event-loop server and the growing index): over TCP on the measured machine the
 store is in the same range as the three established servers. At four server CPUs it is faster than Valkey and Dragonfly
 [C2]; memcached has the highest throughput in most rows [C1]; at one server CPU the store is slower than all three
 on small values [C3]. Its design targets a transport without kernel TCP overhead, and that path has been exercised
 only on Soft-RoCE, a software implementation [C6], so no claim about RDMA hardware is made.
 
-What it does not do: persistence, replication, clustering, authentication or encryption, data structures beyond
-byte-string keys and values, integration with inference serving engines, an index that grows with the data (the index is
-sized at start). It is not recommended for production use.
+What it does not do: replication, server-side clustering, per-user permissions, data structures beyond byte-string
+keys and values, the memcached binary protocol, RESP3, integration with inference serving engines. It is not
+recommended for production use.
 
 ## How to use this repository responsibly
 

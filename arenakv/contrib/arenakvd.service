@@ -1,0 +1,27 @@
+# systemd unit for arenakvd. Install the binary as /usr/local/bin/arenakvd and the configuration as
+# /etc/arenakv/arenakvd.conf. SIGTERM writes the snapshot (if configured) before the process exits.
+[Unit]
+Description=arenakv key-value cache server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/arenakvd --config /etc/arenakv/arenakvd.conf
+ExecReload=/bin/kill -HUP $MAINPID
+User=arenakv
+Group=arenakv
+StateDirectory=arenakv
+# Registered memory for RDMA must not be limited by the default memlock limit.
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+Restart=on-failure
+TimeoutStopSec=120
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/arenakv
+
+[Install]
+WantedBy=multi-user.target

@@ -32,7 +32,8 @@ measurements that anyone can re-derive:
 
 1. **A cache shaped for large blocks** (`arenakv`): log-structured memory, so a fixed-size block costs no
    per-object allocation. A vector-compared hash index and second-chance eviction, with a tested guarantee
-   that a lookup never returns a stale value.
+   that a lookup never returns a stale value. It speaks the memcached and Redis protocols as well as its own
+   native protocol over RDMA, so existing clients and tools can use it.
 2. **A transport that is the same on RDMA and TCP** (`rdmaduct`): messages, one-sided reads, writes and atomics,
    and event-loop descriptors, with identical ordering, flow control and error semantics on both. Code developed on a laptop runs unchanged on an RDMA cluster.
 3. **A measurement tool that removes the tool as a variable** (`kvpace`): one implementation drives all compared
@@ -53,11 +54,15 @@ Statements about other systems reflect their public documentation at the time of
 | Target values | large, mostly immutable blocks | small to medium objects | data structures | data structures |
 | Memory layout | log-structured arena per shard | slab allocator | per-object allocation (jemalloc) | per-object allocation (mimalloc) |
 | Eviction | second chance in write order | segmented LRU | approximate LRU / LFU policies | cache mode (2Q-based) |
-| Network transport | TCP and RDMA reliable connections | TCP, UDP, Unix sockets | TCP, Unix sockets | TCP |
-| Protocol | compact binary ([PROTOCOL.md](arenakv/docs/PROTOCOL.md)) | text and meta commands | RESP | RESP and memcached text |
-| Persistence, replication | no | no | yes | yes |
-| Hash index | sized at start from the expected entry size | grows | grows | grows |
-| Source size | about 1,400 lines (engine, server, client) | large | large | large |
+| Network transport | TCP, TLS, RDMA reliable connections | TCP, UDP, Unix sockets, TLS | TCP, Unix sockets, TLS | TCP, TLS |
+| Protocols | memcached text and meta, RESP2, native binary ([PROTOCOL.md](arenakv/docs/PROTOCOL.md)) | text, meta, binary | RESP2, RESP3 | RESP2, RESP3, memcached text |
+| Expiry, CAS, conditional stores, increments | yes | yes | yes | yes |
+| Data types | strings | strings | strings, lists, hashes, sets, sorted sets, streams | as Valkey |
+| Authentication | shared credentials file | SASL, ASCII auth | ACL users | ACL users |
+| Persistence | snapshots | warm restart | RDB, AOF | snapshots |
+| Replication, cluster | no (client-side consistent hashing) | no (client-side hashing) | yes | replication |
+| Hash index | grows from a small size | grows | grows | grows |
+| Source size | about 6,500 lines (engine, server, protocols, client) | large | large | large |
 | Production use | not recommended | widely deployed | widely deployed | deployed |
 
 ### rdmaduct and RDMA communication frameworks
@@ -171,7 +176,7 @@ kvpace/build/x86_64/kvpace --driver native --driver-opt transport=rdma --host 19
 | Project | Suites | Also run with |
 |---|---|---|
 | rdmaduct | handshake codec with two million fuzzed inputs, TCP framing attacked through a raw socket, fault injection, RDMA flow control under a slow consumer, abrupt close, connect/disconnect cycles with a descriptor-leak check, examples | ASan + UBSan |
-| arenakv | engine model test against a reference map (eviction, overwrite, no stale reads), SIMD and hash primitives, server integration over TCP and RDMA | ASan + UBSan, TSan |
+| arenakv | engine model test against a reference map (eviction, overwrite, no stale reads, growing index), expiry, CAS, increments, memcached and RESP protocols with byte-by-byte feeds and one million fuzzed inputs, pipelining and backpressure on real sockets, snapshots, TLS, native protocol over TCP and RDMA, third-party clients (valkey-cli, valkey-benchmark, memtier_benchmark, redis-py) | ASan + UBSan, TSan |
 | kvpace | histogram error bounds, Zipf generator, RESP and memcached drivers against in-process servers, runner timing, KV-cache workload | ASan + UBSan |
 
 All suites pass on x86-64 (gcc 13, Ubuntu 24.04) and aarch64 (gcc 14, Debian 13, Cortex-A72), including the RDMA

@@ -1,13 +1,14 @@
 # arenakv build. Targets: all, test, clean, format.
 #   make SAN=1       AddressSanitizer + UndefinedBehaviorSanitizer
 #   make TSAN=1      ThreadSanitizer
+#   make TLS=1       TLS listeners for the text protocols (needs OpenSSL headers, links -lssl -lcrypto)
 ARCH := $(shell uname -m)
 CFLAGS ?= -O2 -g
 DUCT_DIR ?= ../rdmaduct
 HAVE_RDMA_HEADERS := $(shell test -f /usr/include/infiniband/verbs.h && test -f /usr/include/rdma/rdma_cma.h && echo 1)
 RDMA ?= $(if $(HAVE_RDMA_HEADERS),1,0)
 # RDMA=0 builds go to a separate directory: they link the TCP-only transport library.
-OUT := build/$(ARCH)$(if $(SAN),-san)$(if $(TSAN),-tsan)$(if $(filter 0,$(RDMA)),-tcp)
+OUT := build/$(ARCH)$(if $(SAN),-san)$(if $(TSAN),-tsan)$(if $(filter 0,$(RDMA)),-tcp)$(if $(filter 1,$(TLS)),-tls)
 
 CFLAGS += -std=gnu2x -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude -Isrc -I$(DUCT_DIR)/include
 LDLIBS += -lpthread
@@ -18,6 +19,10 @@ DUCT_LIB := $(DUCT_BUILD)/librdmaduct.a
 ifeq ($(RDMA),1)
 LDLIBS += -lrdmacm -libverbs
 endif
+ifeq ($(TLS),1)
+CFLAGS += -DAKV_HAVE_TLS
+LDLIBS += -lssl -lcrypto
+endif
 ifdef SAN
 CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
 LDFLAGS += -fsanitize=address,undefined
@@ -27,7 +32,7 @@ CFLAGS += -fsanitize=thread -fno-omit-frame-pointer
 LDFLAGS += -fsanitize=thread
 endif
 
-LIB_SRC := src/akv.c src/server.c src/client.c
+LIB_SRC := src/akv.c src/server.c src/client.c src/proto_mc.c src/proto_resp.c src/snapshot.c
 LIB_OBJ := $(patsubst src/%.c,$(OUT)/%.o,$(LIB_SRC))
 LIB := $(OUT)/libarenakv.a
 TESTS := $(patsubst tests/%.c,$(OUT)/%,$(wildcard tests/test_*.c))
@@ -76,4 +81,8 @@ format:
 clean:
 	rm -rf build
 
-.PHONY: all test format clean
+# Third-party clients (valkey-cli, valkey-benchmark, memtier_benchmark, redis-py) against the server; needs Docker.
+compat: $(OUT)/arenakvd
+	tests/compat.sh $(OUT)
+
+.PHONY: all test compat format clean

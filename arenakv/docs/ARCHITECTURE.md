@@ -1,30 +1,63 @@
 # arenakv architecture
 
-This document is for people who change or review the code. Usage is in the [README](../README.md).
+This document is for people who change or review the code. Usage is in the [README](../README.md), operation in
+[OPERATIONS.md](OPERATIONS.md), the native protocol in [PROTOCOL.md](PROTOCOL.md).
 
 ## Components
+
 | Component | Files | Role |
 |---|---|---|
-| Engine | `src/akv.c`, `include/akv.h` | sharded in-memory cache with log-structured arenas |
+| Engine | `src/akv.c`, `include/akv.h` | sharded in-memory cache with log-structured arenas, expiry, CAS, growing index |
 | Tag matching | `src/simd.h` | 16-lane 16-bit comparison: SSE2, NEON, scalar |
 | Hash | `src/hash.h` | 64-bit multiply-fold hash, per-instance random seed |
-| Protocol | `include/akvproto.h` | request/response messages carried by rdmaduct |
-| Server | `src/server.c`, `include/akvd.h`, `tools/arenakvd.c` | accepts rdmaduct connections, one thread per connection |
-| Client | `src/client.c`, `include/akvclient.h` | synchronous client used by tests and kvpace |
+| Native protocol | `include/akvproto.h` | request/response messages carried by rdmaduct (revision 2) |
+| Server core | `src/server.c`, `include/akvd.h`, `src/srv.h` | listeners, accept thread, epoll workers, native requests, credentials, logging, snapshot scheduling, TLS |
+| memcached protocol | `src/proto_mc.c` | text and meta commands over byte buffers |
+| RESP protocol | `src/proto_resp.c` | RESP2 arrays and inline commands over byte buffers |
+| Persistence | `src/snapshot.c` | snapshot writer and loader, CRC32C |
+| Client | `src/client.c`, `include/akvclient.h` | native client with pipelining and a consistent-hashing pool |
+| Daemon | `tools/arenakvd.c` | options, configuration file, signals |
 
 ## Engine
-- The key space is split into shards (power of two, default 64) by hash bits 32..41. Each shard has a mutex, an arena and an index.
-- **Arena**: circular log of 8-byte-aligned entries (24-byte header, key, value). New entries are appended at the head. When the free space is insufficient, entries are released at the tail. A gap at the end of the arena that is too small for the next entry is filled with a pad entry (only 5 header bytes are written, since gaps can be 8 bytes).
-- **Index**: open addressing, 128-byte buckets with 16 slots (16 tags of 16 bits, then 16 offsets of 48 bits). A key may live in either of two adjacent buckets (a window of 32 slots), so lookups examine at most two buckets and deletions need no tombstones. `akv_match16` yields a bitmask of tag matches; the key is compared only for matching tags. Buckets are allocated lazily (anonymous mapping), sized from `capacity / avg_entry`.
-- **Overwrite**: an entry of equal total size is overwritten in place; otherwise the new version is appended and the old one becomes dead log space (recognized during eviction because the index no longer points to it).
-- **Eviction**: the oldest log entry is examined. Dead entries are skipped. A live entry with the accessed bit (set by every read) is copied to the head once with the bit cleared (second chance, at most 64 consecutive reinsertions); otherwise it is removed from the index. If both buckets of a window are full on insert, the oldest entry of the window is dropped.
-- **Guarantee**: a lookup returns the most recent value stored for the key or reports absence; a stale version is never returned. `tests/test_akv.c` checks this against a reference model under heavy eviction, tiny arenas, and index pressure.
-- **Memory**: the log never shrinks; resident memory approaches the configured capacity once the log has wrapped.
 
-## Server
-- One accept thread; one thread per connection receives a request, executes it on the engine, sends the response, and releases the receive buffer (`src/server.c`). Requests are validated: bad lengths, unknown operations, reserved flags, empty keys yield `AKVP_BADREQ` and the connection stays open; a message shorter than a header closes the connection.
-- The response size is bounded by the peer's limit; larger values yield `AKVP_TOOBIG`.
-- Waiting: event mode by default. Polling mode spins one core per connection thread and degrades sharply when connection threads outnumber cores (measured: 24k ops/s with a 38 ms p99 for 16 connections on one core, against 191k ops/s in event mode).
+- The key space is split into shards (power of two, default 64) by hash bits 32..41. Each shard has a mutex, an
+  arena and an index.
+- **Arena**: circular log of 8-byte-aligned entries (40-byte header, key, value). New entries are appended at the
+  head; when the free space is insufficient, entries are released at the tail. A gap at the end of the arena that is
+  too small for the next entry is filled with a pad entry (only 5 header bytes are written, since gaps can be 8
+  bytes).
+- **Index**: open addressing, 128-byte buckets with 16 slots (16 tags of 16 bits, then 16 offsets of 48 bits). A key
+  may live in either of two adjacent buckets (a window of 32 slots), so lookups examine at most two buckets and
+  deletions need no tombstones. `akv_match16` yields a bitmask of tag matches; the key is compared only for matching
+  tags.
+- **Index growth**: a shard starts with 16 buckets (2 KiB) unless `avg_entry` presizes it. The index doubles when
+  entries exceed 75% of the slots, or when a key finds its window full, up to a bound of one slot per smallest
+  possible entry. Doubling allocates the new table, re-inserts every slot by its stored hash and frees the old table,
+  all under the shard lock (the shard is unavailable during the rehash). Only at the bound does a full window drop its
+  oldest live entry (an index eviction).
+- **Store modes** (`akv_store`): SET, ADD, REPLACE, APPEND, PREPEND, CAS, with client flags and a time to live.
+  APPEND and PREPEND copy the old value first, because allocating the new version may evict or move the old one.
+- **Overwrite**: an entry of equal total size is overwritten in place (value, flags, CAS, expiry); otherwise the new
+  version is appended and the old one becomes dead log space (recognized during eviction because the index no longer
+  points to it).
+- **Expiry**: each entry stores an expiry time in milliseconds of the engine clock (CLOCK_MONOTONIC since creation,
+  plus 1; 0 = none). A lookup that meets an expired entry clears its slot; eviction reclaims expired entries without
+  counting them as evictions.
+- **CAS**: per-shard counter shifted left by 10 bits, ORed with the shard number; versions are unique in the engine.
+- **Increments** (`akv_incr`): memcached semantics (unsigned, wrap on increment, floor at 0, absent key is an error)
+  or RESP semantics (signed, absent key counts as 0, overflow error); the result is stored as decimal text with flags
+  and expiry kept.
+- **Eviction**: the oldest log entry is examined. Dead entries are skipped; expired ones are reclaimed. A live entry
+  with the accessed bit (set by every read) is copied to the head once with the bit cleared (second chance, at most 64
+  consecutive reinsertions); otherwise it is removed from the index. With `no_evict` a live, unexpired entry at the
+  tail makes the store fail with `-ENOMEM`.
+- **Enumeration** (`akv_foreach`): each shard's live entries are copied while its lock is held; the callback runs
+  without locks. Used by snapshots, `KEYS` and `SCAN`.
+- **Flush**: resets head and tail and returns arena and index pages with `MADV_DONTNEED` (private anonymous memory
+  reads back as zero, which empties the index).
+- **Guarantee**: a lookup returns the most recent value stored for the key or reports absence; a stale version is
+  never returned. `tests/test_akv.c` checks this against a reference model under heavy eviction, tiny arenas, index
+  pressure and a growing index.
 
 ## Entry layout
 
@@ -36,45 +69,81 @@ All entries start at multiples of 8 bytes in the arena.
 | 4 | 1 | flags: accessed bit, pad marker |
 | 6 | 2 | key length |
 | 8 | 4 | value length |
+| 12 | 4 | client flags |
 | 16 | 8 | key hash |
-| 24 | k | key |
-| 24 + k | v | value, padded to a multiple of 8 |
+| 24 | 8 | CAS version |
+| 32 | 8 | expiry, milliseconds of the engine clock (0 = none) |
+| 40 | k | key |
+| 40 + k | v | value, padded to a multiple of 8 |
 
-A pad entry fills the gap at the end of an arena when the next entry does not fit before the wrap-around; only
-its first 5 bytes are written, because the gap may be 8 bytes.
-
-Index slot: a 16-bit tag (never 0 for an occupied slot) and a 48-bit value (arena offset / 8 + 1). Bucket: 16 tags
-followed by 16 six-byte values (128 bytes). A key lives in one of the 32 slots of two adjacent buckets.
+Index slot: a 16-bit tag (never 0 for an occupied slot) and a 48-bit value (arena offset / 8 + 1).
 
 ## Invariants
 
-1. Every index slot refers to a live entry inside the range between the log tail and head; eviction clears the
-   slot before the tail passes the entry.
-2. A put either overwrites an entry of equal size in place, or appends the new version and then replaces the slot;
-   a lookup therefore never sees an older version after a put has returned.
-3. The log never contains an entry the index points to beyond the tail: the second-chance copy is made before the
-   old position is released, and nested eviction during that copy does not reinsert (it would overwrite the scratch
-   buffer).
-4. The entry counter equals the number of occupied index slots (tests compare it with a reference model).
+1. Every index slot refers to an entry inside the range between the log tail and head; eviction clears the slot
+   before the tail passes the entry.
+2. A store either overwrites an entry of equal size in place, or appends the new version and then replaces the slot;
+   a lookup therefore never sees an older version after a store has returned.
+3. The second-chance copy is made before the old position is released, and nested eviction during that copy does not
+   reinsert (it would overwrite the scratch buffer).
+4. The entry counter equals the number of occupied index slots (tests compare it with a reference model), including
+   expired entries not yet reclaimed.
+5. Index growth re-inserts every occupied slot; a rehash never changes which entry a key refers to.
 
 ## Server
 
-`src/server.c` implements `akvd.h`. One accept thread polls the listener with a 200 ms timeout and reaps finished
-connection threads. Each connection thread loops on `duct_recv` (500 ms timeout, used to notice shutdown),
-validates the request, calls the engine, sends one response and releases the receive buffer. A request that fails
-validation is answered with `AKVP_BADREQ`; a message shorter than a request header closes the connection. The
-response size is limited by the peer's `max_msg`; larger values are answered with `AKVP_TOOBIG`.
+Threads (`src/server.c`):
+
+- **accept**: `poll()` on all listeners (native rdmaduct listener through `duct_listener_fd`, memcached, RESP, TLS
+  variants). New connections are counted, checked against `max_conns`, and queued round robin to a worker, whose
+  eventfd wakes it.
+- **workers**: one epoll set each. Native connections are driven through `duct_ep_fd` / `duct_ep_arm`: the worker
+  drains requests with `duct_recv(..., 0)`, executes them and sends responses with `duct_send(..., 0)`. A response
+  that does not fit is queued and the connection stops reading until the queue is empty, so a client that does not
+  read cannot make the server buffer without bound. Text connections use non-blocking sockets (or OpenSSL with
+  non-blocking BIOs); input accumulates until the protocol module consumes complete commands, replies accumulate in an
+  output buffer, and reading stops while more than 4 MiB of replies are pending.
+- **fairness**: a connection is served for at most 64 requests or reads per turn. A connection with work left that
+  raises no descriptor event (messages already received by rdmaduct, complete commands in its buffer, TLS-buffered
+  input) goes on the worker's ready list and is served in the next iteration, which polls epoll without waiting. A
+  connection closed while on the ready list is released when the list is processed.
+- **saver**: periodic snapshots; `BGSAVE` runs on its own thread; a mutex serializes snapshots.
+
+Protocol modules (`proto_mc.c`, `proto_resp.c`) are functions over byte buffers: `*_execute(server, session,
+input, length, output)` returns the number of bytes consumed and leaves an incomplete command unconsumed. They never
+touch sockets, which is what `tests/test_proto.c` relies on. Per-thread buffers (values read for replies, RESP
+argument vectors) are freed when a worker exits.
+
+Credentials are loaded once at start; `akvd_auth_check` compares every entry in time that depends only on the
+lengths.
+
+## Client
+
+- Synchronous calls are implemented as one `akvc_post` followed by `akvc_next`.
+- Pipelining: `akvc_post` refuses more than `akvc_window()` = `min(recv_depth, send_depth) - 1` outstanding requests,
+  which keeps the client from blocking on credits while the server waits for the client to read responses.
+- `akvc_pool`: 160 points per server on a 64-bit ring (hash of `"host:port-i"` with a fixed seed), binary search for
+  the first point at or after the key's hash. Removing a server moves only the keys it owned (tested).
 
 ## Tests
 
 | Test | Purpose |
 |---|---|
-| `test_primitives` | tag matching equals the scalar reference for all 2^16 lane patterns and random inputs; hash avalanche (about 32 output bits change per input bit) and distribution (chi-square) |
-| `test_akv` | basic operations and argument validation; model check against a reference map (exact with ample memory; never-stale under eviction, tiny arenas and index pressure); second chance; same-size overwrite; eight-thread stress with self-describing values |
-| `test_server` | protocol round trips, malformed requests, size limits on both sides, concurrent clients, connection accounting, shutdown with connected clients; TCP and, with `DUCT_TEST_ADDR`, RDMA in both waiting modes |
+| `test_primitives` | tag matching equals the scalar reference for all 2^16 lane patterns and random inputs; hash avalanche and distribution |
+| `test_akv` | basic operations; model check against a reference map (exact with ample memory; never-stale under eviction, tiny arenas, index pressure), with a presized and with a growing index; second chance; same-size overwrite; eight-thread stress; index growth to 200,000 entries; store modes, flags and CAS; expiry, touch, persist, keep-ttl, get-and-touch; increments in both semantics; flush; enumeration; stores without eviction |
+| `test_proto` | memcached and RESP commands with exact replies, each script also fed one byte at a time, framing errors, oversized data blocks, authentication in all forms, one million fuzzed inputs |
+| `test_net` | real connections: 2000 pipelined commands per protocol, 512 KiB values, 64 MiB of replies under backpressure, 16 concurrent clients, connection limit, idle timeout, snapshot round trip with flags and expiry, corrupt and truncated snapshots, BGSAVE, TLS with certificate verification (TLS builds), native revision 2 operations, pipelining window, native authentication, consistent hashing over four servers |
+| `test_server` | native protocol round trips, malformed requests, size limits, concurrent clients, connection accounting, shutdown with connected clients; TCP and, with `DUCT_TEST_ADDR`, RDMA in both waiting modes |
+| `tests/compat.sh` (`make compat`) | valkey-cli, valkey-benchmark (pipelined), memtier_benchmark (RESP and memcached text), redis-py against the daemon; needs Docker |
+
+All tests run under AddressSanitizer with UndefinedBehaviorSanitizer (`make SAN=1 test`, also with `TLS=1`) and the
+engine and server tests under ThreadSanitizer (`make TSAN=1 test`).
 
 ## Not implemented
-- Event-loop or worker-per-core serving of many connections (connection threads cost context switches and, with polling, cores).
-- Zero-copy GET from the registered arena; one-sided reads.
-- Persistence, replication, clustering, authentication.
-- Index growth (the index is sized once from `avg_entry`).
+
+- Replication, clustering on the server side, per-user permissions.
+- Data types other than strings (lists, hashes, sets, sorted sets, streams), scripting, transactions, pub/sub.
+- memcached binary protocol; RESP3.
+- Zero-copy GET from the registered arena and a one-sided GET path (the transport provides the operations; the
+  engine's entry layout and locking would have to support remote readers).
+- Incremental index rehashing (growth pauses one shard for the duration of its rehash).

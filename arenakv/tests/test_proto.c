@@ -1,0 +1,374 @@
+/*
+ * test_proto.c - memcached and RESP protocol modules, without sockets.
+ *
+ * A server without listeners provides the engine and counters. Each case feeds a request into the
+ * protocol module and compares the reply byte for byte. Every script is also fed one byte at a time:
+ * the replies must be identical to those of the whole buffer (incremental parsing). A random fuzz feeds
+ * one million inputs mixing valid commands, mutations and noise; the modules must consume no more than
+ * offered, never crash (run under the sanitizers as well) and keep the engine consistent.
+ */
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "srv.h"
+
+static int failures;
+
+#define EXPECT(cond, ...)                                                                                    \
+    do {                                                                                                     \
+        if (!(cond)) {                                                                                       \
+            fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__);                                             \
+            fprintf(stderr, __VA_ARGS__);                                                                    \
+            fputc('\n', stderr);                                                                             \
+            failures++;                                                                                      \
+        }                                                                                                    \
+    } while (0)
+
+typedef size_t (*exec_fn)(akvd *, struct session *, const uint8_t *, size_t, struct obuf *);
+
+/* Feeds in[0, n) and returns the replies (NUL-terminated, caller frees). bytewise feeds one byte at a time. */
+static char *feed(akvd *d, exec_fn fn, struct session *ss, const char *in, size_t n, int bytewise) {
+    struct obuf out = {0};
+    struct obuf buf = {0};
+    for (size_t i = 0; i < n && !ss->close;) {
+        size_t step = bytewise ? 1 : n - i;
+        ob_add(&buf, in + i, step);
+        i += step;
+        size_t used = fn(d, ss, buf.p + buf.off, buf.len - buf.off, &out);
+        buf.off += used;
+        ob_compact(&buf);
+    }
+    ob_add(&out, "", 1);
+    ob_free(&buf);
+    char *r = strdup((const char *)out.p + out.off);
+    ob_free(&out);
+    return r;
+}
+
+/* Runs a request on a fresh session, whole and byte by byte, and compares both with want (NULL = no check). */
+static char *run(akvd *d, exec_fn fn, const char *in, const char *want, int authed) {
+    struct session s1 = {.authed = authed};
+    char *whole = feed(d, fn, &s1, in, strlen(in), 0);
+    if (want != NULL) {
+        EXPECT(strcmp(whole, want) == 0, "request %.60s\n  got  [%s]\n  want [%s]", in, whole, want);
+    }
+    return whole;
+}
+
+/* As run() for requests that are idempotent: the byte-by-byte feed must give the same replies. */
+static void run2(akvd *d, exec_fn fn, const char *in, const char *want) {
+    char *a = run(d, fn, in, want, 1);
+    struct session s2 = {.authed = 1};
+    char *b = feed(d, fn, &s2, in, strlen(in), 1);
+    EXPECT(strcmp(a, b) == 0, "incremental feed differs for %.60s\n  whole [%s]\n  bytes [%s]", in, a, b);
+    free(a);
+    free(b);
+}
+
+static void test_memcached(akvd *d) {
+    exec_fn m = mc_execute;
+    akv_flush(akvd_store(d));
+    free(run(d, m, "set a 5 0 3\r\nabc\r\nget a\r\n", "STORED\r\nVALUE a 5 3\r\nabc\r\nEND\r\n", 1));
+    run2(d, m, "get a b\r\n", "VALUE a 5 3\r\nabc\r\nEND\r\n");
+    run2(d, m, "add a 0 0 1\r\nx\r\n", "NOT_STORED\r\n");
+    run2(d, m, "replace zz 0 0 1\r\nx\r\n", "NOT_STORED\r\n");
+    free(run(d, m, "append a 0 0 2\r\nde\r\nprepend a 0 0 2\r\n12\r\nget a\r\n",
+             "STORED\r\nSTORED\r\nVALUE a 5 7\r\n12abcde\r\nEND\r\n", 1));
+    free(run(d, m, "set n 0 0 2\r\n10\r\nincr n 5\r\ndecr n 100\r\nincr zz 1\r\n",
+             "STORED\r\n15\r\n0\r\nNOT_FOUND\r\n", 1));
+    run2(d, m, "incr a 1\r\n", "CLIENT_ERROR cannot increment or decrement non-numeric value\r\n");
+    run2(d, m, "incr n x\r\n", "CLIENT_ERROR invalid numeric delta argument\r\n");
+    free(run(d, m, "set q 0 0 1 noreply\r\nq\r\ndelete q noreply\r\nget q\r\n", "END\r\n", 1));
+    run2(d, m, "delete nothere\r\n", "NOT_FOUND\r\n");
+    free(run(d, m, "set t 0 100 1\r\nv\r\ntouch t 0\r\ntouch none 5\r\n",
+             "STORED\r\nTOUCHED\r\nNOT_FOUND\r\n", 1));
+    free(run(d, m, "set e 0 -1 1\r\nv\r\nget e\r\n", "STORED\r\nEND\r\n", 1));
+
+    /* gets and cas */
+    char *r = run(d, m, "gets a\r\n", NULL, 1);
+    unsigned long long cas = 0;
+    EXPECT(sscanf(r, "VALUE a 5 7 %llu", &cas) == 1 && cas != 0, "gets reports a cas: %s", r);
+    free(r);
+    char req[256];
+    snprintf(req, sizeof(req), "cas a 1 0 1 %llu\r\nX\r\ncas a 1 0 1 %llu\r\nY\r\ncas none 0 0 1 1\r\nZ\r\n",
+             cas, cas);
+    free(run(d, m, req, "STORED\r\nEXISTS\r\nNOT_FOUND\r\n", 1));
+
+    /* gat updates the expiry */
+    free(run(d, m, "gat 100 a\r\n", "VALUE a 1 1\r\nX\r\nEND\r\n", 1));
+    akv_meta meta;
+    size_t vlen;
+    uint8_t one;
+    EXPECT(akv_get_meta(akvd_store(d), "a", 1, &one, 1, &vlen, &meta, AKV_TTL_KEEP) == 0 &&
+               meta.ttl_ms > 99000,
+           "gat set the ttl");
+
+    /* errors and framing */
+    run2(d, m, "bogus\r\n", "ERROR\r\n");
+    run2(d, m, "get\r\n", "ERROR\r\n");
+    run2(d, m, "\r\n", "ERROR\r\n");
+    struct session s = {.authed = 1};
+    char *x = feed(d, m, &s, "set k 0 0 3\r\nabcd\r\n", 18, 0);
+    EXPECT(strcmp(x, "CLIENT_ERROR bad data chunk\r\n") == 0 && s.close, "bad data chunk closes: %s", x);
+    free(x);
+    s = (struct session){.authed = 1};
+    x = feed(d, m, &s, "set k 0 0 x\r\n", 13, 0);
+    EXPECT(s.close, "unparseable storage line closes the connection");
+    free(x);
+    /* oversized data block: skipped, connection stays usable */
+    size_t big = akvd_max_entry(d) + 10;
+    char *msg = malloc(big + 200);
+    int hl = snprintf(msg, 200, "set big 0 0 %zu\r\n", big);
+    memset(msg + hl, 'z', big);
+    memcpy(msg + hl + big, "\r\nget a\r\n", 9);
+    s = (struct session){.authed = 1};
+    x = feed(d, m, &s, msg, (size_t)hl + big + 9, 0);
+    EXPECT(strcmp(x, "SERVER_ERROR object too large for cache\r\nVALUE a 1 1\r\nX\r\nEND\r\n") == 0 &&
+               !s.close,
+           "oversized value skipped: %.80s", x);
+    free(x);
+    s = (struct session){.authed = 1};
+    x = feed(d, m, &s, msg, (size_t)hl + big + 9, 1);
+    EXPECT(strcmp(x, "SERVER_ERROR object too large for cache\r\nVALUE a 1 1\r\nX\r\nEND\r\n") == 0,
+           "oversized value skipped bytewise: %.80s", x);
+    free(x);
+    free(msg);
+    s = (struct session){.authed = 1};
+    x = feed(d, m, &s, "quit\r\nget a\r\n", 12, 0);
+    EXPECT(s.close && x[0] == '\0', "quit closes without reply");
+    free(x);
+
+    /* meta commands */
+    free(run(d, m, "ms mk 3 T100 F7\r\nabc\r\n", "HD\r\n", 1));
+    run2(d, m, "mg mk v f s\r\n", "VA 3 f7 s3\r\nabc\r\n");
+    run2(d, m, "mg mk k Oop\r\n", "HD kmk Oop\r\n");
+    run2(d, m, "mg missing v\r\n", "EN\r\n");
+    run2(d, m, "mg missing v q\r\nmn\r\n", "MN\r\n");
+    free(run(d, m, "ms mk 1 ME\r\nz\r\n", "NS\r\n", 1));
+    free(run(d, m, "ms mk 2 MA\r\nde\r\nmg mk v\r\n", "HD\r\nVA 5\r\nabcde\r\n", 1));
+    free(run(d, m, "ms cnt 1\r\n5\r\nma cnt v\r\nma cnt MD D10 v\r\nma none\r\nma none N0 J7 v\r\n",
+             "HD\r\nVA 1\r\n6\r\nVA 1\r\n0\r\nNF\r\nVA 1\r\n7\r\n", 1));
+    run2(d, m, "md none q\r\nmd none\r\n", "NF\r\n");
+    run2(d, m, "md none q\r\n", "");
+    free(run(d, m, "md mk\r\nmg mk v\r\n", "HD\r\nEN\r\n", 1));
+    run2(d, m, "mg mk zz\r\n", "CLIENT_ERROR bad command line format\r\n");
+
+    r = run(d, m, "stats\r\n", NULL, 1);
+    EXPECT(strstr(r, "STAT curr_items ") != NULL && strstr(r, "STAT cmd_get ") != NULL &&
+               strstr(r, "END\r\n") != NULL,
+           "stats output");
+    free(r);
+    r = run(d, m, "version\r\n", NULL, 1);
+    EXPECT(strncmp(r, "VERSION 1.6.0-arenakv-", 22) == 0, "version: %s", r);
+    free(r);
+    free(run(d, m, "flush_all\r\nget n\r\n", "OK\r\nEND\r\n", 1));
+}
+
+static void test_resp(akvd *d) {
+    exec_fn r = resp_execute;
+    akv_flush(akvd_store(d));
+    free(run(d, r, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\nabc\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+             "+OK\r\n$3\r\nabc\r\n", 1));
+    run2(d, r, "GET k\r\n", "$3\r\nabc\r\n");
+    run2(d, r, "GET nothere\r\n", "$-1\r\n");
+    run2(d, r, "PING\r\n*1\r\n$4\r\nPING\r\n*2\r\n$4\r\nPING\r\n$2\r\nhi\r\n",
+         "+PONG\r\n+PONG\r\n$2\r\nhi\r\n");
+    run2(d, r, "*2\r\n$4\r\nECHO\r\n$0\r\n\r\n", "$0\r\n\r\n");
+    free(run(d, r, "SET k v NX\r\nSET k2 v XX\r\nSET k3 v NX\r\n", "$-1\r\n$-1\r\n+OK\r\n", 1));
+    free(run(d, r, "SET k new GET\r\nGET k\r\n", "$3\r\nabc\r\n$3\r\nnew\r\n", 1));
+    free(run(d, r, "MSET a 1 b 2\r\nMGET a b c\r\n", "+OK\r\n*3\r\n$1\r\n1\r\n$1\r\n2\r\n$-1\r\n", 1));
+    free(run(d, r, "INCR a\r\nINCRBY a 10\r\nDECR a\r\nDECRBY a -3\r\nINCR fresh\r\n",
+             ":2\r\n:12\r\n:11\r\n:14\r\n:1\r\n", 1));
+    run2(d, r, "INCR k\r\n", "-ERR value is not an integer or out of range\r\n");
+    free(run(d, r, "SET big 9223372036854775807\r\nINCR big\r\n",
+             "+OK\r\n-ERR increment or decrement would overflow\r\n", 1));
+    free(run(d, r, "APPEND s ab\r\nAPPEND s cd\r\nSTRLEN s\r\nGET s\r\n", ":2\r\n:4\r\n:4\r\n$4\r\nabcd\r\n",
+             1));
+    run2(d, r, "EXISTS a b nothere a\r\nTYPE a\r\nTYPE nothere\r\n", ":3\r\n+string\r\n+none\r\n");
+    free(run(d, r, "DEL a b nothere\r\nEXISTS a\r\n", ":2\r\n:0\r\n", 1));
+    free(run(d, r, "SET t v EX 100\r\nTTL t\r\nPERSIST t\r\nTTL t\r\nTTL nothere\r\n",
+             "+OK\r\n:100\r\n:1\r\n:-1\r\n:-2\r\n", 1));
+    free(run(d, r, "SETEX e 100 v\r\nEXPIRE e 0\r\nGET e\r\nPSETEX p 100000 v\r\n",
+             "+OK\r\n:1\r\n$-1\r\n+OK\r\n", 1));
+    char *x = run(d, r, "PTTL p\r\n", NULL, 1);
+    long long pttl = -5;
+    EXPECT(sscanf(x, ":%lld", &pttl) == 1 && pttl > 99000 && pttl <= 100000, "pttl %s", x);
+    free(x);
+    free(run(d, r, "SETNX n 1\r\nSETNX n 2\r\nGETDEL n\r\nGET n\r\n", ":1\r\n:0\r\n$1\r\n1\r\n$-1\r\n", 1));
+    free(run(d, r, "GETEX k EX 50\r\nTTL k\r\n", "$3\r\nnew\r\n:50\r\n", 1));
+    run2(d, r, "SET k v EX 0\r\n", "-ERR invalid expire time in 'set' command\r\n");
+    run2(d, r, "SET k v BOGUS\r\n", "-ERR syntax error\r\n");
+    run2(d, r, "GET\r\n", "-ERR wrong number of arguments for 'GET' command\r\n");
+    run2(d, r, "FOO bar\r\n", "-ERR unknown command 'FOO'\r\n");
+    run2(d, r, "SELECT 0\r\nSELECT 1\r\n", "+OK\r\n-ERR DB index is out of range\r\n");
+    run2(d, r, "HELLO 3\r\n", "-NOPROTO unsupported protocol version\r\n");
+    free(run(d, r, "FLUSHALL\r\nSET k1 v\r\nSET k2 v\r\nSET x v\r\nDBSIZE\r\n",
+             "+OK\r\n+OK\r\n+OK\r\n+OK\r\n:3\r\n", 1));
+    x = run(d, r, "KEYS k*\r\n", NULL, 1);
+    EXPECT(strncmp(x, "*2\r\n", 4) == 0 && strstr(x, "$2\r\nk1\r\n") && strstr(x, "$2\r\nk2\r\n"), "keys: %s",
+           x);
+    free(x);
+    x = run(d, r, "SCAN 0 MATCH x\r\n", NULL, 1);
+    EXPECT(strcmp(x, "*2\r\n$1\r\n0\r\n*1\r\n$1\r\nx\r\n") == 0, "scan: %s", x);
+    free(x);
+    x = run(d, r, "INFO\r\n", NULL, 1);
+    EXPECT(x[0] == '$' && strstr(x, "db0:keys=3") != NULL, "info: %.80s", x);
+    free(x);
+    /* inline and array framing errors */
+    struct session s = {.authed = 1};
+    x = feed(d, r, &s, "*1\r\n$x\r\n", 8, 0);
+    EXPECT(s.close && strncmp(x, "-ERR Protocol error", 19) == 0, "bad bulk length closes: %s", x);
+    free(x);
+    s = (struct session){.authed = 1};
+    x = feed(d, r, &s, "*2\r\n$3\r\nGET\r\n$1\r\nkX\r\n", 21, 0);
+    EXPECT(s.close, "bad bulk terminator closes");
+    free(x);
+    s = (struct session){.authed = 1};
+    x = feed(d, r, &s, "QUIT\r\nGET k\r\n", 12, 0);
+    EXPECT(s.close && strcmp(x, "+OK\r\n") == 0, "quit: %s", x);
+    free(x);
+}
+
+static void test_auth(akvd *d) {
+    /* d was started with credentials "alice:secret" and the default password "pw". */
+    free(run(d, mc_execute, "get a\r\n", "CLIENT_ERROR unauthenticated\r\n", 0));
+    free(run(d, mc_execute, "set x 0 0 9\r\nalice bad\r\n", "CLIENT_ERROR authentication failure\r\n", 0));
+    free(run(d, mc_execute, "set x 0 0 12\r\nalice secret\r\nget a\r\n", "STORED\r\nEND\r\n", 0));
+    free(run(d, resp_execute, "GET a\r\n", "-NOAUTH Authentication required.\r\n", 0));
+    free(run(d, resp_execute, "AUTH wrong\r\n",
+             "-WRONGPASS invalid username-password pair or user is disabled.\r\n", 0));
+    free(run(d, resp_execute, "AUTH pw\r\nGET a\r\n", "+OK\r\n$-1\r\n", 0));
+    free(run(d, resp_execute, "AUTH alice secret\r\nGET a\r\n", "+OK\r\n$-1\r\n", 0));
+    char *x = run(d, resp_execute, "HELLO 2 AUTH alice secret\r\nGET a\r\n", NULL, 0);
+    EXPECT(strncmp(x, "*14\r\n", 5) == 0 && strstr(x, "$-1\r\n") != NULL, "hello with auth: %.40s", x);
+    free(x);
+}
+
+/* Random inputs: valid commands, single-byte mutations, and noise. */
+static void fuzz(akvd *d, exec_fn fn, const char *const *seeds, unsigned nseeds, const char *name) {
+    uint64_t st = 0x9e3779b97f4a7c15ull;
+    unsigned closes = 0;
+    for (unsigned iter = 0; iter < 500000; iter++) {
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17;
+        char buf[512];
+        size_t n = 0;
+        unsigned parts = 1 + (unsigned)(st % 4);
+        for (unsigned k = 0; k < parts && n < sizeof(buf) - 64; k++) {
+            const char *sd = seeds[(st >> (8 + k * 5)) % nseeds];
+            size_t l = strlen(sd);
+            if (n + l >= sizeof(buf)) {
+                break;
+            }
+            memcpy(buf + n, sd, l);
+            n += l;
+        }
+        unsigned mut = (unsigned)((st >> 40) % 5);
+        for (unsigned k = 0; k < mut && n > 0; k++) {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            buf[st % n] = (char)(st >> 32);
+        }
+        if ((iter & 7) == 0) {
+            n = (size_t)(st % sizeof(buf));
+            for (size_t i = 0; i < n; i++) {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                buf[i] = (char)st;
+            }
+        }
+        struct session s = {.authed = 1};
+        struct obuf out = {0};
+        size_t used = fn(d, &s, (const uint8_t *)buf, n, &out);
+        if (used > n) {
+            EXPECT(0, "%s: consumed %zu of %zu bytes", name, used, n);
+            break;
+        }
+        closes += s.close;
+        ob_free(&out);
+    }
+    akv_stats stt;
+    akv_stats_get(akvd_store(d), &stt);
+    EXPECT(stt.log_bytes <= stt.arena_bytes, "%s: engine consistent after fuzz", name);
+    printf("%s fuzz: 500000 inputs, %u closed the connection\n", name, closes);
+}
+
+int main(void) {
+    char cred_path[] = "/tmp/akv-test-cred-XXXXXX";
+    int fd = mkstemp(cred_path);
+    const char creds[] = "# test credentials\nalice:secret\npw\n";
+    EXPECT(fd >= 0 && write(fd, creds, sizeof(creds) - 1) == (ssize_t)(sizeof(creds) - 1),
+           "credentials file");
+    close(fd);
+
+    akvd_config cfg;
+    akvd_config_default(&cfg);
+    cfg.port = NULL; /* no listeners: the protocol modules are driven directly */
+    cfg.store.capacity = 8u << 20;
+    cfg.store.shards = 4;
+    cfg.store.max_entry = 64u << 10;
+    cfg.threads = 1;
+    cfg.log_level = AKVD_LOG_ERROR;
+    int err = 0;
+    akvd *d = akvd_start(&cfg, &err);
+    EXPECT(d != NULL, "server without listeners: %d", err);
+    if (d != NULL) {
+        test_memcached(d);
+        test_resp(d);
+        static const char *const mc_seeds[] = {"get a b\r\n",
+                                               "set a 1 0 3\r\nabc\r\n",
+                                               "incr a 1\r\n",
+                                               "mg a v f c t s k\r\n",
+                                               "ms a 2 T5\r\nxy\r\n",
+                                               "ma n N0 J1 v\r\n",
+                                               "md a\r\n",
+                                               "delete a\r\n",
+                                               "gat 1 a\r\n",
+                                               "cas a 0 0 1 5\r\nq\r\n",
+                                               "append a 0 0 1\r\nz\r\n",
+                                               "touch a 10\r\n",
+                                               "stats\r\n",
+                                               "flush_all\r\n",
+                                               "set big 0 0 99999\r\n"};
+        fuzz(d, mc_execute, mc_seeds, sizeof(mc_seeds) / sizeof(mc_seeds[0]), "memcached");
+        static const char *const resp_seeds[] = {"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n",
+                                                 "*2\r\n$3\r\nGET\r\n$1\r\na\r\n",
+                                                 "INCR a\r\n",
+                                                 "MSET a 1 b 2\r\n",
+                                                 "MGET a b c\r\n",
+                                                 "SET a b EX 5 NX\r\n",
+                                                 "EXPIRE a 3\r\n",
+                                                 "TTL a\r\n",
+                                                 "APPEND a x\r\n",
+                                                 "DEL a b\r\n",
+                                                 "KEYS *\r\n",
+                                                 "*1\r\n$4\r\nPING\r\n",
+                                                 "*-1\r\n",
+                                                 "$5\r\nhello\r\n",
+                                                 "SCAN 0 MATCH a*\r\n"};
+        fuzz(d, resp_execute, resp_seeds, sizeof(resp_seeds) / sizeof(resp_seeds[0]), "resp");
+        akvd_stop(d);
+    }
+    cfg.auth_file = cred_path;
+    d = akvd_start(&cfg, &err);
+    EXPECT(d != NULL, "server with credentials: %d", err);
+    if (d != NULL) {
+        test_auth(d);
+        akvd_stop(d);
+    }
+    unlink(cred_path);
+    srv_thread_exit(); /* the protocol modules ran on this thread */
+    resp_thread_exit();
+    if (failures != 0) {
+        fprintf(stderr, "%d failure(s)\n", failures);
+        return 1;
+    }
+    puts("test_proto: ok");
+    return 0;
+}

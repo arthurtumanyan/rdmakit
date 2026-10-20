@@ -30,6 +30,30 @@ jobs:
       - name: AddressSanitizer and UndefinedBehaviorSanitizer
         run: for p in rdmaduct arenakv kvpace; do make -C $p RDMA=0 SAN=1 test || exit 1; done
 
+  tls:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev
+      - name: arenakv with TLS listeners, plain and under the sanitizers
+        run: make -C arenakv RDMA=0 TLS=1 test && make -C arenakv RDMA=0 TLS=1 SAN=1 test
+
+  thread-sanitizer:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y build-essential
+      - name: arenakv engine and server under ThreadSanitizer
+        run: make -C arenakv RDMA=0 TSAN=1 test
+
+  client-compatibility:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y build-essential python3-redis
+      - name: valkey-cli, valkey-benchmark, memtier_benchmark and redis-py against arenakvd
+        run: make -C arenakv RDMA=0 compat
+
   rdma-build:
     runs-on: ubuntu-24.04
     steps:
