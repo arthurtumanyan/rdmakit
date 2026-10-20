@@ -19,6 +19,8 @@ VALKEY=${VALKEY_IMAGE:-valkey/valkey:latest}
 MEMTIER=${MEMTIER_IMAGE:-redislabs/memtier_benchmark:latest}
 port_resp=${COMPAT_RESP_PORT:-16379}
 port_mc=${COMPAT_MC_PORT:-16211}
+# Pull first, so that download messages do not mix with the output of the checks.
+docker pull -q "$VALKEY" >/dev/null && docker pull -q "$MEMTIER" >/dev/null || { echo "compat: cannot pull images"; exit 1; }
 log=$(mktemp)
 "$build/arenakvd" --port off --text-addr 127.0.0.1 --resp-port "$port_resp" --memcached-port "$port_mc" \
     --capacity 256M --threads 4 --log-level warn >"$log" 2>&1 &

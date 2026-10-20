@@ -581,6 +581,24 @@ static void conn_free(struct conn *c) {
     free(c);
 }
 
+/* Engine store mode of a native store operation. */
+static enum akv_mode store_mode(uint8_t op) {
+    switch (op) {
+    case AKVP_ADD:
+        return AKV_ADD;
+    case AKVP_REPLACE:
+        return AKV_REPLACE;
+    case AKVP_APPEND:
+        return AKV_APPEND;
+    case AKVP_PREPEND:
+        return AKV_PREPEND;
+    case AKVP_CAS:
+        return AKV_CAS;
+    default:
+        return AKV_SET;
+    }
+}
+
 /* Executes one native request into out (capacity cap). Returns the response length, or 0 to close. */
 static size_t native_handle(akvd *d, struct conn *c, const uint8_t *msg, size_t len, uint8_t *out,
                             size_t cap) {
@@ -655,10 +673,8 @@ static size_t native_handle(akvd *d, struct conn *c, const uint8_t *msg, size_t 
                 status = AKVP_BADREQ;
                 break;
             }
-            static const enum akv_mode modes[] = {[AKVP_PUT] = AKV_SET,         [AKVP_ADD] = AKV_ADD,
-                                                  [AKVP_REPLACE] = AKV_REPLACE, [AKVP_APPEND] = AKV_APPEND,
-                                                  [AKVP_PREPEND] = AKV_PREPEND, [AKVP_CAS] = AKV_CAS};
-            akv_store_opts o = {.mode = modes[rq.op], .flags = x.uflags, .ttl_ms = x.ttl_ms, .cas = x.cas};
+            akv_store_opts o = {
+                .mode = store_mode(rq.op), .flags = x.uflags, .ttl_ms = x.ttl_ms, .cas = x.cas};
             uint64_t cas = 0;
             SRV_COUNT(d, cmd_set, 1);
             int rc = akv_store(s, key, rq.klen, val, rq.vlen, &o, &cas);
