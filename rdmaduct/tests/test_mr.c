@@ -111,7 +111,8 @@ static void *target_main(void *arg) {
 }
 
 /* Connects and receives the three descriptors. */
-static int open_conn(duct_ctx *ctx, const char *addr, const char *port, duct_ep **ep, struct duct_mr_desc d[3]) {
+static int open_conn(duct_ctx *ctx, const char *addr, const char *port, duct_ep **ep,
+                     struct duct_mr_desc d[3]) {
     int rc = duct_connect(ctx, addr, port, ep);
     if (rc != 0) {
         return rc;
@@ -210,7 +211,8 @@ static void run(enum duct_transport tr, enum duct_wait w, const char *addr, cons
             rc = duct_write(ep, lmr, (size_t)i * 512, &d[0], (uint64_t)i * 512, 512, 5000, &last);
             EXPECT(rc == 0, "%s: pipelined write %d: %s", name, i, duct_strerror(rc));
         }
-        EXPECT(duct_wait(ep, last, 5000) == 0 && duct_ep_completed(ep) >= last, "%s: pipeline completion", name);
+        EXPECT(duct_wait(ep, last, 5000) == 0 && duct_ep_completed(ep) >= last, "%s: pipeline completion",
+               name);
         memset(lbuf + REGION / 2, 0, 64 * 512);
         uint64_t s;
         duct_read(ep, lmr, REGION / 2, &d[0], 0, 64 * 512, 5000, &s);
@@ -221,8 +223,8 @@ static void run(enum duct_transport tr, enum duct_wait w, const char *addr, cons
         uint64_t *res = (uint64_t *)(lbuf + 1024 * 64);
         for (uint64_t i = 0; i < 10; i++) {
             rc = duct_atomic_fadd(ep, lmr, 1024 * 64, &d[2], 8, 3, 5000, &s);
-            EXPECT(rc == 0 && duct_wait(ep, s, 5000) == 0 && *res == 3 * i, "%s: fadd %llu returned %llu", name,
-                   (unsigned long long)i, (unsigned long long)*res);
+            EXPECT(rc == 0 && duct_wait(ep, s, 5000) == 0 && *res == 3 * i, "%s: fadd %llu returned %llu",
+                   name, (unsigned long long)i, (unsigned long long)*res);
         }
         rc = duct_atomic_cswap(ep, lmr, 1024 * 64, &d[2], 8, 30, 77, 5000, &s);
         EXPECT(rc == 0 && duct_wait(ep, s, 5000) == 0 && *res == 30, "%s: cswap success returned %llu", name,
@@ -296,7 +298,8 @@ static void run(enum duct_transport tr, enum duct_wait w, const char *addr, cons
         if (rc == 0) {
             rc = duct_wait(ep, s, 5000);
         }
-        EXPECT(rc == DUCT_EACCESS, "%s: write to deregistered region failed with %s", name, duct_strerror(rc));
+        EXPECT(rc == DUCT_EACCESS, "%s: write to deregistered region failed with %s", name,
+               duct_strerror(rc));
         duct_ep_close(ep);
     }
 
