@@ -194,9 +194,10 @@ static void run(enum duct_transport tr, enum duct_wait w, const char *addr, cons
         }
 
         /* read-only region: contents and rights */
-        rc = duct_read(ep, lmr, 0, &d[1], 0, 4096, 5000, NULL);
+        uint64_t ro_seq = 0;
+        rc = duct_read(ep, lmr, 0, &d[1], 0, 4096, 5000, &ro_seq);
         EXPECT(rc == 0, "%s: read ro: %s", name, duct_strerror(rc));
-        rc = duct_wait(ep, duct_ep_completed(ep) + 1, 5000);
+        rc = duct_wait(ep, ro_seq, 5000);
         int ro_ok = 1;
         for (int i = 0; i < 4096; i++) {
             ro_ok &= lbuf[i] == (uint8_t)(i * 13);
