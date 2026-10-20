@@ -66,8 +66,13 @@ What `kvpace` adds:
 - Result files that carry the environment of the run, which the benchmark suite in `benchmarks/` uses to make
   every published number checkable.
 
-What it does not do: distributed load generation, the YCSB core workloads, TLS, cluster-aware clients, or
-multiplexing many connections per thread (it uses one thread per connection).
+It also covers the client features of `memtier_benchmark` that matter for these servers: several connections per
+thread with pipelining, operation mixes, key distributions, value-size lists, authentication, TLS and HdrHistogram
+output, plus the YCSB core workloads A, B, C, D and F as presets.
+
+What it does not do: coordinated distributed load generation (several hosts start together with `--start-at` and
+their results are combined with `kvpace merge`, but no controller drives them), YCSB workload E (range scans),
+cluster-aware clients, or the memcached binary protocol.
 
 ## arenakv: key-value cache for large blocks
 

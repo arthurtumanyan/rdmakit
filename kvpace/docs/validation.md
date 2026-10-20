@@ -13,7 +13,7 @@ run. Workload: 100,000 keys, 64-byte values, uniform keys, 90% GET / 10% SET, ke
 | Connections | `kvpace` | `memtier_benchmark` |
 |---|---|---|
 | 1 | 1 thread, 1 connection | `-t 1 -c 1` |
-| 16 | 16 threads, 1 connection each | `-t 4 -c 4` |
+| 16 | 16 threads, 1 connection each (run1) | `-t 4 -c 4` |
 
 Both tools run pinned to the same client CPUs. Each configuration is repeated and the order of the two tools
 alternates between repetitions. Raw files are in the `validation` suite of the benchmark run
@@ -41,5 +41,6 @@ The differences between the tools are explained by client design, not by the ser
   dominates and the tools differ. With many connections the server is the bottleneck, and the burst pattern of the
   multiplexing client lets the server read several requests per wake-up, which lowers its per-request cost.
 - A comparison between servers must use one tool for all servers.
-- A multiplexed runner would remove the burst difference (listed under known limitations in
-  [`ARCHITECTURE.md`](ARCHITECTURE.md)).
+- The run above predates the multiplexed runner. `kvpace --threads 4 --conns-per-thread 4` reproduces the client
+  model of `memtier_benchmark -t 4 -c 4` ([`ARCHITECTURE.md`](ARCHITECTURE.md#execution-model)); the next run of
+  the benchmark suite compares the two tools with matched models.

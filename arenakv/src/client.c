@@ -64,6 +64,18 @@ unsigned akvc_window(const akvc *c) {
     return c->window;
 }
 
+unsigned akvc_outstanding(const akvc *c) {
+    return c->outstanding;
+}
+
+int akvc_fd(const akvc *c) {
+    return duct_ep_fd(c->ep);
+}
+
+int akvc_arm(akvc *c) {
+    return duct_ep_arm(c->ep);
+}
+
 /* Builds a request in c->req and returns its length, or 0 when it does not fit. */
 static size_t build(akvc *c, uint8_t op, const void *key, size_t klen, const void *val, size_t vlen,
                     const struct akvp_ext *ext) {

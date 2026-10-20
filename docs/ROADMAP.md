@@ -8,7 +8,7 @@ developed further. Dates refer to the history of this repository.
 | Area | Done | Open |
 |---|---|---|
 | rdmaduct | RDMA and TCP transports, credit-based flow control, batching, event-driven waiting, graceful close, pollable descriptors, registered regions, zero-copy send, one-sided read/write and atomics (emulated on TCP), fault injection and fuzzing of handshake, framing and control frames | GPU memory, multiple devices, TCP progress thread, coverage-guided fuzzing |
-| kvpace | closed and open loop, Zipfian and uniform keys, KV-cache scenario, RESP, memcached and native drivers, server CPU sampling | multiplexed connections per thread, trace replay, distributed generation |
+| kvpace | closed and open loop; several connections per thread with pipelining; operation mixes and YCSB workloads A, B, C, D, F; five key distributions and value-size lists; KV-cache scenario; RESP, memcached and native drivers with authentication and TLS; CSV and HdrHistogram output; synchronized multi-host start and result merging; server CPU sampling | trace replay, cluster-aware clients, coordinated distributed generation |
 | arenakv | engine with expiry, CAS, conditional stores, increments and a growing index; event-loop server; memcached text and meta, RESP2 and native protocols; authentication, TLS, snapshots; client with pipelining and consistent hashing; tests under three sanitizers and with third-party clients | zero-copy GET from registered memory, one-sided GET, incremental rehashing, replication |
 | benchmarks | orchestrator, environment capture, figures, tables, claim verification | runs on RDMA hardware, runs with the `performance` CPU governor, cross-host runs |
 
@@ -26,5 +26,4 @@ memory efficiency. They need RDMA hardware to be evaluated; Soft-RoCE results ar
 2. Worker-per-core serving model for `arenakvd` with polling completion queues.
 3. Zero-copy GET (send from the registered arena) and a one-sided GET path with checksummed buckets, measured against
    the RPC path.
-4. Multiplexed connections in `kvpace`, to reproduce burst behavior of event-loop clients.
-5. Integration points for inference serving engines, only if step 1 to 3 show an advantage.
+4. Integration points for inference serving engines, only if steps 1 to 3 show an advantage.

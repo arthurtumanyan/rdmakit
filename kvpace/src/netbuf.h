@@ -1,5 +1,5 @@
 /*
- * netbuf.h - buffered blocking TCP connection used by the text-protocol drivers.
+ * netbuf.h - buffered blocking connection (TCP or TLS, see sock.h) used by the synchronous text drivers.
  *
  * A connection owns a read buffer for incremental parsing of responses and a growable write buffer for
  * assembling requests. Not thread-safe; one thread owns a connection.
@@ -9,11 +9,13 @@
 
 #include <stddef.h>
 
+#include "sock.h"
+
 #define PACE_NET_RBUF 65536
 #define PACE_NET_LINE_MAX 256
 
 typedef struct pace_net {
-    int fd;
+    pace_sock s;
     size_t rpos;
     size_t rlen;
     unsigned char rbuf[PACE_NET_RBUF];
@@ -21,7 +23,7 @@ typedef struct pace_net {
     size_t wcap;
 } pace_net;
 
-/* Connects over TCP with TCP_NODELAY. Returns NULL on failure. */
+/* Connects over TCP with TCP_NODELAY (and TLS when configured). Returns NULL on failure. */
 pace_net *pace_net_open(const char *host, const char *port);
 
 /* Closes the connection and frees it. Safe with NULL. */

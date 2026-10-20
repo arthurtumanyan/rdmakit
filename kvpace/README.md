@@ -6,10 +6,20 @@ identical measurement code, in closed-loop or open-loop mode, and records the en
 its result files.
 
 - Closed-loop and open-loop load; open-loop latency is measured from the **intended** send time.
-- Uniform and Zipfian key distributions; fixed-size values; configurable read ratio.
+- One connection per thread with blocking calls, or many connections per thread from one epoll loop with up to
+  `--pipeline` requests in flight per connection (the client model of `memtier_benchmark -t/-c/--pipeline`).
+- Operation mixes of GET, SET, DEL, INCR, MGET, read-modify-write and INSERT; YCSB core workloads A, B, C, D and F
+  as presets.
+- Key distributions: uniform, Zipfian, sequential, Gaussian, latest. Value sizes: fixed, uniform range or weighted
+  list. Key prefixes.
+- Duration or request-count runs; synchronized start on several hosts and `kvpace merge` to combine their results.
+- Authentication (RESP `AUTH`, memcached ASCII authentication, native `AUTH`), RESP `SELECT`, and optional TLS for
+  the RESP and memcached drivers (`TLS=1`).
 - A KV-cache scenario: prefix-chain requests with reuse accounting.
-- Latency histograms with at most 0.8% relative error; per-second throughput series; server CPU and memory sampling.
-- One JSON result file per run (schema in [`docs/USAGE.md`](docs/USAGE.md#result-files)).
+- Latency histograms with at most 0.8% relative error, configurable percentiles, per-operation latencies;
+  per-second throughput series; server CPU and memory sampling.
+- One JSON result file per run (schema in [`docs/USAGE.md`](docs/USAGE.md#result-files)), plus CSV and
+  HdrHistogram percentile-distribution output.
 - CPU pinning of client threads.
 
 **Status:** experimental. Cross-checked against `memtier_benchmark` (see [`docs/validation.md`](docs/validation.md)).
@@ -34,8 +44,9 @@ front of an expensive computation actually saves. `kvpace` exists to remove thes
   memory samples. The benchmark suite in [`../benchmarks`](../benchmarks) uses them to make every published
   number checkable.
 
-`memtier_benchmark`, YCSB, `mutilate` and `wrk2` remain better choices for their own strengths: the standard Redis
-and memcached tool, the YCSB core workloads, distributed load generation, HTTP. See
+`memtier_benchmark`, YCSB, `mutilate` and `wrk2` remain better choices for their own strengths: Redis Cluster
+support and the memcached binary protocol, databases other than key-value caches, coordinated distributed load
+generation, HTTP. See
 [`../docs/PRIOR_ART.md`](../docs/PRIOR_ART.md).
 
 ### Comparison
@@ -44,12 +55,20 @@ and memcached tool, the YCSB core workloads, distributed load generation, HTTP. 
 |---|---|---|---|
 | Protocols | RESP, memcached text, arenakv native | RESP, memcached text and binary | many databases through bindings |
 | Same measurement code for all servers | yes | yes (two protocols) | per binding |
+| Several connections per thread, pipelining | yes (`--conns-per-thread`, `--pipeline`) | yes (`-c`, `--pipeline`) | no (one request per thread) |
+| Operation mix | GET, SET, DEL, INCR, MGET, read-modify-write, INSERT | GET/SET ratio, multi-get | read, update, insert, scan, read-modify-write |
+| YCSB core workloads | A, B, C, D, F (E needs range scans) | no | A to F |
+| Key distributions | uniform, Zipfian, sequential, Gaussian, latest | uniform, Gaussian, sequential | uniform, Zipfian, latest, hotspot, sequential |
+| Value sizes | fixed, range, weighted list | fixed, range, weighted list | field count and length |
+| TLS, authentication | yes (`TLS=1`) | yes | per binding |
 | Open-loop arrivals | constant or Poisson schedule | per-connection rate limit | target throughput |
 | Latency from the intended send time | yes, reported next to service time | no | yes (intended latency) |
+| HdrHistogram output | percentile distribution files | yes | yes |
 | KV-cache prefix-chain scenario with reuse accounting | yes | no | no |
 | Server CPU time and memory per operation | yes (`--server-pid`) | no | no |
 | Hardware and software environment in every result file | yes | no | no |
-| Multi-host load generation | no | no | separate client processes |
+| Multi-host load generation | synchronized start, `kvpace merge` of the result files | no | separate client processes |
+| Cluster-aware clients | no | Redis Cluster | per binding |
 
 Statements about other systems reflect their public documentation at the time of writing.
 
@@ -72,8 +91,8 @@ Valkey on one CPU, 64-byte values, 90% GET. Latencies are GET latencies in micro
 <!-- END GENERATED:validation -->
 
 With one connection kvpace measures higher throughput than memtier_benchmark; with 16 connections it measures
-between 5% and 15% lower [C21]. The differences come from the client models (one blocking thread per connection
-against event loops) and are analysed in [`docs/validation.md`](docs/validation.md).
+between 5% and 15% lower [C21]. The differences come from the client models (run1 used one blocking thread per
+connection, memtier an event loop) and are analysed in [`docs/validation.md`](docs/validation.md).
 
 Open-loop sweep over offered load, and the effect of measuring from the intended send time:
 
@@ -139,21 +158,27 @@ with `AKV_DIR` and `DUCT_DIR`, or build without it with `NATIVE=0`).
 
 ```
 make                 # build/<arch>/kvpace
-make test            # unit tests: histogram, Zipf generator, drivers, runner timing, KV-cache workload
+make test            # unit tests: histogram, generators, drivers, runner timing, merge, KV-cache workload
 make SAN=1 test      # AddressSanitizer + UndefinedBehaviorSanitizer
+make TLS=1 test      # with TLS for the text drivers (OpenSSL), build/<arch>-tls/
 make NATIVE=0        # without the arenakv driver
 make RDMA=0          # native driver over TCP only (build/<arch>-tcp/)
 ```
 
-Test results: all six suites pass on x86-64 and aarch64, and on x86-64 under AddressSanitizer with
-UndefinedBehaviorSanitizer. CI runs them with gcc and clang on x86-64 and arm64.
+Test results: all ten suites pass on x86-64, in the default, `TLS=1`, `RDMA=0` and `NATIVE=0` builds and under
+AddressSanitizer with UndefinedBehaviorSanitizer (with and without TLS). CI runs them with gcc and clang on x86-64
+and arm64, and the TLS build on x86-64.
 
 | Suite | Covers |
 |---|---|
 | `test_hist` | exact storage of small values, bucket bounds, relative quantization error over the 64-bit range, quantiles, merge |
 | `test_zipf` | empirical rank frequencies against the exact Zipf probabilities, uniformity at theta 0, range |
+| `test_workload` | parsing of mixes, sizes and presets; operation frequencies; sequential, Gaussian, latest and Zipf keys; value-size bounds and frequencies; key text |
 | `test_resp`, `test_memcached` | drivers against in-process servers: round trips, missing keys, binary-safe and empty values, oversize values |
-| `test_runner` | closed- and open-loop timing with a synthetic driver whose throughput and latency are known analytically |
+| `test_drivers` | all three drivers against an in-process arenakv server: DEL, INCR, MGET, authentication, and pipelined asynchronous requests compared with the synchronous results |
+| `test_runner` | closed- and open-loop timing with a synthetic driver whose throughput and latency are known analytically, for one and for several connections per thread with pipelining; request-count mode |
+| `test_merge` | JSON round trip, `kvpace merge` (summed counters and series, merged histograms, idempotent percentiles, schema check), CSV and `.hgrm` output |
+| `test_tls` | TLS round trips and 200 pipelined requests with certificate verification, refusal of an untrusted certificate, `--tls-skip-verify` (`TLS=1` builds) |
 | `test_kvcache` | request structure, hit rates, determinism, key sharing and separation, corruption detection |
 
 ## Quick start
@@ -168,6 +193,16 @@ build/x86_64/kvpace --port 6379 --threads 16 --duration 10 --value-size 64 --rea
 # open loop: 100,000 operations per second in total, constant arrivals
 build/x86_64/kvpace --port 6379 --threads 16 --rate 100000 --duration 10 --out result.json
 
+# memtier-style client: 4 threads x 4 connections, 8 requests in flight per connection, SET:GET 1:10
+build/x86_64/kvpace --port 6379 --threads 4 --conns-per-thread 4 --pipeline 8 --ratio 1:10 --out result.json
+
+# YCSB workload A (50% read, 50% update, Zipfian, 1000-byte values) over TLS with a password
+build/x86_64-tls/kvpace --port 6380 --tls --cacert ca.pem --auth secret --workload ycsb-a --threads 8
+
+# two load-generator hosts started together, results combined afterwards
+build/x86_64/kvpace --host 192.0.2.10 --threads 8 --start-at 1793000000 --out a.json    # on each host
+build/x86_64/kvpace merge --out all.json a.json b.json
+
 # KV-cache scenario against a memcached server
 build/x86_64/kvpace --driver memcached --port 11211 --scenario kvcache --threads 8 --block-size 16384
 
@@ -175,29 +210,37 @@ build/x86_64/kvpace --driver memcached --port 11211 --scenario kvcache --threads
 build/x86_64/kvpace --driver native --driver-opt transport=rdma --host 192.0.2.10 --port 7600
 ```
 
-The text output prints throughput, latency percentiles and, with `--server-pid`, the server's CPU time per
-operation and resident memory.
+The text output prints throughput, latency percentiles per operation type and, with `--server-pid`, the server's
+CPU time per operation and resident memory. `kvpace --help` lists every option.
 
 ## Options
+
+The main options; `kvpace --help` prints the complete list.
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--driver NAME` | `resp` | `resp`, `memcached`, `native` |
 | `--driver-opt K=V` | | driver option, repeatable; `native`: `transport=tcp\|rdma\|auto`, `wait=poll\|event`, `max-msg=N`, `depth=N` |
 | `--host`, `--port` | `127.0.0.1`, `6379` | server address |
-| `--threads N` | 1 | client threads, one connection each |
+| `--threads N` | 1 | client threads |
+| `--conns-per-thread N`, `--pipeline N` | 1, 1 | connections per thread; requests in flight per connection |
+| `--auth SECRET`, `--db N` | | password or `user:password`; RESP database |
+| `--tls`, `--cacert`, `--cert`, `--key`, `--sni`, `--tls-skip-verify` | off | TLS for `resp` and `memcached` (`TLS=1` builds) |
 | `--duration SEC`, `--warmup SEC` | 10, 2 | measurement and warm-up length |
-| `--keys N` | 100000 | key space size (preloaded unless `--no-preload`) |
-| `--dist NAME`, `--theta X` | `uniform`, 0.99 | key distribution; Zipf skew in [0, 1) |
-| `--value-size N` | 64 | value size in bytes |
-| `--read-ratio X` | 0.9 | fraction of GET operations |
-| `--rate N` | 0 | aggregate operations per second; 0 selects the closed loop |
-| `--arrival NAME` | `constant` | open-loop inter-arrival times: `constant` or `poisson` |
-| `--spin` | off | open loop: busy-wait for the intended time instead of sleeping |
+| `--requests N` | | requests per connection instead of a duration (no warm-up) |
+| `--start-at UNIXTIME` | | start the warm-up at this time after the preload |
+| `--keys N`, `--key-prefix TEXT` | 100000, `k` | key space size (preloaded unless `--no-preload`); key prefix |
+| `--dist NAME`, `--theta X`, `--gauss-sd X` | `uniform`, 0.99, 1/6 | `uniform`, `zipf`, `sequential`, `gaussian`, `latest` |
+| `--value-size SPEC` | 64 | `N`, `A-B` or `S:W,S:W,...` |
+| `--read-ratio X`, `--ratio SET:GET`, `--mix SPEC` | 0.9 | operation mix, for example `--mix get=80,set=15,del=3,incr=2` |
+| `--multi-get N` | 1 | keys per MGET |
+| `--workload NAME` | | `ycsb-a`, `ycsb-b`, `ycsb-c`, `ycsb-d`, `ycsb-f` |
+| `--rate N`, `--arrival NAME`, `--spin` | 0, `constant` | open loop: aggregate operations per second, `constant` or `poisson`, busy-wait |
 | `--scenario NAME` | `kv` | `kv` or `kvcache` (parameters: `--block-size`, `--groups`, `--shared-blocks`, `--turn-blocks`, `--active-conv`, `--max-turns`, `--new-conv-prob`) |
 | `--server-pid PID` | | sample the server's CPU time and resident memory |
 | `--pin LIST` | | CPU list for client threads (thread i uses entry i mod length) |
 | `--label TEXT`, `--out FILE` | | name stored in the result; JSON output path |
+| `--csv FILE`, `--hdr-prefix PREFIX`, `--percentiles LIST` | 50,90,99,99.9,99.99 | CSV summary; HdrHistogram files; reported percentiles |
 | `--seed N`, `--no-preload` | 1 | random seed; skip the preload |
 
 The exit status is 0 on success, 1 on setup failure, 2 on invalid options and 3 when some operations failed (the
@@ -205,11 +248,13 @@ result is still written).
 
 ## Measurement model in one paragraph
 
-Each thread owns one connection and has one request in flight. In the open loop requests follow a schedule; a
-thread that is behind schedule sends immediately and the delay counts as latency, because latency is measured
-from the intended send time (the pure service time is reported separately). Warm-up operations are not
-recorded. Throughput is completed operations divided by the measurement time. Definitions of all metrics:
-[`../benchmarks/METHODOLOGY.md`](../benchmarks/METHODOLOGY.md).
+With one connection per thread and no pipelining, each thread has one request in flight and calls the driver
+synchronously. Otherwise each thread serves its connections from one epoll loop and keeps up to `--pipeline`
+requests in flight on each. In the open loop requests follow a schedule; a request that cannot be sent at its
+intended time, because the connection is busy or the generator is behind, is sent as soon as possible and the
+delay counts as latency, because latency is measured from the intended send time (the pure service time is
+reported separately). Warm-up operations are not recorded. Throughput is completed operations divided by the
+measurement time. Definitions of all metrics: [`../benchmarks/METHODOLOGY.md`](../benchmarks/METHODOLOGY.md).
 
 ## Helper scripts
 
@@ -222,17 +267,19 @@ The benchmark suite in [`../benchmarks`](../benchmarks) orchestrates these for t
 
 ## Limitations
 
-- One thread per connection with blocking I/O: not suitable for thousands of connections; with few client CPUs
-  the generator can be the bottleneck.
-- Keys are 16 bytes (17 in the KV-cache scenario); values have fixed size.
-- No TLS, no authentication, no cluster-aware clients, no pipelining.
+- No cluster-aware clients (Redis Cluster, consistent hashing over several servers) and no memcached binary
+  protocol.
+- The KV-cache scenario uses the synchronous model (one connection per thread).
+- The native driver has no TLS; its RDMA transport is not encrypted.
+- Keys are the prefix followed by 15 digits; the prefix is at most 32 bytes.
+- `kvpace merge` adds throughput and merges histograms; it does not check that the inputs ran at the same time.
 - Server CPU sampling has the 10 ms granularity of `/proc` and needs the server's host PID.
 
 ## Layout
 
 | Path | Content |
 |---|---|
-| `src/` | tool and library code (`runner`, `hist`, `zipf`, `kvcache`, drivers, `report`, `main`) |
+| `src/` | tool and library code (`runner`, `workload`, `hist`, `zipf`, `kvcache`, drivers, `sock`, `report`, `json`, `merge`, `main`) |
 | `tests/` | unit tests |
 | `scripts/` | helper scripts |
 | `docs/` | usage, architecture, scenario and validation documents |

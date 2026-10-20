@@ -101,8 +101,18 @@ unsigned akvc_window(const akvc *c);
 int akvc_post(akvc *c, uint8_t op, const void *key, size_t klen, const void *val, size_t vlen,
               const struct akvp_ext *ext, uint32_t *reqid);
 
-/* Waits for the oldest outstanding response. Returns 0, -EINVAL when none is outstanding, or a transport error. */
+/*
+ * Waits for the oldest outstanding response. Returns 0, -EINVAL when none is outstanding, -ETIMEDOUT
+ * (timeout_ms 0: not yet arrived), or a transport error.
+ */
 int akvc_next(akvc *c, struct akvc_resp *r, int timeout_ms);
+
+/* Number of requests posted whose responses have not been taken. */
+unsigned akvc_outstanding(const akvc *c);
+
+/* Descriptor for event loops (rdmaduct's duct_ep_fd) and its arming (duct_ep_arm: 0 wait, -EAGAIN progress now). */
+int akvc_fd(const akvc *c);
+int akvc_arm(akvc *c);
 
 /* ---- several servers ----------------------------------------------------------------------------------- */
 

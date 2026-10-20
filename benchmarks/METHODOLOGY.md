@@ -142,7 +142,7 @@ overlap, or when the statement is a direct restatement of a table cell.
 - **Power management.** The CPU governor was `powersave`, which adds wake-up latency and frequency variation.
   Tail latencies (p99 and above) at low load are affected most; the `performance` governor would reduce this.
   Throughput of saturated runs is less sensitive.
-- **Client limits.** The load generator uses one thread per connection with blocking I/O. In the four-CPU
+- **Client limits.** In run1 the load generator used one thread per connection with blocking I/O. In the four-CPU
   configurations the generator may be the bottleneck; those rows show the order of systems under this client, not
   the capacity of each server.
 - **Default configurations.** Each system runs with defaults plus the settings above. A system's maintainers might

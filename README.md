@@ -10,7 +10,7 @@ RDMA software in C, with the components measured against established systems:
 |---|---|---|---|
 | [`rdmaduct`](rdmaduct) | message transport over RDMA reliable connections or TCP, one API, identical behavior | experimental | [README](rdmaduct/README.md), [architecture](rdmaduct/docs/ARCHITECTURE.md) |
 | [`arenakv`](arenakv) | key-value cache for large values: log-structured engine, server, client library | experimental, not for production | [README](arenakv/README.md), [architecture](arenakv/docs/ARCHITECTURE.md), [protocol](arenakv/docs/PROTOCOL.md), [operations](arenakv/docs/OPERATIONS.md) |
-| [`kvpace`](kvpace) | load generator: closed and open loop; RESP, memcached and native protocols; KV-cache scenario | experimental | [README](kvpace/README.md), [usage](kvpace/docs/USAGE.md), [architecture](kvpace/docs/ARCHITECTURE.md) |
+| [`kvpace`](kvpace) | load generator: closed and open loop, pipelining, YCSB presets, TLS; RESP, memcached and native protocols; KV-cache scenario | experimental | [README](kvpace/README.md), [usage](kvpace/docs/USAGE.md), [architecture](kvpace/docs/ARCHITECTURE.md) |
 | [`benchmarks`](benchmarks) | orchestrator, raw data, figures, tables, methodology, machine-checked claims | | [README](benchmarks/README.md), [methodology](benchmarks/METHODOLOGY.md) |
 | [`lab`](lab) | six programs that teach RDMA programming, from opening a device to a key-value store over one-sided reads | | [README](lab/README.md) |
 
@@ -84,8 +84,12 @@ Statements about other systems reflect their public documentation at the time of
 |---|---|---|---|
 | Protocols | RESP, memcached text, arenakv native | RESP, memcached text and binary | many databases through bindings |
 | Same measurement code for all servers | yes | yes (two protocols) | per binding |
+| Several connections per thread, pipelining | yes | yes | no |
+| YCSB core workloads | A, B, C, D, F | no | A to F |
+| TLS, authentication | yes | yes | per binding |
 | Open-loop arrivals | constant or Poisson schedule | per-connection rate limit | target throughput |
 | Latency from the intended send time | yes, reported next to service time | no | yes (intended latency) |
+| Multi-host runs | synchronized start, result merging | no | separate client processes |
 | KV-cache prefix-chain scenario with reuse accounting | yes | no | no |
 | Server CPU time and memory per operation | yes (`--server-pid`) | no | no |
 | Hardware and software environment in every result file | yes | no | no |
@@ -177,7 +181,7 @@ kvpace/build/x86_64/kvpace --driver native --driver-opt transport=rdma --host 19
 |---|---|---|
 | rdmaduct | handshake codec with two million fuzzed inputs, TCP framing attacked through a raw socket, fault injection, RDMA flow control under a slow consumer, abrupt close, connect/disconnect cycles with a descriptor-leak check, examples | ASan + UBSan |
 | arenakv | engine model test against a reference map (eviction, overwrite, no stale reads, growing index), expiry, CAS, increments, memcached and RESP protocols with byte-by-byte feeds and one million fuzzed inputs, pipelining and backpressure on real sockets, snapshots, TLS, native protocol over TCP and RDMA, third-party clients (valkey-cli, valkey-benchmark, memtier_benchmark, redis-py) | ASan + UBSan, TSan |
-| kvpace | histogram error bounds, Zipf generator, RESP and memcached drivers against in-process servers, runner timing, KV-cache workload | ASan + UBSan |
+| kvpace | histogram error bounds, workload generators, Zipf generator, all drivers against in-process servers (synchronous and pipelined), TLS, runner timing with multiplexed connections, result merging, KV-cache workload | ASan + UBSan |
 
 All suites pass on x86-64 (gcc 13, Ubuntu 24.04) and aarch64 (gcc 14, Debian 13, Cortex-A72), including the RDMA
 suites on Soft-RoCE. Continuous integration ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds with gcc
