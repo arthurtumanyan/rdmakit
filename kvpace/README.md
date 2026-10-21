@@ -168,6 +168,7 @@ make SAN=1 test      # AddressSanitizer + UndefinedBehaviorSanitizer
 make TLS=1 test      # with TLS for the text drivers (OpenSSL), build/<arch>-tls/
 make NATIVE=0        # without the arenakv driver
 make RDMA=0          # native driver over TCP only (build/<arch>-tcp/)
+sudo make install    # /usr/local/bin/kvpace (PREFIX= and DESTDIR= are honored)
 ```
 
 Test results: all ten suites pass on x86-64, in the default, `TLS=1`, `RDMA=0` and `NATIVE=0` builds and under
@@ -291,6 +292,7 @@ The benchmark suite in [`../benchmarks`](../benchmarks) orchestrates these for t
 
 ## Further reading
 
-[Usage and result schema](docs/USAGE.md) · [Architecture](docs/ARCHITECTURE.md) ·
+[Usage, option reference and result schema](docs/USAGE.md) · [Running the benchmark suite](../benchmarks/RUNNING.md) ·
+[Architecture](docs/ARCHITECTURE.md) ·
 [KV-cache scenario](docs/kvcache-scenario.md) · [Validation against memtier](docs/validation.md) ·
 [Methodology](../benchmarks/METHODOLOGY.md)

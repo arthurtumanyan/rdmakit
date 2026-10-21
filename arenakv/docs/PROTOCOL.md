@@ -2,7 +2,8 @@
 
 The native protocol runs on top of [`rdmaduct`](../../rdmaduct) messages: one request message produces one response
 message. All integers are little-endian. [`include/akvproto.h`](../include/akvproto.h) is the authoritative definition.
-The text protocols (memcached, RESP) are described in [`OPERATIONS.md`](OPERATIONS.md#compatibility-notes).
+The commands of the text protocols (memcached, RESP) are described in [`USAGE.md`](USAGE.md), their compatibility
+notes in [`OPERATIONS.md`](OPERATIONS.md#compatibility-notes).
 
 ## Request
 

@@ -1,8 +1,10 @@
-# kvpace build. Targets: all, test, clean, format.
+# kvpace build. Targets: all, test, install, clean, format.
+#   make install [PREFIX=/usr/local] [DESTDIR=]   installs kvpace into $(DESTDIR)$(PREFIX)/bin
 #   make SAN=1      build with AddressSanitizer and UndefinedBehaviorSanitizer
 #   make TLS=1      TLS for the text drivers (needs OpenSSL headers, links -lssl -lcrypto)
 ARCH := $(shell uname -m)
 GIT := $(shell git describe --always --dirty 2>/dev/null || echo unknown)
+PREFIX ?= /usr/local
 
 CFLAGS ?= -O2 -g
 CFLAGS += -std=gnu2x -Wall -Wextra -Werror -D_GNU_SOURCE -DPACE_GIT=\"$(GIT)\" -Isrc
@@ -67,8 +69,12 @@ $(OUT)/test_%: tests/test_%.c $(LIB_OBJ) $(EXTRA_DEP) $(wildcard src/*.h)
 $(OUT):
 	mkdir -p $@
 
-test: $(TESTS)
+test: $(TESTS) $(OUT)/kvpace
 	@set -e; for t in $(TESTS); do echo "== $$t"; $$t; done
+	@echo "== tests/cli.sh"; tests/cli.sh $(OUT)
+
+install: $(OUT)/kvpace
+	install -D -m 755 $(OUT)/kvpace $(DESTDIR)$(PREFIX)/bin/kvpace
 
 format:
 	clang-format -i src/*.c src/*.h tests/*.c
@@ -76,6 +82,6 @@ format:
 clean:
 	rm -rf build
 
-.PHONY: all test format clean FORCE
+.PHONY: all test install format clean FORCE
 
 FORCE:

@@ -284,10 +284,19 @@ void pace_report_text(FILE *f, const pace_config *cfg, const pace_result *res, c
     uint64_t ops = pace_result_ops(res);
     char vs[256];
     vsize_text(&cfg->wl, vs, sizeof(vs));
-    fprintf(f, "driver=%s threads=%u conns/thread=%u pipeline=%u value=%sB keys=%llu dist=%s\n",
-            cfg->driver->name, cfg->threads, cfg->conns_per_thread ? cfg->conns_per_thread : 1,
-            cfg->pipeline ? cfg->pipeline : 1, vs, (unsigned long long)cfg->wl.nkeys,
-            dist_names[cfg->wl.dist]);
+    if (cfg->scenario == PACE_SCENARIO_KVCACHE) {
+        const pace_kvcache_cfg *k = &cfg->kvcache;
+        fprintf(f,
+                "driver=%s threads=%u scenario=kvcache block=%uB groups=%u shared-blocks=%u turn-blocks=%u "
+                "active-conv=%u max-turns=%u\n",
+                cfg->driver->name, cfg->threads, k->block_size, k->groups, k->shared_blocks, k->turn_blocks,
+                k->active_conv, k->max_turns);
+    } else {
+        fprintf(f, "driver=%s threads=%u conns/thread=%u pipeline=%u value=%sB keys=%llu dist=%s\n",
+                cfg->driver->name, cfg->threads, cfg->conns_per_thread ? cfg->conns_per_thread : 1,
+                cfg->pipeline ? cfg->pipeline : 1, vs, (unsigned long long)cfg->wl.nkeys,
+                dist_names[cfg->wl.dist]);
+    }
     if (cfg->rate > 0.0) {
         fprintf(f, "open loop: offered %.0f ops/s (%s arrivals), max lag %.1f us\n", cfg->rate,
                 cfg->arrival == PACE_ARRIVAL_POISSON ? "poisson" : "constant", (double)res->max_lag_ns / 1e3);
@@ -362,8 +371,7 @@ void pace_report_csv(FILE *f, const pace_config *cfg, const pace_result *res, co
         }
         const char *name = i < PACE_OP_COUNT ? pace_op_name((pace_op_type)i) : "service";
         fprintf(f, "%s,%s,%llu,%.1f,%.3f", cfg->driver->name, name, (unsigned long long)h->total,
-                res->seconds > 0 && i < PACE_OP_COUNT ? (double)h->total / res->seconds : 0.0,
-                pace_hist_mean(h) / 1e3);
+                res->seconds > 0 ? (double)h->total / res->seconds : 0.0, pace_hist_mean(h) / 1e3);
         for (unsigned k = 0; k < pc->n; k++) {
             fprintf(f, ",%.3f", (double)pace_hist_quantile(h, pc->q[k]) / 1e3);
         }

@@ -369,8 +369,34 @@ static void test_snapshot(void) {
         akvd_stop(d);
     }
 
-    /* corruption: flip a byte inside the first block */
+    /* Time while stopped counts towards expiry: a file created 700 s ago drops the 600 s entries. */
     FILE *f = fopen(path, "r+b");
+    uint64_t past = (uint64_t)time(NULL) - 700;
+    uint8_t le[8];
+    for (int i = 0; i < 8; i++) {
+        le[i] = (uint8_t)(past >> (8 * i));
+    }
+    fseek(f, 16, SEEK_SET);
+    fwrite(le, 1, sizeof(le), f);
+    fclose(f);
+    d = akvd_start(&cfg, &err);
+    EXPECT(d != NULL, "restart from an old snapshot: %d", err);
+    if (d != NULL) {
+        s = akvd_store(d);
+        int kept = 0;
+        int expired = 0;
+        for (int i = 0; i < 5000; i++) {
+            int n = snprintf(key, sizeof(key), "s%d", i);
+            int present = akv_exists(s, key, (size_t)n);
+            kept += i % 2 == 0 && present;
+            expired += i % 2 == 1 && !present;
+        }
+        EXPECT(kept == 2500 && expired == 2500, "downtime counted: %d kept, %d expired", kept, expired);
+        akvd_stop(d);
+    }
+
+    /* corruption: flip a byte inside the first block */
+    f = fopen(path, "r+b");
     fseek(f, 100, SEEK_SET);
     int c = fgetc(f);
     fseek(f, 100, SEEK_SET);

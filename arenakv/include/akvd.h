@@ -104,6 +104,9 @@ uint64_t akvd_lastsave(const akvd *d);
 /* 1 when the last snapshot attempt succeeded (or none was attempted), 0 after a failure. */
 int akvd_last_save_ok(const akvd *d);
 
+/* Server version, as reported by INFO, stats and version ("major.minor.patch"). */
+const char *akvd_version(void);
+
 /* Reopens the log file (for log rotation). */
 void akvd_reopen_log(akvd *d);
 

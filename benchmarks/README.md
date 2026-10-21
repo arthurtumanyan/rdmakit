@@ -556,4 +556,6 @@ tools/report.py data/<new-run> --update-docs               # regenerate figures,
 tools/verify.py data/<new-run>                             # verify
 ```
 
-Details and how to challenge a result: [`METHODOLOGY.md`](METHODOLOGY.md#challenging-a-result).
+Requirements, machine preparation, suites, output layout, publishing a run and troubleshooting:
+[`RUNNING.md`](RUNNING.md). Details and how to challenge a result:
+[`METHODOLOGY.md`](METHODOLOGY.md#challenging-a-result).

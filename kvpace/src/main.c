@@ -4,7 +4,9 @@
  * The option list is the usage text printed by `kvpace --help` (the string `usage` below). Exit status: 0
  * success, 1 setup failure, 2 invalid options, 3 some operations failed (the result is still written).
  */
+#include <errno.h>
 #include <getopt.h>
+#include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -210,6 +212,59 @@ static int bad(const char *what, const char *value) {
     return 2;
 }
 
+/* Returns the long name of the option with code `opt`, for error messages. */
+static const char *opt_name(int opt) {
+    for (const struct option *o = long_opts; o->name != NULL; o++) {
+        if (o->val == opt) {
+            return o->name;
+        }
+    }
+    return "?";
+}
+
+/* Prints an error about the value of option `opt` and returns 2 (the exit status for invalid options). */
+static int bad_num(int opt, const char *value, const char *expected) {
+    fprintf(stderr, "kvpace: invalid value '%s' for --%s (expected %s)\n", value, opt_name(opt), expected);
+    return 2;
+}
+
+/* Parses a decimal integer in [min, max]. Returns 0, or -1 when s is not such a number. */
+static int num_u64(const char *s, uint64_t min, uint64_t max, uint64_t *out) {
+    char *end = NULL;
+    if (*s < '0' || *s > '9') {
+        return -1;
+    }
+    errno = 0;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (errno != 0 || *end != '\0' || v < min || v > max) {
+        return -1;
+    }
+    *out = v;
+    return 0;
+}
+
+/* Parses a decimal integer in [min, max] that fits in unsigned. Returns 0 or -1. */
+static int num_uint(const char *s, unsigned min, unsigned max, unsigned *out) {
+    uint64_t v;
+    if (num_u64(s, min, max, &v) != 0) {
+        return -1;
+    }
+    *out = (unsigned)v;
+    return 0;
+}
+
+/* Parses a finite decimal number with lo <= x <= hi (lo < x when open_lo). Returns 0 or -1. */
+static int num_double(const char *s, double lo, double hi, int open_lo, double *out) {
+    char *end = NULL;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (end == s || *end != '\0' || errno != 0 || !isfinite(v) || v < lo || v > hi || (open_lo && v == lo)) {
+        return -1;
+    }
+    *out = v;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     /* TLS connections are written with write(2) by OpenSSL; a closed server must not kill the process. */
     signal(SIGPIPE, SIG_IGN);
@@ -231,6 +286,22 @@ int main(int argc, char **argv) {
     int *cpus = NULL;
     char err[160];
 
+    /*
+     * A YCSB preset sets the operation mix and the key distribution; it is applied before the other
+     * options, so that --dist, --theta, --mix, --read-ratio or --ratio given with it override its values.
+     */
+    for (int i = 1; i < argc; i++) {
+        const char *w = NULL;
+        if (strcmp(argv[i], "--workload") == 0 && i + 1 < argc) {
+            w = argv[i + 1];
+        } else if (strncmp(argv[i], "--workload=", 11) == 0) {
+            w = argv[i] + 11;
+        }
+        if (w != NULL && pace_wl_preset(&cfg.wl, w, err, sizeof(err)) != 0) {
+            fprintf(stderr, "%s\n", err);
+            return 2;
+        }
+    }
     int opt;
     while ((opt = getopt_long(argc, argv, "h", long_opts, NULL)) != -1) {
         switch (opt) {
@@ -260,19 +331,29 @@ int main(int argc, char **argv) {
             cfg.port = optarg;
             break;
         case OPT_THREADS:
-            cfg.threads = (unsigned)strtoul(optarg, NULL, 10);
+            if (num_uint(optarg, 1, 4096, &cfg.threads) != 0) {
+                return bad_num(opt, optarg, "a number of threads from 1 to 4096");
+            }
             break;
         case OPT_CONNS:
-            cfg.conns_per_thread = (unsigned)strtoul(optarg, NULL, 10);
+            if (num_uint(optarg, 1, 65536, &cfg.conns_per_thread) != 0) {
+                return bad_num(opt, optarg, "a number from 1 to 65536");
+            }
             break;
         case OPT_PIPELINE:
-            cfg.pipeline = (unsigned)strtoul(optarg, NULL, 10);
+            if (num_uint(optarg, 1, 4096, &cfg.pipeline) != 0) {
+                return bad_num(opt, optarg, "a number from 1 to 4096");
+            }
             break;
         case OPT_AUTH:
             pace_driver_set_auth(optarg);
             break;
         case OPT_DB:
-            pace_driver_set_db((unsigned)strtoul(optarg, NULL, 10));
+            unsigned db;
+            if (num_uint(optarg, 0, UINT32_MAX, &db) != 0) {
+                return bad_num(opt, optarg, "a database number");
+            }
+            pace_driver_set_db(db);
             break;
         case OPT_TLS:
             tls.enabled = 1;
@@ -293,19 +374,29 @@ int main(int argc, char **argv) {
             tls.skip_verify = 1;
             break;
         case OPT_DURATION:
-            cfg.duration_s = strtod(optarg, NULL);
+            if (num_double(optarg, 0.0, 1e7, 1, &cfg.duration_s) != 0) {
+                return bad_num(opt, optarg, "a positive number of seconds");
+            }
             break;
         case OPT_WARMUP:
-            cfg.warmup_s = strtod(optarg, NULL);
+            if (num_double(optarg, 0.0, 1e7, 0, &cfg.warmup_s) != 0) {
+                return bad_num(opt, optarg, "a number of seconds, 0 or more");
+            }
             break;
         case OPT_REQUESTS:
-            cfg.requests = strtoull(optarg, NULL, 10);
+            if (num_u64(optarg, 1, UINT64_MAX, &cfg.requests) != 0) {
+                return bad_num(opt, optarg, "a number of requests, 1 or more");
+            }
             break;
         case OPT_START_AT:
-            cfg.start_at = strtod(optarg, NULL);
+            if (num_double(optarg, 0.0, 1e12, 0, &cfg.start_at) != 0) {
+                return bad_num(opt, optarg, "a Unix time in seconds");
+            }
             break;
         case OPT_KEYS:
-            cfg.wl.nkeys = strtoull(optarg, NULL, 10);
+            if (num_u64(optarg, 1, UINT64_MAX / 2, &cfg.wl.nkeys) != 0) {
+                return bad_num(opt, optarg, "a number of keys, 1 or more");
+            }
             break;
         case OPT_KEY_PREFIX:
             if (strlen(optarg) > PACE_KEY_PREFIX_MAX || strpbrk(optarg, " \t\r\n") != NULL) {
@@ -329,10 +420,14 @@ int main(int argc, char **argv) {
             break;
         }
         case OPT_THETA:
-            cfg.wl.theta = strtod(optarg, NULL);
+            if (num_double(optarg, 0.0, 1.0, 0, &cfg.wl.theta) != 0 || cfg.wl.theta >= 1.0) {
+                return bad_num(opt, optarg, "a number with 0 <= theta < 1");
+            }
             break;
         case OPT_GAUSS_SD:
-            cfg.wl.gauss_sd = strtod(optarg, NULL);
+            if (num_double(optarg, 0.0, 1e6, 1, &cfg.wl.gauss_sd) != 0) {
+                return bad_num(opt, optarg, "a positive fraction of the key space");
+            }
             break;
         case OPT_VALUE_SIZE:
             if (pace_wl_parse_vsize(&cfg.wl, optarg) != 0) {
@@ -341,8 +436,8 @@ int main(int argc, char **argv) {
             value_size_given = 1;
             break;
         case OPT_READ_RATIO: {
-            double r = strtod(optarg, NULL);
-            if (r < 0.0 || r > 1.0) {
+            double r;
+            if (num_double(optarg, 0.0, 1.0, 0, &r) != 0) {
                 return bad("read ratio", optarg);
             }
             memset(cfg.wl.weight, 0, sizeof(cfg.wl.weight));
@@ -361,13 +456,17 @@ int main(int argc, char **argv) {
             }
             break;
         case OPT_MULTI_GET:
-            cfg.wl.mget_keys = (unsigned)strtoul(optarg, NULL, 10);
+            if (num_uint(optarg, 1, 4096, &cfg.wl.mget_keys) != 0) {
+                return bad_num(opt, optarg, "a number of keys from 1 to 4096");
+            }
             break;
         case OPT_WORKLOAD:
             workload = optarg;
             break;
         case OPT_SEED:
-            cfg.seed = strtoull(optarg, NULL, 10);
+            if (num_u64(optarg, 0, UINT64_MAX, &cfg.seed) != 0) {
+                return bad_num(opt, optarg, "an unsigned integer");
+            }
             break;
         case OPT_NO_PRELOAD:
             cfg.preload = 0;
@@ -391,28 +490,44 @@ int main(int argc, char **argv) {
             }
             break;
         case OPT_BLOCK_SIZE:
-            cfg.kvcache.block_size = (uint32_t)strtoul(optarg, NULL, 10);
+            if (num_uint(optarg, 1, 64u << 20, &cfg.kvcache.block_size) != 0) {
+                return bad_num(opt, optarg, "a number of bytes from 1 to 67108864");
+            }
             break;
         case OPT_GROUPS:
-            cfg.kvcache.groups = (uint32_t)strtoul(optarg, NULL, 10);
+            if (num_uint(optarg, 1, UINT32_MAX, &cfg.kvcache.groups) != 0) {
+                return bad_num(opt, optarg, "a number, 1 or more");
+            }
             break;
         case OPT_SHARED_BLOCKS:
-            cfg.kvcache.shared_blocks = (uint32_t)strtoul(optarg, NULL, 10);
+            if (num_uint(optarg, 0, 1u << 20, &cfg.kvcache.shared_blocks) != 0) {
+                return bad_num(opt, optarg, "a number of blocks from 0 to 1048576");
+            }
             break;
         case OPT_TURN_BLOCKS:
-            cfg.kvcache.turn_blocks = (uint32_t)strtoul(optarg, NULL, 10);
+            if (num_uint(optarg, 1, 1u << 20, &cfg.kvcache.turn_blocks) != 0) {
+                return bad_num(opt, optarg, "a number of blocks from 1 to 1048576");
+            }
             break;
         case OPT_ACTIVE_CONV:
-            cfg.kvcache.active_conv = (uint32_t)strtoul(optarg, NULL, 10);
+            if (num_uint(optarg, 1, 1u << 20, &cfg.kvcache.active_conv) != 0) {
+                return bad_num(opt, optarg, "a number from 1 to 1048576");
+            }
             break;
         case OPT_MAX_TURNS:
-            cfg.kvcache.max_turns = (uint32_t)strtoul(optarg, NULL, 10);
+            if (num_uint(optarg, 1, 1u << 20, &cfg.kvcache.max_turns) != 0) {
+                return bad_num(opt, optarg, "a number from 1 to 1048576");
+            }
             break;
         case OPT_NEW_CONV_PROB:
-            cfg.kvcache.new_conv_prob = strtod(optarg, NULL);
+            if (num_double(optarg, 0.0, 1.0, 0, &cfg.kvcache.new_conv_prob) != 0) {
+                return bad_num(opt, optarg, "a probability from 0 to 1");
+            }
             break;
         case OPT_RATE:
-            cfg.rate = strtod(optarg, NULL);
+            if (num_double(optarg, 0.0, 1e10, 0, &cfg.rate) != 0) {
+                return bad_num(opt, optarg, "operations per second, 0 or more (0: closed loop)");
+            }
             break;
         case OPT_ARRIVAL:
             if (strcmp(optarg, "constant") == 0) {
@@ -459,18 +574,13 @@ int main(int argc, char **argv) {
         }
     }
     if (workload != NULL) {
-        if (pace_wl_preset(&cfg.wl, workload, err, sizeof(err)) != 0) {
-            fprintf(stderr, "%s\n", err);
-            return 2;
-        }
         if (!value_size_given) {
             /* YCSB default record: 10 fields of 100 bytes (Cooper et al., SoCC 2010). */
             pace_wl_parse_vsize(&cfg.wl, "1000");
         }
     }
-    if (cfg.threads == 0 || cfg.wl.nkeys == 0 || (cfg.duration_s <= 0.0 && cfg.requests == 0) ||
-        cfg.rate < 0.0) {
-        fprintf(stderr, "invalid numeric option\n");
+    if (optind < argc) {
+        fprintf(stderr, "kvpace: unexpected argument '%s'; options start with --\n", argv[optind]);
         return 2;
     }
     if (cfg.pipeline > 1 && cfg.driver->set_option != NULL) {

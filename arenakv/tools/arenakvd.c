@@ -35,10 +35,14 @@
  *   --no-save-on-stop           do not write the snapshot at exit
  *   --log-level error|warn|info|debug, --log-file FILE (reopened on SIGHUP)
  *   --stats SECONDS             log a statistics line every SECONDS seconds
+ *   -h, --help, -V, --version   print the usage text or the version and exit
  * Signals: SIGINT and SIGTERM stop the server (after the final snapshot); SIGHUP reopens the log file.
+ * Exit status: 0 after a requested stop, 1 when the server cannot start, 2 for invalid options.
  */
 #include <errno.h>
 #include <getopt.h>
+#include <libgen.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +51,102 @@
 #include <unistd.h>
 
 #include "akvd.h"
+
+#ifndef AKV_GIT
+#define AKV_GIT "unknown"
+#endif
+
+/* Limits of the transport (rdmaduct/src/internal.h: DUCT_LIMIT_MAX_MSG, DUCT_LIMIT_DEPTH) and of the
+ * engine (akv_create: at most 1024 shards, at least 4 KiB of arena per shard). The smallest native
+ * message holds the 36-byte request header with extension and a short key. */
+#define MAX_MSG_MIN 64u
+#define MAX_MSG_MAX (1u << 30)
+#define DEPTH_MIN 2u
+#define DEPTH_MAX 65535u
+#define SHARDS_MAX 1024u
+#define SHARD_ARENA_MIN 4096u
+
+static const char usage[] =
+    "Usage: arenakvd [options]\n"
+    "\n"
+    "Native protocol (rdmaduct):\n"
+    "  --transport tcp|rdma|auto   transport (default: auto = RDMA when a device exists, else TCP)\n"
+    "  --wait poll|event           waiting strategy of RDMA connections (default: event)\n"
+    "  --addr ADDRESS              listen address (default: all IPv4 addresses)\n"
+    "  --port PORT|off             listen port (default: 7600)\n"
+    "  --max-msg BYTES             largest native message, bounds key + value + 36 (default: 65536)\n"
+    "  --depth N                   receive and send buffers per connection (default: 16)\n"
+    "Text protocols:\n"
+    "  --text-addr ADDRESS         listen address of the text listeners (default: all IPv4 addresses)\n"
+    "  --memcached-port PORT|off   memcached text and meta protocol (default: off)\n"
+    "  --resp-port PORT|off        RESP2 / Redis protocol (default: off)\n"
+    "  --tls-memcached-port PORT, --tls-resp-port PORT   TLS listeners (build with TLS=1)\n"
+    "  --tls-cert FILE, --tls-key FILE   server certificate chain and private key (PEM)\n"
+    "  --tls-ca FILE               require client certificates signed by this CA\n"
+    "Engine:\n"
+    "  --capacity SIZE             cache memory, with optional K, M or G suffix (default: 256M)\n"
+    "  --shards N                  shards, power of two up to 1024 (default: 64)\n"
+    "  --max-entry SIZE            largest key + value (default: 1M)\n"
+    "  --avg-entry BYTES           presize the index for this mean entry size (default: grow on demand)\n"
+    "  --no-evict                  refuse stores when full instead of evicting\n"
+    "  --huge-pages                advise transparent huge pages for the cache memory\n"
+    "Server:\n"
+    "  --threads N                 worker threads (default: CPUs the process may run on)\n"
+    "  --max-conns N               connection limit (default: unlimited)\n"
+    "  --idle-timeout SECONDS      close idle connections (default: never)\n"
+    "  --auth-file FILE            credentials, \"user:password\" or a password per line\n"
+    "  --snapshot FILE             snapshot file, loaded at start, written on SAVE/BGSAVE and at exit\n"
+    "  --save-interval SECONDS     periodic snapshot when data changed (default: off)\n"
+    "  --no-save-on-stop           do not write the snapshot at exit\n"
+    "  --log-level error|warn|info|debug   (default: info)\n"
+    "  --log-file FILE             log destination (default: standard error); reopened on SIGHUP\n"
+    "  --stats SECONDS             log a statistics line every SECONDS seconds\n"
+    "  --config FILE               read options from FILE (\"name = value\" per line); the command line\n"
+    "                              overrides it\n"
+    "  -h, --help                  this text\n"
+    "  -V, --version               version and build revision\n"
+    "\n"
+    "Signals: SIGTERM and SIGINT stop the server after the final snapshot; SIGHUP reopens the log file.\n"
+    "Exit status: 0 after a requested stop, 1 when the server cannot start, 2 for invalid options.\n";
+
+/* Prints an error about the value of option `name` and returns 2 (the exit status for invalid options). */
+static int bad_value(const char *name, const char *value, const char *expected) {
+    fprintf(stderr, "arenakvd: invalid value '%s' for --%s (expected %s)\n", value, name, expected);
+    return 2;
+}
+
+/* Parses a decimal integer in [min, max] into *out. Returns 0, or -1 when s is not such a number. */
+static int parse_uint(const char *s, unsigned long min, unsigned long max, unsigned long *out) {
+    char *end = NULL;
+    if (*s < '0' || *s > '9') {
+        return -1;
+    }
+    errno = 0;
+    unsigned long v = strtoul(s, &end, 10);
+    if (errno != 0 || *end != '\0' || v < min || v > max) {
+        return -1;
+    }
+    *out = v;
+    return 0;
+}
+
+/* Parses a port number (0 to 65535; 0 lets the kernel choose) or "off". Returns 0, or -1. */
+static int parse_port(const char *s, const char **out) {
+    unsigned long v;
+    if (strcmp(s, "off") == 0) {
+        *out = NULL;
+        return 0;
+    }
+    if (parse_uint(s, 0, 65535, &v) != 0) {
+        return -1;
+    }
+    *out = s;
+    return 0;
+}
+
+/* Arguments from the configuration file and the command line; referenced by the configuration for the
+ * life of the process. volatile keeps the store, so leak checkers see the array as reachable. */
+static char **volatile all_args;
 
 static volatile sig_atomic_t stop_requested;
 static volatile sig_atomic_t reopen_requested;
@@ -62,8 +162,14 @@ static void on_signal(int sig) {
 /* Parses a size with optional K/M/G suffix; returns 0 on error. */
 static uint64_t parse_size(const char *s) {
     char *end = NULL;
+    if ((*s < '0' || *s > '9') && *s != '.') {
+        return 0;
+    }
     double v = strtod(s, &end);
-    if (end == s || v <= 0) {
+    if (end == s || v <= 0 || v > 1e18) {
+        return 0;
+    }
+    if (*end != '\0' && end[1] != '\0') {
         return 0;
     }
     switch (*end) {
@@ -88,22 +194,40 @@ static uint64_t parse_size(const char *s) {
 }
 
 static const struct option lo[] = {
-    {"transport", required_argument, NULL, 't'},      {"wait", required_argument, NULL, 'w'},
-    {"addr", required_argument, NULL, 'a'},           {"port", required_argument, NULL, 'p'},
-    {"capacity", required_argument, NULL, 'c'},       {"shards", required_argument, NULL, 's'},
-    {"max-msg", required_argument, NULL, 'm'},        {"max-entry", required_argument, NULL, 'E'},
-    {"avg-entry", required_argument, NULL, 'e'},      {"depth", required_argument, NULL, 'd'},
-    {"huge-pages", no_argument, NULL, 'H'},           {"no-evict", no_argument, NULL, 'N'},
-    {"stats", required_argument, NULL, 'S'},          {"threads", required_argument, NULL, 'T'},
-    {"max-conns", required_argument, NULL, 'C'},      {"idle-timeout", required_argument, NULL, 'i'},
-    {"text-addr", required_argument, NULL, 'A'},      {"memcached-port", required_argument, NULL, 'M'},
-    {"resp-port", required_argument, NULL, 'R'},      {"tls-memcached-port", required_argument, NULL, 1001},
-    {"tls-resp-port", required_argument, NULL, 1002}, {"tls-cert", required_argument, NULL, 1003},
-    {"tls-key", required_argument, NULL, 1004},       {"tls-ca", required_argument, NULL, 1005},
-    {"auth-file", required_argument, NULL, 1006},     {"snapshot", required_argument, NULL, 1007},
-    {"save-interval", required_argument, NULL, 1008}, {"no-save-on-stop", no_argument, NULL, 1009},
-    {"log-level", required_argument, NULL, 1010},     {"log-file", required_argument, NULL, 1011},
-    {"config", required_argument, NULL, 1012},        {NULL, 0, NULL, 0},
+    {"transport", required_argument, NULL, 't'},
+    {"wait", required_argument, NULL, 'w'},
+    {"addr", required_argument, NULL, 'a'},
+    {"port", required_argument, NULL, 'p'},
+    {"capacity", required_argument, NULL, 'c'},
+    {"shards", required_argument, NULL, 's'},
+    {"max-msg", required_argument, NULL, 'm'},
+    {"max-entry", required_argument, NULL, 'E'},
+    {"avg-entry", required_argument, NULL, 'e'},
+    {"depth", required_argument, NULL, 'd'},
+    {"huge-pages", no_argument, NULL, 'H'},
+    {"no-evict", no_argument, NULL, 'N'},
+    {"stats", required_argument, NULL, 'S'},
+    {"threads", required_argument, NULL, 'T'},
+    {"max-conns", required_argument, NULL, 'C'},
+    {"idle-timeout", required_argument, NULL, 'i'},
+    {"text-addr", required_argument, NULL, 'A'},
+    {"memcached-port", required_argument, NULL, 'M'},
+    {"resp-port", required_argument, NULL, 'R'},
+    {"tls-memcached-port", required_argument, NULL, 1001},
+    {"tls-resp-port", required_argument, NULL, 1002},
+    {"tls-cert", required_argument, NULL, 1003},
+    {"tls-key", required_argument, NULL, 1004},
+    {"tls-ca", required_argument, NULL, 1005},
+    {"auth-file", required_argument, NULL, 1006},
+    {"snapshot", required_argument, NULL, 1007},
+    {"save-interval", required_argument, NULL, 1008},
+    {"no-save-on-stop", no_argument, NULL, 1009},
+    {"log-level", required_argument, NULL, 1010},
+    {"log-file", required_argument, NULL, 1011},
+    {"config", required_argument, NULL, 1012},
+    {"help", no_argument, NULL, 'h'},
+    {"version", no_argument, NULL, 'V'},
+    {NULL, 0, NULL, 0},
 };
 
 /* Returns the option table entry of a long option name, or NULL. */
@@ -170,7 +294,8 @@ static int read_config(const char *path, char ***args, int *nargs) {
         }
         v[vn] = '\0';
         const struct option *o = find_option(name);
-        if (o == NULL || strcmp(name, "config") == 0) {
+        if (o == NULL || strcmp(name, "config") == 0 || strcmp(name, "help") == 0 ||
+            strcmp(name, "version") == 0) {
             fprintf(stderr, "%s:%d: unknown option '%s'\n", path, lineno, name);
             fclose(f);
             return -1;
@@ -202,10 +327,6 @@ static int read_config(const char *path, char ***args, int *nargs) {
     return 0;
 }
 
-static const char *port_or_null(const char *v) {
-    return strcmp(v, "off") == 0 ? NULL : v;
-}
-
 int main(int argc, char **argv) {
     akvd_config cfg;
     akvd_config_default(&cfg);
@@ -229,45 +350,93 @@ int main(int argc, char **argv) {
     if (all == NULL) {
         return 1;
     }
+    all_args = all;
     for (int i = 1; i < argc; i++) {
         all[nargs++] = argv[i];
     }
     all[nargs] = NULL;
 
     int c;
-    while ((c = getopt_long(nargs, all, "", lo, NULL)) != -1) {
+    unsigned long v;
+    while ((c = getopt_long(nargs, all, "hV", lo, NULL)) != -1) {
+        const char *name = NULL;
+        for (const struct option *o = lo; o->name != NULL; o++) {
+            if (o->val == c) {
+                name = o->name;
+            }
+        }
         switch (c) {
+        case 'h':
+            fputs(usage, stdout);
+            return 0;
+        case 'V':
+            printf("arenakvd %s (%s)\n", akvd_version(), AKV_GIT);
+            return 0;
         case 't':
-            cfg.transport = strcmp(optarg, "tcp") == 0    ? DUCT_TRANSPORT_TCP
-                            : strcmp(optarg, "rdma") == 0 ? DUCT_TRANSPORT_RDMA
-                                                          : DUCT_TRANSPORT_AUTO;
+            if (strcmp(optarg, "tcp") == 0) {
+                cfg.transport = DUCT_TRANSPORT_TCP;
+            } else if (strcmp(optarg, "rdma") == 0) {
+                cfg.transport = DUCT_TRANSPORT_RDMA;
+            } else if (strcmp(optarg, "auto") == 0) {
+                cfg.transport = DUCT_TRANSPORT_AUTO;
+            } else {
+                return bad_value(name, optarg, "tcp, rdma or auto");
+            }
             break;
         case 'w':
-            cfg.wait = strcmp(optarg, "poll") == 0 ? DUCT_WAIT_POLL : DUCT_WAIT_EVENT;
+            if (strcmp(optarg, "poll") == 0) {
+                cfg.wait = DUCT_WAIT_POLL;
+            } else if (strcmp(optarg, "event") == 0) {
+                cfg.wait = DUCT_WAIT_EVENT;
+            } else {
+                return bad_value(name, optarg, "poll or event");
+            }
             break;
         case 'a':
             cfg.addr = optarg;
             break;
         case 'p':
-            cfg.port = port_or_null(optarg);
+            if (parse_port(optarg, &cfg.port) != 0) {
+                return bad_value(name, optarg, "a port from 0 to 65535 or off");
+            }
             break;
         case 'c':
             cfg.store.capacity = parse_size(optarg);
+            if (cfg.store.capacity == 0) {
+                return bad_value(name, optarg, "a size such as 512M or 8G");
+            }
             break;
         case 's':
-            cfg.store.shards = (uint32_t)strtoul(optarg, NULL, 10);
+            if (parse_uint(optarg, 1, SHARDS_MAX, &v) != 0 || (v & (v - 1)) != 0) {
+                return bad_value(name, optarg, "a power of two from 1 to 1024");
+            }
+            cfg.store.shards = (uint32_t)v;
             break;
         case 'e':
-            cfg.store.avg_entry = (uint32_t)strtoul(optarg, NULL, 10);
+            if (parse_uint(optarg, 0, UINT32_MAX, &v) != 0) {
+                return bad_value(name, optarg, "a number of bytes");
+            }
+            cfg.store.avg_entry = (uint32_t)v;
             break;
-        case 'E':
-            cfg.store.max_entry = (uint32_t)parse_size(optarg);
+        case 'E': {
+            uint64_t s = parse_size(optarg);
+            if (s == 0 || s > UINT32_MAX) {
+                return bad_value(name, optarg, "a size such as 1M, at most 4G");
+            }
+            cfg.store.max_entry = (uint32_t)s;
             break;
+        }
         case 'm':
-            cfg.max_msg = (uint32_t)strtoul(optarg, NULL, 10);
+            if (parse_uint(optarg, MAX_MSG_MIN, MAX_MSG_MAX, &v) != 0) {
+                return bad_value(name, optarg, "a number of bytes from 64 to 1073741824");
+            }
+            cfg.max_msg = (uint32_t)v;
             break;
         case 'd':
-            cfg.recv_depth = cfg.send_depth = (uint32_t)strtoul(optarg, NULL, 10);
+            if (parse_uint(optarg, DEPTH_MIN, DEPTH_MAX, &v) != 0) {
+                return bad_value(name, optarg, "a number from 2 to 65535");
+            }
+            cfg.recv_depth = cfg.send_depth = (uint32_t)v;
             break;
         case 'H':
             cfg.store.huge_pages = 1;
@@ -276,31 +445,51 @@ int main(int argc, char **argv) {
             cfg.store.no_evict = 1;
             break;
         case 'S':
-            stats_every = (unsigned)strtoul(optarg, NULL, 10);
+            if (parse_uint(optarg, 0, UINT_MAX, &v) != 0) {
+                return bad_value(name, optarg, "a number of seconds");
+            }
+            stats_every = (unsigned)v;
             break;
         case 'T':
-            cfg.threads = (unsigned)strtoul(optarg, NULL, 10);
+            if (parse_uint(optarg, 1, 4096, &v) != 0) {
+                return bad_value(name, optarg, "a number of threads from 1 to 4096");
+            }
+            cfg.threads = (unsigned)v;
             break;
         case 'C':
-            cfg.max_conns = (unsigned)strtoul(optarg, NULL, 10);
+            if (parse_uint(optarg, 0, UINT_MAX, &v) != 0) {
+                return bad_value(name, optarg, "a number of connections (0: unlimited)");
+            }
+            cfg.max_conns = (unsigned)v;
             break;
         case 'i':
-            cfg.idle_timeout_s = (unsigned)strtoul(optarg, NULL, 10);
+            if (parse_uint(optarg, 0, UINT_MAX, &v) != 0) {
+                return bad_value(name, optarg, "a number of seconds (0: never)");
+            }
+            cfg.idle_timeout_s = (unsigned)v;
             break;
         case 'A':
             cfg.text_addr = optarg;
             break;
         case 'M':
-            cfg.memcached_port = port_or_null(optarg);
+            if (parse_port(optarg, &cfg.memcached_port) != 0) {
+                return bad_value(name, optarg, "a port from 0 to 65535 or off");
+            }
             break;
         case 'R':
-            cfg.resp_port = port_or_null(optarg);
+            if (parse_port(optarg, &cfg.resp_port) != 0) {
+                return bad_value(name, optarg, "a port from 0 to 65535 or off");
+            }
             break;
         case 1001:
-            cfg.tls_memcached_port = port_or_null(optarg);
+            if (parse_port(optarg, &cfg.tls_memcached_port) != 0) {
+                return bad_value(name, optarg, "a port from 0 to 65535 or off");
+            }
             break;
         case 1002:
-            cfg.tls_resp_port = port_or_null(optarg);
+            if (parse_port(optarg, &cfg.tls_resp_port) != 0) {
+                return bad_value(name, optarg, "a port from 0 to 65535 or off");
+            }
             break;
         case 1003:
             cfg.tls_cert = optarg;
@@ -318,7 +507,10 @@ int main(int argc, char **argv) {
             cfg.snapshot_path = optarg;
             break;
         case 1008:
-            cfg.save_interval_s = (unsigned)strtoul(optarg, NULL, 10);
+            if (parse_uint(optarg, 0, UINT_MAX, &v) != 0) {
+                return bad_value(name, optarg, "a number of seconds (0: off)");
+            }
+            cfg.save_interval_s = (unsigned)v;
             break;
         case 1009:
             cfg.save_on_stop = 0;
@@ -333,8 +525,7 @@ int main(int argc, char **argv) {
             } else if (strcmp(optarg, "debug") == 0) {
                 cfg.log_level = AKVD_LOG_DEBUG;
             } else {
-                fprintf(stderr, "invalid log level '%s'\n", optarg);
-                return 2;
+                return bad_value(name, optarg, "error, warn, info or debug");
             }
             break;
         case 1011:
@@ -343,17 +534,40 @@ int main(int argc, char **argv) {
         case 1012:
             break; /* already read */
         default:
+            fprintf(stderr, "Try 'arenakvd --help' for the list of options.\n");
             return 2;
         }
     }
-    if (cfg.store.capacity == 0 || cfg.store.max_entry == 0) {
-        fprintf(stderr, "invalid capacity or maximum entry size\n");
+    if (optind < nargs) {
+        fprintf(stderr, "arenakvd: unexpected argument '%s'; options start with --\n", all[optind]);
+        return 2;
+    }
+    uint32_t shards = cfg.store.shards ? cfg.store.shards : 64;
+    if (cfg.store.capacity < (uint64_t)shards * SHARD_ARENA_MIN) {
+        fprintf(stderr, "arenakvd: --capacity must be at least %u KiB with %u shards (4 KiB per shard)\n",
+                shards * SHARD_ARENA_MIN / 1024, shards);
         return 2;
     }
     if (cfg.port == NULL && cfg.memcached_port == NULL && cfg.resp_port == NULL &&
         cfg.tls_memcached_port == NULL && cfg.tls_resp_port == NULL) {
-        fprintf(stderr, "no listener configured\n");
+        fprintf(stderr,
+                "arenakvd: no listener configured (--port, --memcached-port, --resp-port or a TLS port)\n");
         return 2;
+    }
+    if ((cfg.tls_memcached_port != NULL || cfg.tls_resp_port != NULL) &&
+        (cfg.tls_cert == NULL || cfg.tls_key == NULL)) {
+        fprintf(stderr, "arenakvd: TLS listeners need --tls-cert and --tls-key\n");
+        return 2;
+    }
+    if (cfg.snapshot_path != NULL) {
+        char *copy = keep(cfg.snapshot_path);
+        const char *dir = dirname(copy);
+        if (access(dir, W_OK | X_OK) != 0) {
+            fprintf(stderr, "arenakvd: snapshot directory %s is not writable: %s\n", dir, strerror(errno));
+            free(copy);
+            return 2;
+        }
+        free(copy);
     }
     struct sigaction sa = {.sa_handler = on_signal};
     sigaction(SIGINT, &sa, NULL);

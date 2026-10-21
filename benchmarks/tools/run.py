@@ -49,8 +49,12 @@ AKV_BENCH = ROOT / "arenakv" / "build" / ARCH / "akv_bench"
 DUCT_BENCH = ROOT / "rdmaduct" / "build" / ARCH / "duct_bench"
 ENV_SH = ROOT / "benchmarks" / "scripts" / "env-info.sh"
 
-CLIENT_CPUS = "8,10,12,14"
-SERVER_CPUS = {"1": "0", "4": "0,2,4,6"}
+# CPU sets of the measured machine (Intel Core i9-12900K: logical CPUs 2k and 2k+1 are one P-core): the server
+# and the load generator use distinct physical cores, one logical CPU per core. Other machines set
+# BENCH_SERVER_CPU, BENCH_SERVER_CPUS4 and BENCH_CLIENT_CPUS (comma-separated logical CPU lists); the sets in
+# effect are part of every recorded command line.
+CLIENT_CPUS = os.environ.get("BENCH_CLIENT_CPUS", "8,10,12,14")
+SERVER_CPUS = {"1": os.environ.get("BENCH_SERVER_CPU", "0"), "4": os.environ.get("BENCH_SERVER_CPUS4", "0,2,4,6")}
 PORT = 7100
 
 SYSTEMS = {

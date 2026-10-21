@@ -1,6 +1,6 @@
 # arenakv architecture
 
-This document is for people who change or review the code. Usage is in the [README](../README.md), operation in
+This document is for people who change or review the code. Usage is in [USAGE.md](USAGE.md), administration in
 [OPERATIONS.md](OPERATIONS.md), the native protocol in [PROTOCOL.md](PROTOCOL.md).
 
 ## Components

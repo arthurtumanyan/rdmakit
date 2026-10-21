@@ -1510,6 +1510,10 @@ static int tcp_listen(const char *addr, const char *port, int *bound) {
 
 /* ---- lifecycle ---------------------------------------------------------------------------------------- */
 
+const char *akvd_version(void) {
+    return AKVD_VERSION;
+}
+
 void akvd_config_default(akvd_config *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     akv_config_default(&cfg->store);
@@ -1681,8 +1685,13 @@ akvd *akvd_start(const akvd_config *cfg, int *err) {
         o.max_msg = d->cfg.max_msg;
         o.recv_depth = d->cfg.recv_depth;
         o.send_depth = d->cfg.send_depth;
-        if ((*err = duct_ctx_create(&o, &d->ctx)) != 0 ||
-            (*err = duct_listen(d->ctx, d->cfg.addr, d->cfg.port, &d->nl)) != 0) {
+        if ((*err = duct_ctx_create(&o, &d->ctx)) != 0) {
+            akvd_log(d, AKVD_LOG_ERROR, "native transport cannot be set up: %s", duct_strerror(*err));
+            goto fail;
+        }
+        if ((*err = duct_listen(d->ctx, d->cfg.addr, d->cfg.port, &d->nl)) != 0) {
+            akvd_log(d, AKVD_LOG_ERROR, "native listener on %s port %s: %s", d->cfg.addr ? d->cfg.addr : "*",
+                     d->cfg.port, duct_strerror(*err));
             goto fail;
         }
         d->ports[0] = duct_listener_port(d->nl);
@@ -1696,6 +1705,9 @@ akvd *akvd_start(const akvd_config *cfg, int *err) {
         }
         int fd = tcp_listen(d->cfg.text_addr, tports[i], &d->ports[1 + i]);
         if (fd < 0) {
+            static const char *const names[4] = {"memcached", "RESP", "TLS memcached", "TLS RESP"};
+            akvd_log(d, AKVD_LOG_ERROR, "%s listener on %s port %s: %s", names[i],
+                     d->cfg.text_addr ? d->cfg.text_addr : "*", tports[i], strerror(-fd));
             *err = fd;
             goto fail;
         }

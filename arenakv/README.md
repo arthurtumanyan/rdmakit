@@ -211,7 +211,8 @@ Linux, a C compiler with `-std=gnu2x` (gcc 13 or newer, clang 18 or newer), `mak
 ## Build and test
 
 ```
-make                  # build/<arch>/libarenakv.a, arenakvd, akv_bench
+make                  # build/<arch>/libarenakv.a, arenakvd, akv_cli, akv_bench
+sudo make install     # /usr/local/bin (PREFIX= and DESTDIR= are honored)
 make TLS=1            # with TLS listeners (needs libssl-dev; build/<arch>-tls/)
 make test             # engine, protocol, network and server tests
 make RDMA=0 test      # without RDMA libraries (build/<arch>-tcp/)
@@ -231,7 +232,7 @@ and clang on x86-64 and arm64.
 | `test_akv` | model check against a reference map (exact with ample memory, only the latest version under eviction) with a presized and a growing index; store modes, flags, CAS; expiry, touch, keep-ttl; increments; flush; enumeration; no-evict; eight-thread stress |
 | `test_primitives` | vector tag matching equals the scalar reference for all lane combinations; hash avalanche and bucket distribution |
 | `test_proto` | memcached and RESP commands with exact replies, also fed one byte at a time; framing errors; authentication; one million fuzzed inputs |
-| `test_net` | pipelining, large values and backpressure on real sockets, 16 concurrent clients, connection limit, idle timeout, snapshots (round trip, corruption, truncation), TLS, native revision 2, consistent hashing |
+| `test_net` | pipelining, large values and backpressure on real sockets, 16 concurrent clients, connection limit, idle timeout, snapshots (round trip, expiry across downtime, corruption, truncation), TLS, native revision 2, consistent hashing |
 | `test_server` | native protocol round trips, malformed requests, size limits, concurrent clients, shutdown with clients connected; over TCP, and over RDMA when `DUCT_TEST_ADDR` is set |
 
 ## Run the server
@@ -276,7 +277,9 @@ END
 | `--log-level`, `--log-file`, `--stats SEC` | info, stderr, off | logging (SIGHUP reopens the file) |
 | `--config FILE` | none | read options from a file; the command line overrides it |
 
-Operations guide (security, persistence, monitoring, deployment, compatibility notes):
+Every option with its accepted values, the configuration file, and every command of the three protocols, with
+example sessions, are in [`docs/USAGE.md`](docs/USAGE.md). Deployment (systemd, container, RDMA hosts), security
+(authentication, TLS), persistence (backup, restore), monitoring fields, logging and troubleshooting are in
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 ## Use the client library
@@ -340,12 +343,13 @@ transport.
 |---|---|
 | `include/` | public headers: `akv.h` (engine), `akvproto.h` (protocol), `akvd.h` (server), `akvclient.h` |
 | `src/` | `akv.c` engine, `simd.h`, `hash.h`, `server.c` core, `proto_mc.c`, `proto_resp.c`, `snapshot.c`, `client.c` |
-| `tools/` | `arenakvd` daemon, `akv_bench` micro-benchmarks |
+| `tools/` | `arenakvd` daemon, `akv_cli` native-protocol client, `akv_bench` micro-benchmarks |
 | `tests/` | engine, protocol, network and server tests; `compat.sh` with third-party clients |
 | `contrib/` | example configuration, systemd unit, Dockerfile |
 | `docs/` | architecture, native protocol and operations |
 
 ## Further reading
 
-[Architecture](docs/ARCHITECTURE.md) · [Protocol](docs/PROTOCOL.md) · [Operations](docs/OPERATIONS.md) ·
+[Running and querying](docs/USAGE.md) · [Administration](docs/OPERATIONS.md) · [Architecture](docs/ARCHITECTURE.md) ·
+[Protocol](docs/PROTOCOL.md) ·
 [Benchmarks](../benchmarks/README.md)

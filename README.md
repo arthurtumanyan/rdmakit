@@ -9,9 +9,9 @@ RDMA software in C, with the components measured against established systems:
 | Project | What it is | Status | Documentation |
 |---|---|---|---|
 | [`rdmaduct`](rdmaduct) | message transport over RDMA reliable connections or TCP, one API, identical behavior | experimental | [README](rdmaduct/README.md), [architecture](rdmaduct/docs/ARCHITECTURE.md) |
-| [`arenakv`](arenakv) | key-value cache for large values: log-structured engine, server, client library | experimental, not for production | [README](arenakv/README.md), [architecture](arenakv/docs/ARCHITECTURE.md), [protocol](arenakv/docs/PROTOCOL.md), [operations](arenakv/docs/OPERATIONS.md) |
+| [`arenakv`](arenakv) | key-value cache for large values: log-structured engine, server, client library | experimental, not for production | [README](arenakv/README.md), [running and querying](arenakv/docs/USAGE.md), [administration](arenakv/docs/OPERATIONS.md), [architecture](arenakv/docs/ARCHITECTURE.md), [protocol](arenakv/docs/PROTOCOL.md) |
 | [`kvpace`](kvpace) | load generator: closed and open loop, pipelining, YCSB presets, TLS; RESP, memcached and native protocols; KV-cache scenario | experimental | [README](kvpace/README.md), [usage](kvpace/docs/USAGE.md), [architecture](kvpace/docs/ARCHITECTURE.md) |
-| [`benchmarks`](benchmarks) | orchestrator, raw data, figures, tables, methodology, machine-checked claims | | [README](benchmarks/README.md), [methodology](benchmarks/METHODOLOGY.md) |
+| [`benchmarks`](benchmarks) | orchestrator, raw data, figures, tables, methodology, machine-checked claims | | [README](benchmarks/README.md), [running the suite](benchmarks/RUNNING.md), [methodology](benchmarks/METHODOLOGY.md) |
 | [`lab`](lab) | six programs that teach RDMA programming, from opening a device to a key-value store over one-sided reads | | [README](lab/README.md) |
 
 The three projects live in one repository because they depend on each other: `arenakv` uses `rdmaduct` as its

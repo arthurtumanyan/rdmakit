@@ -7,8 +7,13 @@
  * snapshot (rename(2) replaces the target atomically; POSIX.1-2017 rename()).
  *
  * Loading: blocks are verified before their records are stored; a bad magic, a CRC mismatch, a truncated
- * block or a missing end block yields -EBADMSG. Records whose time to live has run out are skipped; other
- * records keep their remaining time to live. CAS versions are not preserved (new versions are assigned).
+ * block or a missing end block yields -EBADMSG. A record holds the time to live that remained when it was
+ * copied; the wall-clock time between the creation time of the file and the load is subtracted from it,
+ * so time spent with the server stopped counts towards expiry, as with the absolute expiry times of
+ * memcached and Redis. Records whose time to live has run out are skipped. The creation time has a
+ * resolution of one second and is taken before the first shard is copied, so an entry may expire up to
+ * one second plus the duration of the save early, never late. CAS versions are not preserved (new
+ * versions are assigned).
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -215,6 +220,10 @@ int snap_load(akv *s, const char *path, uint64_t *records) {
         fclose(f);
         return -EBADMSG;
     }
+    /* Wall-clock milliseconds since the file was created; a clock set back counts as no time. */
+    int64_t created = (int64_t)get64(hdr + 16);
+    int64_t now = (int64_t)time(NULL);
+    int64_t elapsed_ms = now > created ? (now - created) * 1000 : 0;
     uint8_t *buf = NULL;
     size_t cap = 0;
     uint64_t loaded = 0;
@@ -261,7 +270,10 @@ int snap_load(akv *s, const char *path, uint64_t *records) {
                 break;
             }
             seen++;
-            if (ttl != 0) { /* 0: the time to live ran out while the snapshot was written */
+            if (ttl > 0) {
+                ttl = ttl > elapsed_ms ? ttl - elapsed_ms : 0;
+            }
+            if (ttl != 0) { /* 0: the time to live ran out before the load */
                 akv_store_opts o = {.flags = flags, .ttl_ms = ttl < 0 ? 0 : ttl};
                 if (akv_store(s, r + REC_HDR, klen, r + REC_HDR + klen, vlen, &o, NULL) == 0) {
                     loaded++;
