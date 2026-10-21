@@ -35,7 +35,7 @@ choice between hand-written verbs code and a framework far bigger than the probl
   consumer checks the device's receiver-not-ready counters.
 - **Failure paths tested, not assumed:** two million fuzzed handshakes, a raw socket that attacks the TCP
   framing, abrupt closes in both waiting modes, and descriptor-leak checks over connect/disconnect cycles.
-- **Small dependency set:** libc and pthreads for TCP; libibverbs and librdmacm for RDMA. About 3,500 lines with
+- **Small dependency set:** libc and pthreads for TCP; libibverbs and librdmacm for RDMA. About 3,800 lines with
   headers.
 
 It does not do GPU memory, multi-rail, tag matching or collectives. For those, use UCX, libfabric or MPI
@@ -53,7 +53,7 @@ It does not do GPU memory, multi-rail, tag matching or collectives. For those, u
 | Zero-copy send from registered memory | yes | yes | yes | no |
 | Pollable descriptor for event loops | yes (endpoint and listener) | yes (worker) | yes (wait sets) | `rpoll()`, not epoll |
 | GPU memory, multi-rail, tag matching | no | yes | yes | no |
-| Source size | about 3,500 lines | large framework | large framework | part of librdmacm |
+| Source size | about 3,800 lines | large framework | large framework | part of librdmacm |
 
 Statements about other systems reflect their public documentation at the time of writing.
 
@@ -69,44 +69,45 @@ hardware). Tables are generated from the raw data in [`../benchmarks/data`](../b
 </picture>
 
 <!-- BEGIN GENERATED:transport-rtt -->
-Data: `benchmarks/data/2026-10-21-run2` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `46efd6447c6d`, summary digest `95813d0d095ed976`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-21-run3` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `cb8f60b7eaa0`, summary digest `c9976f2a8da5b83b`. Mean over repetitions; `cv` is the coefficient of variation.
 
 Median round-trip time in microseconds (ping-pong, one message in flight). Loopback on one host.
 
 | Message bytes | TCP | Soft-RoCE, polling | Soft-RoCE, event-driven |
 |---|---|---|---|
-| 64 | 9.6 (cv 37.9%) | 6.8 (cv 2.7%) | 10.3 (cv 9.7%) |
-| 256 | 7.8 (cv 0.4%) | 6.7 (cv 3.4%) | 10.1 (cv 1.8%) |
-| 1024 | 8.1 (cv 2.0%) | 7.2 (cv 2.9%) | 10.7 (cv 3.6%) |
-| 4096 | 9.0 (cv 2.5%) | 11.2 (cv 1.8%) | 15.1 (cv 1.7%) |
-| 16384 | 16.2 (cv 45.4%) | 30.4 (cv 1.4%) | 35.3 (cv 2.0%) |
-| 65536 | 29.2 (cv 35.9%) | 106.5 (cv 0.9%) | 113.4 (cv 1.8%) |
-| 262144 | 50.6 (cv 2.3%) | 442.1 (cv 2.7%) | 459.6 (cv 1.9%) |
-| 1048576 | 185.7 (cv 1.7%) | 1,898.3 (cv 1.3%) | 1,938.9 (cv 1.1%) |
+| 64 | 7.3 (cv 1.6%) | 7.0 (cv 9.2%) | 10.2 (cv 7.5%) |
+| 256 | 7.1 (cv 3.3%) | 6.6 (cv 2.4%) | 10.0 (cv 2.8%) |
+| 1024 | 7.6 (cv 4.4%) | 6.7 (cv 1.9%) | 10.5 (cv 3.2%) |
+| 4096 | 8.4 (cv 2.5%) | 11.1 (cv 1.9%) | 15.3 (cv 3.2%) |
+| 16384 | 11.1 (cv 5.2%) | 30.2 (cv 3.0%) | 34.4 (cv 2.2%) |
+| 65536 | 22.1 (cv 2.6%) | 110.9 (cv 8.4%) | 112.5 (cv 0.8%) |
+| 262144 | 49.2 (cv 8.5%) | 440.4 (cv 1.6%) | 450.9 (cv 1.2%) |
+| 1048576 | 181.9 (cv 2.0%) | 1,864.1 (cv 1.0%) | 1,927.9 (cv 1.2%) |
 <!-- END GENERATED:transport-rtt -->
 
 <!-- BEGIN GENERATED:transport-stream -->
-Data: `benchmarks/data/2026-10-21-run2` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `46efd6447c6d`, summary digest `95813d0d095ed976`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-21-run3` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `cb8f60b7eaa0`, summary digest `c9976f2a8da5b83b`. Mean over repetitions; `cv` is the coefficient of variation.
 
 One-way streaming throughput in MB/s (batched sends, 64 buffers per direction). Loopback on one host.
 
 | Message bytes | TCP | Soft-RoCE, polling | Soft-RoCE, event-driven |
 |---|---|---|---|
-| 64 | 285 (cv 26.5%) | 46 (cv 6.8%) | 47 (cv 2.6%) |
-| 256 | 1,037 (cv 1.4%) | 188 (cv 2.7%) | 178 (cv 6.6%) |
-| 1024 | 3,287 (cv 12.7%) | 730 (cv 2.2%) | 715 (cv 2.2%) |
-| 4096 | 7,352 (cv 20.5%) | 915 (cv 0.5%) | 968 (cv 1.6%) |
-| 16384 | 10,546 (cv 9.1%) | 1,155 (cv 1.3%) | 1,137 (cv 0.9%) |
-| 65536 | 9,213 (cv 20.7%) | 1,279 (cv 3.0%) | 1,263 (cv 1.9%) |
-| 262144 | 5,757 (cv 10.3%) | 1,170 (cv 4.4%) | 1,158 (cv 1.9%) |
-| 1048576 | 6,329 (cv 43.2%) | 1,124 (cv 2.5%) | 1,087 (cv 2.4%) |
+| 64 | 301 (cv 17.0%) | 47 (cv 1.7%) | 47 (cv 5.0%) |
+| 256 | 1,203 (cv 17.1%) | 190 (cv 5.8%) | 172 (cv 8.8%) |
+| 1024 | 3,509 (cv 2.8%) | 763 (cv 3.8%) | 665 (cv 9.0%) |
+| 4096 | 8,181 (cv 1.6%) | 930 (cv 4.7%) | 952 (cv 2.5%) |
+| 16384 | 11,527 (cv 2.7%) | 1,154 (cv 2.6%) | 1,146 (cv 1.6%) |
+| 65536 | 9,865 (cv 11.8%) | 1,300 (cv 2.0%) | 1,270 (cv 1.3%) |
+| 262144 | 5,430 (cv 13.4%) | 1,196 (cv 4.7%) | 1,193 (cv 2.2%) |
+| 1048576 | 5,892 (cv 33.2%) | 1,139 (cv 2.5%) | 1,102 (cv 2.2%) |
 <!-- END GENERATED:transport-stream -->
 
 - For messages up to 1 KiB the median round trip of Soft-RoCE with polling is lower than that of TCP; from 16 KiB TCP
   is lower than both Soft-RoCE modes [C19].
 - TCP loopback streaming is at least four times faster than both Soft-RoCE modes at every measured size [C20]. TCP
-  sends a batch with one `sendmsg()` and reads through a 64 KiB buffer, so small streamed messages cost a fraction of
-  a system call each.
+  copies the frames of a batch up to 512 bytes into one staging buffer and writes it with one `send()` (larger
+  payloads go out in place with `sendmsg()`), and reads through a 64 KiB buffer, so small streamed messages cost a
+  fraction of a system call each.
 - These numbers describe the cost of a software RDMA implementation on one host. They say nothing about RDMA
   hardware, where the data path bypasses the kernel.
 
@@ -180,9 +181,10 @@ Full contracts are in [`include/rdmaduct.h`](include/rdmaduct.h).
 | `duct_opts_default`, `duct_ctx_create`, `duct_ctx_destroy`, `duct_ctx_transport` | configure and create a context |
 | `duct_listen`, `duct_listener_port`, `duct_accept`, `duct_listener_close` | server side |
 | `duct_connect`, `duct_ep_close`, `duct_ep_peer_max_msg` | client side and endpoint management |
-| `duct_send`, `duct_send_batch` | send one message or a batch (copying) |
+| `duct_send`, `duct_send_batch`, `duct_send_some` | send one message or a batch (copying); `duct_send_some` sends what fits without waiting and returns the count |
 | `duct_recv`, `duct_rx_release` | receive a message and return its buffer |
 | `duct_ep_fd`, `duct_ep_arm`, `duct_progress`, `duct_ep_send_space`, `duct_listener_fd` | event-loop integration |
+| `duct_ep_direct_fd`, `duct_ep_wait_events` | direct waiting on the transport descriptor (TCP: the socket), without a nested epoll set |
 | `duct_mr_reg`, `duct_mr_dereg`, `duct_mr_export`, `duct_mr_addr` | registered regions and their descriptors |
 | `duct_send_mr` | zero-copy send of part of a region |
 | `duct_read`, `duct_write`, `duct_atomic_fadd`, `duct_atomic_cswap` | one-sided operations on a peer's region |

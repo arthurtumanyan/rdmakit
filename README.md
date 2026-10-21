@@ -18,6 +18,36 @@ The three projects live in one repository because they depend on each other: `ar
 transport, `kvpace` drives `arenakv` through its native protocol, and the benchmark suite needs all three. Each
 project directory builds and tests on its own and has its own documentation.
 
+## Results at a glance
+
+One machine (Intel Core i9-12900K, Linux 7.0, `performance` governor), server and load generator on separate cores,
+loopback TCP, default server configurations, five repetitions per configuration. Every number in these figures is
+redrawn from the raw data in [`benchmarks/data`](benchmarks/data) by `make verify`, which fails if a figure, a table
+or a tagged statement such as [C1] disagrees with that data. Details and caveats: [Measured results](#measured-results).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="benchmarks/figures/throughput-dark.svg">
+  <img alt="Grouped bar charts of throughput for six systems in six panels" src="benchmarks/figures/throughput.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="benchmarks/figures/concurrency-dark.svg">
+  <img alt="Line charts of throughput by pipeline depth and by connection count, and p99 latency by connection count" src="benchmarks/figures/concurrency.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="benchmarks/figures/cpu-split-dark.svg">
+  <img alt="Stacked bar charts of server CPU time per operation for five servers at pipeline depths 1 and 32, split into kernel and user mode" src="benchmarks/figures/cpu-split.svg">
+</picture>
+
+- arenakv over TCP has the highest mean throughput in all six matrix rows [C1]. At 32 pipelined requests per
+  connection native arenakv has at least twice the throughput of Valkey, Dragonfly and memcached [C24].
+- With one request in flight, more than 80% of the server CPU time of native arenakv is spent in the kernel, in
+  system calls and the TCP stack, and more than 70% for every server measured [C28]. RDMA hardware is designed to
+  take this kernel part off the request path: the NIC places messages in user memory and a polling server receives
+  them without a system call. That effect is expected, not measured: no measurement on RDMA hardware exists yet, and
+  the RDMA rows here use Soft-RoCE, a software implementation inside the kernel [C6].
+
 ## Why this repository exists
 
 Two workloads that keep growing are poorly served by general-purpose caches. Model inference serving keeps
@@ -76,7 +106,7 @@ Statements about other systems reflect their public documentation at the time of
 | One-sided read/write, 64-bit atomics | yes (emulated on TCP) | yes | yes |
 | Zero-copy send, pollable descriptors for event loops | yes | yes | yes |
 | GPU memory, multi-rail, tag matching | no | yes | yes |
-| Source size | about 3,500 lines | large framework | large framework |
+| Source size | about 3,800 lines | large framework | large framework |
 
 ### kvpace and key-value load generators
 
@@ -103,24 +133,21 @@ RDMA hardware exists yet. The tables below are generated from the raw data, and 
 the figures and every tagged statement ([C1] ...) match it. The complete data, method and caveats are in
 [`benchmarks/README.md`](benchmarks/README.md) and [`benchmarks/METHODOLOGY.md`](benchmarks/METHODOLOGY.md).
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="benchmarks/figures/throughput-dark.svg">
-  <img alt="Grouped bar charts of throughput for six systems in six panels" src="benchmarks/figures/throughput.svg">
-</picture>
+The throughput figure above is drawn from this table:
 
 <!-- BEGIN GENERATED:matrix-throughput -->
-Data: `benchmarks/data/2026-10-21-run2` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `46efd6447c6d`, summary digest `95813d0d095ed976`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-21-run3` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `cb8f60b7eaa0`, summary digest `c9976f2a8da5b83b`. Mean over repetitions; `cv` is the coefficient of variation.
 
 Operations per second (KV-cache rows: requests per second).
 
 | Workload | Server CPUs | arenakv (TCP) | arenakv (Soft-RoCE) | arenakv (memcached protocol) | Valkey | Dragonfly | memcached |
 |---|---|---|---|---|---|---|---|
-| 64-byte values | 1 | 221,649 (cv 0.4%) | 203,726 (cv 0.8%) | 250,825 (cv 1.1%) | 207,438 (cv 0.5%) | 204,562 (cv 0.6%) | 226,135 (cv 0.7%) |
-| 64-byte values | 4 | 731,229 (cv 0.6%) | 233,217 (cv 2.3%) | 849,389 (cv 0.8%) | 534,587 (cv 1.0%) | 567,459 (cv 1.4%) | 775,447 (cv 1.7%) |
-| 16 KiB values | 1 | 143,866 (cv 1.1%) | 112,277 (cv 2.3%) | 154,248 (cv 2.0%) | 140,608 (cv 0.3%) | 134,652 (cv 0.8%) | 144,826 (cv 0.4%) |
-| 16 KiB values | 4 | 511,973 (cv 1.3%) | 144,497 (cv 1.8%) | 558,377 (cv 1.9%) | 371,017 (cv 2.0%) | 415,075 (cv 2.3%) | 531,024 (cv 1.0%) |
-| KV-cache requests | 1 | 1,839 (cv 0.6%) | 1,426 (cv 0.9%) | 1,932 (cv 1.0%) | 1,746 (cv 0.4%) | 1,773 (cv 0.5%) | 1,846 (cv 1.0%) |
-| KV-cache requests | 4 | 4,800 (cv 1.2%) | 1,873 (cv 1.1%) | 5,227 (cv 1.4%) | 4,213 (cv 0.8%) | 2,809 (cv 11.9%) | 4,552 (cv 1.7%) |
+| 64-byte values | 1 | 267,146 (cv 2.1%) | 226,389 (cv 0.9%) | 258,139 (cv 1.7%) | 210,691 (cv 1.5%) | 204,423 (cv 3.4%) | 232,434 (cv 0.9%) |
+| 64-byte values | 4 | 723,389 (cv 4.4%) | 244,918 (cv 4.5%) | 805,570 (cv 1.2%) | 477,558 (cv 4.0%) | 529,566 (cv 2.1%) | 725,576 (cv 4.6%) |
+| 16 KiB values | 1 | 157,518 (cv 3.9%) | 118,128 (cv 1.9%) | 159,958 (cv 0.8%) | 143,522 (cv 0.4%) | 136,874 (cv 0.6%) | 144,302 (cv 2.9%) |
+| 16 KiB values | 4 | 510,367 (cv 3.9%) | 133,901 (cv 3.7%) | 517,462 (cv 6.8%) | 342,350 (cv 4.3%) | 377,634 (cv 6.3%) | 493,253 (cv 3.5%) |
+| KV-cache requests | 1 | 2,034 (cv 2.3%) | 1,445 (cv 1.7%) | 1,993 (cv 0.7%) | 1,758 (cv 1.1%) | 1,772 (cv 5.1%) | 1,862 (cv 2.6%) |
+| KV-cache requests | 4 | 4,704 (cv 3.2%) | 1,762 (cv 6.0%) | 4,864 (cv 2.4%) | 3,885 (cv 1.6%) | 2,340 (cv 5.0%) | 4,427 (cv 4.3%) |
 <!-- END GENERATED:matrix-throughput -->
 
 <picture>
@@ -129,38 +156,41 @@ Operations per second (KV-cache rows: requests per second).
 </picture>
 
 <!-- BEGIN GENERATED:capacity-reuse -->
-Data: `benchmarks/data/2026-10-21-run2` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `46efd6447c6d`, summary digest `95813d0d095ed976`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-21-run3` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `cb8f60b7eaa0`, summary digest `c9976f2a8da5b83b`. Mean over repetitions; `cv` is the coefficient of variation.
 
 KV-cache scenario, reuse rate (fraction of needed blocks served from the cache) by configured capacity.
 
 | System | 16 MB | 64 MB | 256 MB | 1 GB | 4 GB |
 |---|---|---|---|---|---|
-| arenakv (TCP) | 0.186 (cv 1.2%) | 0.437 (cv 0.4%) | 0.652 (cv 0.4%) | 0.830 (cv 0.1%) | 0.903 (cv 0.0%) |
-| Valkey | 0.036 (cv 4.6%) | 0.116 (cv 2.1%) | 0.308 (cv 0.7%) | 0.791 (cv 0.3%) | 0.902 (cv 0.0%) |
-| Dragonfly | n/a | n/a | 0.411 (cv 1.3%) | 0.690 (cv 0.6%) | 0.902 (cv 0.0%) |
-| Dragonfly (eviction flag raised) | n/a | n/a | 0.435 (cv 0.8%) | 0.604 (cv 0.7%) | 0.902 (cv 0.0%) |
-| memcached | 0.354 (cv 0.8%) | 0.500 (cv 0.2%) | 0.665 (cv 0.2%) | 0.846 (cv 0.1%) | 0.903 (cv 0.0%) |
+| arenakv (TCP) | 0.182 (cv 1.3%) | 0.429 (cv 0.3%) | 0.642 (cv 0.2%) | 0.822 (cv 0.2%) | 0.904 (cv 0.0%) |
+| Valkey | 0.036 (cv 5.5%) | 0.115 (cv 3.0%) | 0.307 (cv 0.9%) | 0.789 (cv 0.2%) | 0.902 (cv 0.0%) |
+| Dragonfly | n/a | n/a | 0.408 (cv 0.9%) | 0.685 (cv 0.5%) | 0.902 (cv 0.0%) |
+| Dragonfly (eviction flag raised) | n/a | n/a | 0.436 (cv 0.5%) | 0.599 (cv 0.6%) | 0.902 (cv 0.0%) |
+| memcached | 0.354 (cv 0.3%) | 0.497 (cv 0.2%) | 0.663 (cv 0.2%) | 0.845 (cv 0.1%) | 0.903 (cv 0.0%) |
 <!-- END GENERATED:capacity-reuse -->
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="benchmarks/figures/concurrency-dark.svg">
-  <img alt="Line charts of throughput by pipeline depth and by connection count, and p99 latency by connection count" src="benchmarks/figures/concurrency.svg">
-</picture>
+The pipelining, connection and CPU-split figures above have their tables in
+[`benchmarks/README.md`](benchmarks/README.md#4-pipelining-and-connection-count).
 
 Findings:
 
-- arenakv serving the memcached text protocol has the highest throughput in every matrix row and the lowest server
-  CPU time per operation [C1] [C4]; at one server CPU it is faster than memcached itself in all three workloads
-  [C3]. Its native protocol over TCP is faster than Valkey and Dragonfly at four server CPUs [C2].
-- With pipelined requests arenakv over the memcached protocol leads at depth 32; the native protocol and Valkey scale
-  by a factor of 9 to 12 from depth 1 to 32, Dragonfly and memcached by about 6 [C24] [C25]. With 1024 connections
-  arenakv over the memcached protocol keeps its throughput and has the lowest p99 latency [C26] [C27].
-- In the KV-cache workload arenakv reuses more cached blocks than Valkey at small capacities [C11]; memcached is at
-  least as good [C12]. Dragonfly's default eviction settings rejected most requests at 256 MB and 1 GB [C14].
+- arenakv over TCP, with its native protocol or the memcached protocol, has the highest throughput in every matrix
+  row [C1] and the lowest server CPU time per operation in five of six rows [C4]. At one server CPU arenakv over the
+  memcached protocol is faster than memcached itself in all three workloads [C3]. The native protocol over TCP is
+  faster than Valkey and Dragonfly at four server CPUs [C2].
+- With pipelined requests native arenakv leads at depth 32, with at least twice the throughput of Valkey, Dragonfly
+  and memcached [C24]; from depth 1 to 32 it scales by a factor above 15, Dragonfly and memcached by less than 6.5
+  [C25]. From 16 to 1024 connections arenakv, memcached and Valkey lose less than 5% of their throughput [C26], and
+  arenakv over the memcached protocol has the lowest p99 latency at 1024 connections [C27].
+- With one request in flight the kernel accounts for more than 80% of the server CPU time of arenakv and for more
+  than 70% for every server [C28]; pipelining lowers that share for all of them [C30].
+- In the KV-cache workload arenakv reuses more cached blocks than Valkey at small capacities [C11]; memcached reuses
+  more up to 1 GB [C12]. Dragonfly's default eviction settings rejected most requests at 256 MB and 1 GB [C14].
 - With 64-byte values arenakv has the smallest resident memory of the four servers, because its hash index starts
   small and grows with the data [C16].
-- Under open-loop load arenakv sustains a higher rate than Valkey and Dragonfly and a lower one than memcached [C7].
-  Measuring latency from the intended send time exposes backlogs that service-time measurements hide [C9].
+- Under open-loop load arenakv sustains 260,000 operations per second, the highest offered rate, while Valkey,
+  Dragonfly and memcached stay below 240,000 [C7]. Measuring latency from the intended send time exposes the
+  backlogs of the saturated servers, which service-time measurements hide [C9].
 - Soft-RoCE results describe software behavior only [C6] [C19] [C20].
 
 ## Quick start
@@ -191,8 +221,7 @@ kvpace/build/x86_64/kvpace --driver native --driver-opt transport=rdma --host 19
 | arenakv | engine model test against a reference map (eviction, overwrite, no stale reads, growing index), expiry, CAS, increments, memcached and RESP protocols with byte-by-byte feeds and one million fuzzed inputs, pipelining and backpressure on real sockets, snapshots, TLS, native protocol over TCP and RDMA, third-party clients (valkey-cli, valkey-benchmark, memtier_benchmark, redis-py) | ASan + UBSan, TSan |
 | kvpace | histogram error bounds, workload generators, Zipf generator, all drivers against in-process servers (synchronous and pipelined), TLS, runner timing with multiplexed connections, result merging, KV-cache workload | ASan + UBSan |
 
-All suites pass on x86-64 (gcc 13, Ubuntu 24.04) and aarch64 (gcc 14, Debian 13, Cortex-A72), including the RDMA
-suites on Soft-RoCE. Continuous integration ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds with gcc
+All suites pass on x86-64 (gcc 13, Ubuntu 24.04), including the RDMA suites on Soft-RoCE. Continuous integration ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds with gcc
 and clang on x86-64 and arm64, runs the TCP suites and the sanitizers, compiles the RDMA build, and runs
 `make verify`.
 
@@ -208,8 +237,9 @@ and clang on x86-64 and arm64, runs the TCP suites and the sanitizers, compiles 
 
 ## Status and limitations
 
-- The software is experimental. `arenakv` and `rdmaduct` have no authentication or encryption and are meant for
-  trusted networks ([`SECURITY.md`](SECURITY.md)).
+- The software is experimental and meant for trusted networks. `rdmaduct` neither authenticates peers nor encrypts
+  traffic; `arenakvd` offers shared-secret authentication and TLS for its text protocols, but its native protocol is
+  never encrypted ([`SECURITY.md`](SECURITY.md)).
 - No measurement on RDMA hardware exists yet; see [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## License

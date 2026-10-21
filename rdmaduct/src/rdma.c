@@ -795,8 +795,38 @@ static unsigned rdma_send_space(duct_ep *base) {
     return c < r ? c : r;
 }
 
+/* Posts as many messages as credits and ring slots allow, in chunks of rdma_send_batch(). */
+static int rdma_send_some(duct_ep *base, const struct duct_msg *msgs, unsigned n) {
+    unsigned done = 0;
+    while (done < n) {
+        unsigned k = rdma_send_space(base);
+        if (k == 0) {
+            break;
+        }
+        if (k > n - done) {
+            k = n - done;
+        }
+        int rc = rdma_send_batch(base, msgs + done, k, 0); /* accepted in full: k <= send space */
+        if (rc != 0) {
+            return rc;
+        }
+        done += k;
+    }
+    return (int)done;
+}
+
 static int rdma_fd(const duct_ep *base) {
     return ((const struct rdma_ep *)base)->epfd;
+}
+
+/* The completion channel, CM channel and timer need the aggregating set: direct waiting uses it. */
+static int rdma_direct_fd(duct_ep *base) {
+    return rdma_fd(base);
+}
+
+static uint32_t rdma_wait_events(const duct_ep *base) {
+    (void)base;
+    return EPOLLIN;
 }
 
 /* Arms (ns > 0) or disarms (ns == 0) the endpoint's timer. */
@@ -916,6 +946,7 @@ static void rdma_close(duct_ep *base) {
 static const struct duct_ep_ops rdma_ep_ops = {
     .send = rdma_send,
     .send_batch = rdma_send_batch,
+    .send_some = rdma_send_some,
     .recv = rdma_recv,
     .release = rdma_release,
     .close = rdma_close,
@@ -923,6 +954,8 @@ static const struct duct_ep_ops rdma_ep_ops = {
     .arm = rdma_arm,
     .progress = rdma_progress,
     .send_space = rdma_send_space,
+    .direct_fd = rdma_direct_fd,
+    .wait_events = rdma_wait_events,
     .send_mr = rdma_send_mr,
     .rma = rdma_rma,
     .completed = rdma_completed,

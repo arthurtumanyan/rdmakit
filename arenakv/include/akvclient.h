@@ -119,6 +119,14 @@ unsigned akvc_outstanding(const akvc *c);
 int akvc_fd(const akvc *c);
 int akvc_arm(akvc *c);
 
+/*
+ * Direct waiting (rdmaduct duct_ep_direct_fd): the descriptor to wait on instead of akvc_fd(), on TCP the
+ * socket itself, and the epoll events to wait for after each akvc_arm() that returned 0 (EPOLLIN, with
+ * EPOLLOUT while requests are queued in the transport). akvc_fd() must not be waited on afterwards.
+ */
+int akvc_direct_fd(akvc *c);
+uint32_t akvc_wait_events(const akvc *c);
+
 /* ---- several servers ----------------------------------------------------------------------------------- */
 
 typedef struct akvc_pool akvc_pool;

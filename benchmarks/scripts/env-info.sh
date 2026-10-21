@@ -9,7 +9,8 @@ json_str() { python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().stri
 first() { "$@" 2>/dev/null | head -1 | json_str; }
 
 cpu_model=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | json_str)
-governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null | json_str)
+# All distinct governors of the online CPUs, comma-separated (one value when every CPU uses the same).
+governor=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort -u | paste -sd, | json_str)
 mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
 nic=${BENCH_NIC:-}
 nic_speed=null
@@ -20,6 +21,9 @@ fi
 git_commit=$(git -C "$root" rev-parse HEAD 2>/dev/null | json_str)
 git_dirty=$(git -C "$root" status --porcelain 2>/dev/null | wc -l)
 docker_ver=$(docker version --format '{{.Server.Version}}' 2>/dev/null | json_str)
+# Containers already running when the run starts compete with the measured processes for CPU and memory.
+containers=$(docker ps -q 2>/dev/null | wc -l)
+loadavg=$(cut -d' ' -f1 /proc/loadavg)
 
 image_id() {
     docker image inspect "$1" --format '{{index .RepoDigests 0}}' 2>/dev/null | json_str
@@ -42,6 +46,8 @@ cat <<JSON
   "nic_speed_mbit": $nic_speed,
   "rdma_devices": $(rdma link show 2>/dev/null | json_str),
   "docker": $docker_ver,
+  "running_containers": $containers,
+  "load_avg_1min": $loadavg,
   "images": {
     "valkey": $(image_id valkey/valkey:latest),
     "dragonfly": $(image_id docker.dragonflydb.io/dragonflydb/dragonfly:latest),

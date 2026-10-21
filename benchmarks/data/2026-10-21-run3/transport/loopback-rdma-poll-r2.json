@@ -1,0 +1,10 @@
+{"tool": "duct_bench", "transport": "rdma", "wait": "poll", "pingpong_max": 5000, "stream_max": 20000, "results": [
+  {"size": 64, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 6.66, "p50": 6.59, "p99": 8.59, "p999": 25.72, "min": 4.83, "max": 118.07}, "pingpong_mb_s": 19.05, "stream_msgs_per_s": 742260, "stream_mb_s": 47.50},
+  {"size": 256, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 6.41, "p50": 6.36, "p99": 8.29, "p999": 9.36, "min": 4.94, "max": 10.90}, "pingpong_mb_s": 79.24, "stream_msgs_per_s": 673863, "stream_mb_s": 172.51},
+  {"size": 1024, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 6.75, "p50": 6.69, "p99": 8.27, "p999": 9.59, "min": 5.32, "max": 21.18}, "pingpong_mb_s": 301.42, "stream_msgs_per_s": 753199, "stream_mb_s": 771.28},
+  {"size": 4096, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 10.82, "p50": 10.75, "p99": 13.15, "p999": 15.38, "min": 9.18, "max": 60.86}, "pingpong_mb_s": 753.41, "stream_msgs_per_s": 237360, "stream_mb_s": 972.23},
+  {"size": 16384, "pingpong_count": 4096, "stream_count": 16384, "rtt_us": {"mean": 29.01, "p50": 28.88, "p99": 32.78, "p999": 39.36, "min": 25.83, "max": 55.31}, "pingpong_mb_s": 1127.65, "stream_msgs_per_s": 70863, "stream_mb_s": 1161.02},
+  {"size": 65536, "pingpong_count": 1024, "stream_count": 4096, "rtt_us": {"mean": 104.56, "p50": 103.66, "p99": 124.58, "p999": 132.23, "min": 97.14, "max": 145.67}, "pingpong_mb_s": 1252.84, "stream_msgs_per_s": 20387, "stream_mb_s": 1336.11},
+  {"size": 262144, "pingpong_count": 256, "stream_count": 1024, "rtt_us": {"mean": 451.24, "p50": 430.26, "p99": 692.23, "p999": 694.48, "min": 402.07, "max": 694.48}, "pingpong_mb_s": 1161.62, "stream_msgs_per_s": 4769, "stream_mb_s": 1250.22},
+  {"size": 1048576, "pingpong_count": 200, "stream_count": 256, "rtt_us": {"mean": 1855.10, "p50": 1846.90, "p99": 2127.54, "p999": 2265.83, "min": 1730.04, "max": 2265.83}, "pingpong_mb_s": 1130.39, "stream_msgs_per_s": 1134, "stream_mb_s": 1188.70}
+]}

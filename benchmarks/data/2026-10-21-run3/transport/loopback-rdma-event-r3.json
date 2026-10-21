@@ -1,0 +1,10 @@
+{"tool": "duct_bench", "transport": "rdma", "wait": "event", "pingpong_max": 5000, "stream_max": 20000, "results": [
+  {"size": 64, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 10.68, "p50": 10.17, "p99": 13.84, "p999": 73.18, "min": 6.90, "max": 81.81}, "pingpong_mb_s": 11.90, "stream_msgs_per_s": 739087, "stream_mb_s": 47.30},
+  {"size": 256, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 10.50, "p50": 10.27, "p99": 13.23, "p999": 70.20, "min": 7.09, "max": 90.94}, "pingpong_mb_s": 48.48, "stream_msgs_per_s": 601230, "stream_mb_s": 153.91},
+  {"size": 1024, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 10.44, "p50": 10.59, "p99": 13.10, "p999": 71.35, "min": 5.71, "max": 100.48}, "pingpong_mb_s": 195.22, "stream_msgs_per_s": 698625, "stream_mb_s": 715.39},
+  {"size": 4096, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 14.80, "p50": 14.61, "p99": 16.98, "p999": 77.10, "min": 11.34, "max": 82.06}, "pingpong_mb_s": 551.54, "stream_msgs_per_s": 231744, "stream_mb_s": 949.22},
+  {"size": 16384, "pingpong_count": 4096, "stream_count": 16384, "rtt_us": {"mean": 34.89, "p50": 33.95, "p99": 46.25, "p999": 144.56, "min": 30.69, "max": 160.40}, "pingpong_mb_s": 937.42, "stream_msgs_per_s": 68751, "stream_mb_s": 1126.42},
+  {"size": 65536, "pingpong_count": 1024, "stream_count": 4096, "rtt_us": {"mean": 112.41, "p50": 111.73, "p99": 132.60, "p999": 170.22, "min": 91.97, "max": 185.77}, "pingpong_mb_s": 1165.41, "stream_msgs_per_s": 19083, "stream_mb_s": 1250.66},
+  {"size": 262144, "pingpong_count": 256, "stream_count": 1024, "rtt_us": {"mean": 455.01, "p50": 442.80, "p99": 633.89, "p999": 686.42, "min": 402.88, "max": 686.42}, "pingpong_mb_s": 1152.09, "stream_msgs_per_s": 4495, "stream_mb_s": 1178.23},
+  {"size": 1048576, "pingpong_count": 200, "stream_count": 256, "rtt_us": {"mean": 2013.96, "p50": 1914.29, "p99": 2998.26, "p999": 3039.80, "min": 1801.65, "max": 3039.80}, "pingpong_mb_s": 1041.25, "stream_msgs_per_s": 1042, "stream_mb_s": 1092.93}
+]}

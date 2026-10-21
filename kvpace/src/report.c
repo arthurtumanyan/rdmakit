@@ -261,8 +261,12 @@ void pace_report_json(FILE *f, const pace_config *cfg, const pace_result *res, c
         fputs("}", f);
     }
     if (res->has_server) {
-        fprintf(f, ",\n    \"server\": {\"cpu_seconds\": %.3f, \"cpu_us_per_op\": %.3f, \"rss_bytes\": %llu}",
-                res->server_cpu_seconds, ops > 0 ? res->server_cpu_seconds * 1e6 / (double)ops : 0.0,
+        fprintf(f,
+                ",\n    \"server\": {\"cpu_seconds\": %.3f, \"system_cpu_seconds\": %.3f, \"cpu_us_per_op\": "
+                "%.3f, "
+                "\"rss_bytes\": %llu}",
+                res->server_cpu_seconds, res->server_system_seconds,
+                ops > 0 ? res->server_cpu_seconds * 1e6 / (double)ops : 0.0,
                 (unsigned long long)res->server_rss_bytes);
     }
     fputs(",\n    \"histograms\": {\"service\": ", f);

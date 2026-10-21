@@ -714,8 +714,58 @@ static void do_auth(akvd *d, struct session *ss, const uint8_t *data, size_t dle
     }
 }
 
+/*
+ * Prefetches the index buckets (akv_prefetch), then the entries (akv_prefetch_entry), of the keys of up to
+ * MC_PREFETCH consecutive retrieval lines ("get", "gets", "mg" with one key) starting at in, so that the
+ * lookups of pipelined commands overlap their cache misses. Stops at the first other command, because a
+ * storage command is followed by a data block that is not a command line. Returns the offset after the
+ * last line examined.
+ */
+#define MC_PREFETCH 8
+static size_t mc_prefetch(akvd *d, const uint8_t *in, size_t len) {
+    const uint8_t *keys[MC_PREFETCH];
+    size_t klens[MC_PREFETCH];
+    int nk = 0;
+    size_t off = 0;
+    akv *s = akvd_store(d);
+    while (nk < MC_PREFETCH && off < len) {
+        size_t adv;
+        ssize_t ln = line_end(in + off, len - off, &adv);
+        if (ln < 0) {
+            break;
+        }
+        const uint8_t *p = in + off;
+        size_t skip = 0;
+        if (ln > 4 && memcmp(p, "get ", 4) == 0) {
+            skip = 4;
+        } else if (ln > 5 && memcmp(p, "gets ", 5) == 0) {
+            skip = 5;
+        } else if (ln > 3 && memcmp(p, "mg ", 3) == 0) {
+            skip = 3;
+        } else {
+            break;
+        }
+        const uint8_t *k = p + skip;
+        const uint8_t *end = p + ln;
+        const uint8_t *sp = memchr(k, ' ', (size_t)(end - k));
+        size_t klen = (size_t)((sp != NULL ? sp : end) - k);
+        if (klen > 0 && klen <= MC_MAX_KEY) {
+            akv_prefetch(s, k, klen);
+            keys[nk] = k;
+            klens[nk] = klen;
+            nk++;
+        }
+        off += adv;
+    }
+    for (int i = 0; nk > 1 && i < nk; i++) {
+        akv_prefetch_entry(s, keys[i], klens[i]);
+    }
+    return off;
+}
+
 size_t mc_execute(akvd *d, struct session *ss, const uint8_t *in, size_t len, struct obuf *out) {
     size_t used = 0;
+    size_t prefetched = 0; /* input before this offset had its keys prefetched */
     if (ss->swallow > 0) {
         size_t take = ss->swallow < len ? ss->swallow : len;
         ss->swallow -= take;
@@ -724,6 +774,9 @@ size_t mc_execute(akvd *d, struct session *ss, const uint8_t *in, size_t len, st
     while (used < len && ss->swallow == 0 && !ss->close && ob_pending(out) <= OB_SOFT_LIMIT) {
         const uint8_t *p = in + used;
         size_t left = len - used;
+        if (used >= prefetched) {
+            prefetched = used + mc_prefetch(d, p, left);
+        }
         size_t adv;
         ssize_t ln = line_end(p, left, &adv);
         if (ln < 0) {

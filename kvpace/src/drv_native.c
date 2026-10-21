@@ -207,7 +207,7 @@ static pace_aconn *anative_connect(const char *host, const char *port) {
 }
 
 static int anative_fd(pace_aconn *a) {
-    return akvc_fd(a->conn.c);
+    return akvc_direct_fd(a->conn.c);
 }
 
 static unsigned anative_window(pace_aconn *a) {
@@ -279,8 +279,7 @@ static int anative_next(pace_aconn *a, pace_reply *out) {
 }
 
 static unsigned anative_events(pace_aconn *a) {
-    (void)a;
-    return EPOLLIN;
+    return akvc_wait_events(a->conn.c);
 }
 
 static int anative_arm(pace_aconn *a) {

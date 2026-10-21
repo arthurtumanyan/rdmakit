@@ -78,6 +78,14 @@ int akvc_fd(const akvc *c) {
     return duct_ep_fd(c->ep);
 }
 
+int akvc_direct_fd(akvc *c) {
+    return duct_ep_direct_fd(c->ep);
+}
+
+uint32_t akvc_wait_events(const akvc *c) {
+    return duct_ep_wait_events(c->ep);
+}
+
 int akvc_push(akvc *c) {
     if (c->nstaged == 0) {
         return 0;

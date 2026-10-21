@@ -609,14 +609,15 @@ static void *async_main(void *arg) {
                 break;
             }
             all_done = all_done && s->completed >= cfg->requests;
+            /* Arming may change the events to wait for (rdmaduct direct waiting), so it comes first. */
+            if (s->count > 0 && ad->arm(s->c) != 0) {
+                ready_now = 1;
+            }
             unsigned evm = ad->events(s->c);
             if (evm != s->events) {
                 struct epoll_event ev = {.events = evm, .data.u32 = i};
                 epoll_ctl(epfd, EPOLL_CTL_MOD, ad->fd(s->c), &ev);
                 s->events = evm;
-            }
-            if (s->count > 0 && ad->arm(s->c) != 0) {
-                ready_now = 1;
             }
             /* A free pipeline slot that may be filled now: submit again instead of waiting. Replies that
              * arrive before this drain would otherwise leave the connection idle until the next event. */
@@ -832,6 +833,7 @@ int pace_run(pace_config *cfg, pace_result *res) {
     if (srv_ok) {
         res->has_server = 1;
         res->server_cpu_seconds = srv_after.cpu_seconds - srv_before.cpu_seconds;
+        res->server_system_seconds = srv_after.system_seconds - srv_before.system_seconds;
         res->server_rss_bytes = srv_after.rss_bytes;
     }
     free(ws);

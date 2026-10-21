@@ -127,11 +127,14 @@ struct duct_rma {
 struct duct_ep_ops {
     int (*send)(duct_ep *ep, const void *data, size_t len, int timeout_ms);
     int (*send_batch)(duct_ep *ep, const struct duct_msg *msgs, unsigned n, int timeout_ms);
+    int (*send_some)(duct_ep *ep, const struct duct_msg *msgs, unsigned n);
     int (*recv)(duct_ep *ep, struct duct_rx *rx, int timeout_ms);
     int (*release)(duct_ep *ep, struct duct_rx *rx);
     void (*close)(duct_ep *ep);
     int (*fd)(const duct_ep *ep);
     int (*arm)(duct_ep *ep);
+    int (*direct_fd)(duct_ep *ep);
+    uint32_t (*wait_events)(const duct_ep *ep);
     int (*progress)(duct_ep *ep);
     unsigned (*send_space)(duct_ep *ep);
     int (*send_mr)(duct_ep *ep, const duct_mr *mr, size_t off, size_t len, int timeout_ms, uint64_t *seq);
@@ -165,15 +168,21 @@ static inline int64_t duct_now_ms(void) {
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* Converts a relative timeout (-1 = infinite) to an absolute deadline (-1 = none). */
+/*
+ * Converts a relative timeout (-1 = infinite) to an absolute deadline (-1 = none). A timeout of 0 maps to
+ * deadline 0, which lies in the past of CLOCK_MONOTONIC, so non-blocking calls read no clock.
+ */
 static inline int64_t duct_deadline(int timeout_ms) {
+    if (timeout_ms == 0) {
+        return 0;
+    }
     return timeout_ms < 0 ? -1 : duct_now_ms() + timeout_ms;
 }
 
 /* Milliseconds left until deadline for poll(): -1 infinite, otherwise >= 0. */
 static inline int duct_remaining_ms(int64_t deadline) {
-    if (deadline < 0) {
-        return -1;
+    if (deadline <= 0) {
+        return deadline < 0 ? -1 : 0;
     }
     int64_t left = deadline - duct_now_ms();
     return left > 0 ? (int)left : 0;

@@ -87,9 +87,10 @@ typedef struct pace_result {
     uint64_t max_lag_ns;              /* largest delay of an actual send behind its intended time */
     uint64_t series[PACE_MAX_SERIES]; /* completed operations per second of the measurement phase */
     unsigned nseries;
-    int has_server;            /* server sampling succeeded */
-    double server_cpu_seconds; /* server CPU time consumed during the measurement phase */
-    uint64_t server_rss_bytes; /* server resident set size at the end */
+    int has_server;               /* server sampling succeeded */
+    double server_cpu_seconds;    /* server CPU time consumed during the measurement phase */
+    double server_system_seconds; /* its kernel-mode part (proc(5): stime) */
+    uint64_t server_rss_bytes;    /* server resident set size at the end */
 } pace_result;
 
 /* Total operations of a result (all types). */

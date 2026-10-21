@@ -150,9 +150,12 @@ overlap, or when the statement is a direct restatement of a table cell.
 
 - **Single machine, single run directory.** Results come from one machine (see `env.json`). Another CPU,
   kernel or NIC may rank the systems differently.
-- **Power management.** The CPU governor was `powersave`, which adds wake-up latency and frequency variation.
-  Tail latencies (p99 and above) at low load are affected most; the `performance` governor would reduce this.
-  Throughput of saturated runs is less sensitive.
+- **Power management.** run3 used the `performance` governor; run1 and run2 used `powersave`, which adds wake-up
+  latency and frequency variation. C-states and turbo frequencies were left at their defaults in all runs, so the
+  clock frequency still varies with the number of busy cores and with temperature. Tail latencies (p99 and above)
+  remain noisy at moderate load [C10].
+- **Other processes.** For run3 containers unrelated to the benchmark were stopped; desktop and system services kept
+  running. Later runs record the number of running containers and the load average at the start in `env.json`.
 - **Client limits.** The matrix uses one thread per connection with blocking I/O on four client CPUs. In the
   four-CPU configurations the generator may be the bottleneck; those rows show the order of systems under this
   client, not the capacity of each server. With pipelined requests the same four client CPUs drive more than

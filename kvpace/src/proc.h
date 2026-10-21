@@ -10,7 +10,10 @@
 #include <stdint.h>
 
 typedef struct pace_proc_sample {
-    double cpu_seconds; /* user + system CPU time consumed since process start */
+    double cpu_seconds;  /* user + system CPU time consumed since process start */
+    double user_seconds; /* user-mode part (utime) */
+    double
+        system_seconds; /* kernel-mode part (stime): system calls and the network stack run on its behalf */
     uint64_t rss_bytes; /* resident set size */
 } pace_proc_sample;
 

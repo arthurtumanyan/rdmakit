@@ -39,8 +39,9 @@ TESTS := $(patsubst tests/%.c,$(OUT)/%,$(wildcard tests/test_*.c))
 
 all: $(LIB) $(OUT)/arenakvd $(OUT)/akv_bench
 
-# The transport library is built by its own makefile.
-$(DUCT_LIB):
+# The transport library is built by its own makefile, which is always consulted (FORCE) so that changes
+# to the transport sources are linked in.
+$(DUCT_LIB): FORCE
 	$(MAKE) -C $(DUCT_DIR) $(DUCT_MAKE_ARGS) $(patsubst $(DUCT_DIR)/%,%,$(DUCT_LIB))
 
 $(OUT)/akv_bench: tools/akv_bench.c $(LIB) $(DUCT_LIB) $(wildcard src/*.h)
@@ -85,4 +86,6 @@ clean:
 compat: $(OUT)/arenakvd
 	tests/compat.sh $(OUT)
 
-.PHONY: all test compat format clean
+.PHONY: all test compat format clean FORCE
+
+FORCE:

@@ -13,6 +13,11 @@
  * delivered messages may be held by the application (as on RDMA, where the peer is limited by credits);
  * the other slots buffer frames that arrive while the application waits for a one-sided operation, so
  * that the response behind them can be read. When every slot is in use, reading stops until a release.
+ * duct_recv() delivers a data frame that lies complete in the input buffer in place, without copying it
+ * into a slot, when no earlier frame waits in a slot. While such a message is held, the buffer is not
+ * refilled: the endpoint switches to a second input buffer (allocated on first use), and in-place
+ * delivery from it waits until the messages of the first buffer are released, so that at most one buffer
+ * is referenced by held messages and a refill is always possible.
  *
  * Send path. Frames are written directly while the socket accepts data; the rest of a frame is copied
  * into a send queue that later calls flush. duct_send() waits while the queue holds more than
@@ -60,8 +65,16 @@
 #define CLOSE_FLUSH_MS 1000
 #define IBUF_SIZE 65536u
 #define IBUF_DIRECT 4096u
-/* iovec entries per sendmsg() of a batch: two per frame (header, payload); far below IOV_MAX (1024). */
+/* iovec entries per sendmsg() of a batch; at most IOV_MAX (1024, sysconf(_SC_IOV_MAX) on Linux). */
 #define IOV_BATCH 64u
+/*
+ * Batch staging: frames with a payload of at most COPY_MAX bytes are copied, header and payload, into a
+ * contiguous stack buffer of SBUF_SIZE bytes, so that a run of small frames is one iovec. Copying a small
+ * payload costs a few cycles per byte; every extra iovec costs a segment walk in the kernel's
+ * copy_from_iter, and every extra sendmsg() a full transmit path.
+ */
+#define COPY_MAX 512u
+#define SBUF_SIZE 16384u
 
 enum ctrl_type {
     CT_READ_REQ = 1,
@@ -101,16 +114,29 @@ struct tcp_ep {
     struct duct_ep base;
     int fd;
     int epfd;
-    uint32_t epmask; /* events currently registered for fd in epfd */
+    uint32_t epmask; /* events to wait for: registered for fd in epfd, or reported in direct mode */
+    int direct;      /* duct_ep_direct_fd() was called: fd is not in epfd, the caller waits on it */
     uint32_t max_msg;
     uint32_t recv_depth;
     uint32_t send_depth;
     int broken; /* sticky error (negative code) */
 
     /* input buffer: bytes read from the socket and not yet consumed by the state machine */
-    uint8_t *ib;
+    uint8_t *ib;        /* ibuf[ibcur] */
+    uint8_t *ibuf[2];   /* the second buffer is allocated when first needed */
+    uint32_t ibrefs[2]; /* held messages delivered in place from each buffer */
+    unsigned ibcur;
     size_t ib_pos;
     size_t ib_len;
+    int lazy; /* pump() called by duct_recv(): leave a complete data frame in the buffer for in-place delivery */
+    /*
+     * Socket emptiness hint, to save recv() calls that would return EAGAIN:
+     * HINT_UNKNOWN: read the socket; HINT_SEEN_EMPTY: the last recv() returned less than requested, so the next
+     * read reports "no data" without a system call; HINT_REPORTED_EMPTY: "no data" was reported since the last
+     * arm, so tcp_arm() does not read again. The descriptors are level-triggered, so bytes that arrive after
+     * the hint was taken raise an event.
+     */
+    enum { HINT_UNKNOWN, HINT_SEEN_EMPTY, HINT_REPORTED_EMPTY } hint;
 
     /* receive state machine */
     enum rx_state rxs;
@@ -247,34 +273,26 @@ static int write_full(int fd, const uint8_t *buf, size_t n, int64_t deadline) {
 }
 
 /*
- * Reads up to n bytes without blocking, from the input buffer first, otherwise from the socket. Returns the
- * byte count (> 0), 0 when no data is available, or a negative error (DUCT_ECLOSED for an orderly or
- * abortive close).
+ * Reads up to n bytes from the socket without blocking and maintains the emptiness hint. Returns the byte
+ * count (> 0), 0 when no data is available, or a negative error (DUCT_ECLOSED for an orderly or abortive
+ * close).
  */
-static ssize_t read_some(struct tcp_ep *e, uint8_t *buf, size_t n) {
-    if (e->ib_pos < e->ib_len) {
-        size_t take = e->ib_len - e->ib_pos < n ? e->ib_len - e->ib_pos : n;
-        memcpy(buf, e->ib + e->ib_pos, take);
-        e->ib_pos += take;
-        return (ssize_t)take;
+static ssize_t sock_read(struct tcp_ep *e, uint8_t *buf, size_t n) {
+    if (e->hint == HINT_SEEN_EMPTY) {
+        e->hint = HINT_REPORTED_EMPTY;
+        return 0;
     }
-    int direct = n >= IBUF_DIRECT;
     for (;;) {
-        ssize_t r = recv(e->fd, direct ? buf : e->ib, direct ? n : IBUF_SIZE, 0);
-        if (r > 0 && !direct) {
-            size_t take = (size_t)r < n ? (size_t)r : n;
-            memcpy(buf, e->ib, take);
-            e->ib_pos = take;
-            e->ib_len = (size_t)r;
-            return (ssize_t)take;
-        }
+        ssize_t r = recv(e->fd, buf, n, 0);
         if (r > 0) {
+            e->hint = (size_t)r < n ? HINT_SEEN_EMPTY : HINT_UNKNOWN;
             return r;
         }
         if (r == 0) {
             return DUCT_ECLOSED;
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            e->hint = HINT_REPORTED_EMPTY;
             return 0;
         }
         if (errno == ECONNRESET) {
@@ -284,6 +302,59 @@ static ssize_t read_some(struct tcp_ep *e, uint8_t *buf, size_t n) {
             return -errno;
         }
     }
+}
+
+/*
+ * Refills the consumed input buffer from the socket; switches to the other buffer while held messages
+ * refer to the current one. Returns as sock_read().
+ */
+static ssize_t ib_fill(struct tcp_ep *e) {
+    if (e->ibrefs[e->ibcur] > 0) {
+        unsigned o = e->ibcur ^ 1u; /* not referenced: in-place delivery requires the other buffer free */
+        if (e->ibuf[o] == NULL && (e->ibuf[o] = malloc(IBUF_SIZE)) == NULL) {
+            return -ENOMEM;
+        }
+        e->ibcur = o;
+        e->ib = e->ibuf[o];
+    }
+    e->ib_pos = 0;
+    e->ib_len = 0;
+    ssize_t r = sock_read(e, e->ib, IBUF_SIZE);
+    if (r > 0) {
+        e->ib_len = (size_t)r;
+    }
+    return r;
+}
+
+/* Returns 1 when a complete data frame starts at the read position and may be delivered in place. */
+static int ib_frame_ready(const struct tcp_ep *e) {
+    size_t avail = e->ib_len - e->ib_pos;
+    if (avail < FRAME_HEADER || e->ibrefs[e->ibcur ^ 1u] != 0) {
+        return 0;
+    }
+    uint32_t word = get_le32(e->ib + e->ib_pos);
+    return (word & CTRL_FLAG) == 0 && word <= e->max_msg && avail - FRAME_HEADER >= word;
+}
+
+/*
+ * Reads up to n bytes without blocking, from the input buffer first, otherwise from the socket. Returns the
+ * byte count (> 0), 0 when no data is available, or a negative error (DUCT_ECLOSED for an orderly or
+ * abortive close).
+ */
+static ssize_t read_some(struct tcp_ep *e, uint8_t *buf, size_t n) {
+    if (e->ib_pos == e->ib_len) {
+        if (n >= IBUF_DIRECT) {
+            return sock_read(e, buf, n);
+        }
+        ssize_t r = ib_fill(e);
+        if (r <= 0) {
+            return r;
+        }
+    }
+    size_t take = e->ib_len - e->ib_pos < n ? e->ib_len - e->ib_pos : n;
+    memcpy(buf, e->ib + e->ib_pos, take);
+    e->ib_pos += take;
+    return (ssize_t)take;
 }
 
 /* ---- send queue ------------------------------------------------------------------------------------ */
@@ -359,8 +430,11 @@ static int emitv(struct tcp_ep *e, struct iovec *iov, int cnt) {
     size_t written = 0;
     if (queued(e) == 0) {
         for (;;) {
+            /* One contiguous run (a staged batch) uses send(): sendmsg() also copies the msghdr and the
+             * iovec array from user space (net/socket.c: ___sys_sendmsg, about 300 cycles more here). */
             struct msghdr mh = {.msg_iov = iov, .msg_iovlen = (size_t)cnt};
-            ssize_t w = sendmsg(e->fd, &mh, MSG_NOSIGNAL);
+            ssize_t w = cnt == 1 ? send(e->fd, iov[0].iov_base, iov[0].iov_len, MSG_NOSIGNAL)
+                                 : sendmsg(e->fd, &mh, MSG_NOSIGNAL);
             if (w >= 0) {
                 written = (size_t)w;
                 break;
@@ -604,6 +678,18 @@ static int pump(struct tcp_ep *e) {
         int rc = 0;
         switch (e->rxs) {
         case RX_HDR:
+            if (e->lazy && e->hdr_off == 0 && e->rcount == 0 && e->held < e->recv_depth) {
+                if (e->ib_pos == e->ib_len) {
+                    r = ib_fill(e);
+                    if (r <= 0) {
+                        break;
+                    }
+                    any = 1;
+                }
+                if (ib_frame_ready(e)) {
+                    return 1; /* tcp_recv() delivers it in place */
+                }
+            }
             r = read_some(e, e->hdr + e->hdr_off, FRAME_HEADER - e->hdr_off);
             if (r <= 0) {
                 break;
@@ -759,6 +845,7 @@ static int wait_io(struct tcp_ep *e, int64_t deadline) {
         }
         return deadline >= 0 && duct_remaining_ms(deadline) == 0 ? -ETIMEDOUT : 0;
     }
+    e->hint = HINT_UNKNOWN;
     int rc = wait_fd(e->fd, ev, deadline);
     return rc == -ETIMEDOUT ? -ETIMEDOUT : rc;
 }
@@ -783,7 +870,8 @@ static void tcp_ep_free(struct tcp_ep *e) {
     free(e->ready);
     free(e->ops);
     free(e->q);
-    free(e->ib);
+    free(e->ibuf[0]);
+    free(e->ibuf[1]);
     free(e);
 }
 
@@ -823,44 +911,79 @@ static int tcp_send(duct_ep *base, const void *data, size_t len, int timeout_ms)
 }
 
 /*
- * Sends the messages in groups of up to IOV_BATCH / 2 frames, each group with one sendmsg(), so that a
- * batch of small messages costs one system call instead of one per message. Each group waits for send
- * space like duct_send(); on -ETIMEDOUT the earlier groups have been sent.
+ * Sends the messages in groups, each with one sendmsg(). Small payloads are staged with their headers (see
+ * COPY_MAX); a larger payload is referenced in place behind its staged header. A group ends when the
+ * staging buffer or the iovec array is full or the group reaches the queue limit. Each group waits for
+ * send space like duct_send(); on -ETIMEDOUT the earlier groups have been sent. *sent receives the number
+ * of messages written or queued.
  */
-static int tcp_send_batch(duct_ep *base, const struct duct_msg *msgs, unsigned n, int timeout_ms) {
-    struct tcp_ep *e = (struct tcp_ep *)base;
-    int64_t deadline = duct_deadline(timeout_ms);
-    uint8_t hdr[IOV_BATCH / 2][FRAME_HEADER];
+static int send_groups(struct tcp_ep *e, const struct duct_msg *msgs, unsigned n, int64_t deadline,
+                       unsigned *sent) {
+    uint8_t sb[SBUF_SIZE];
     struct iovec iov[IOV_BATCH];
     unsigned i = 0;
+    *sent = 0;
     while (i < n) {
         if (e->broken != 0) {
             return e->broken;
         }
         int cnt = 0;
-        size_t bytes = 0;
+        size_t used = 0;  /* staged bytes */
+        size_t bytes = 0; /* frame bytes of the group */
         unsigned first = i;
-        while (i < n && cnt < (int)IOV_BATCH) {
-            size_t frame = FRAME_HEADER + msgs[i].len;
-            /* a group never needs more than the queue limit, so that wait_send_space can succeed */
-            if (i > first && bytes + frame > e->qlimit) {
+        while (i < n) {
+            size_t len = msgs[i].len;
+            int copy = len <= COPY_MAX;
+            size_t stage = FRAME_HEADER + (copy ? len : 0);
+            /* worst case two new iovecs: the staged run and an in-place payload */
+            if (cnt + 2 > (int)IOV_BATCH || used + stage > SBUF_SIZE) {
                 break;
             }
-            put_le32(hdr[i - first], (uint32_t)msgs[i].len);
-            iov[cnt++] = (struct iovec){hdr[i - first], FRAME_HEADER};
-            iov[cnt++] = (struct iovec){(void *)msgs[i].data, msgs[i].len};
-            bytes += frame;
+            /* a group never needs more than the queue limit, so that wait_send_space can succeed */
+            if (i > first && bytes + FRAME_HEADER + len > e->qlimit) {
+                break;
+            }
+            uint8_t *dst = sb + used;
+            put_le32(dst, (uint32_t)len);
+            if (copy && len > 0) {
+                memcpy(dst + FRAME_HEADER, msgs[i].data, len);
+            }
+            if (cnt > 0 && (uint8_t *)iov[cnt - 1].iov_base + iov[cnt - 1].iov_len == dst) {
+                iov[cnt - 1].iov_len += stage; /* extends the staged run */
+            } else {
+                iov[cnt++] = (struct iovec){dst, stage};
+            }
+            if (!copy) {
+                iov[cnt++] = (struct iovec){(void *)msgs[i].data, len};
+            }
+            used += stage;
+            bytes += FRAME_HEADER + len;
             i++;
         }
         int rc = wait_send_space(e, bytes, deadline);
         if (rc == 0) {
-            rc = emitv(e, iov, cnt);
+            rc = emitv(e, iov, cnt); /* unsent bytes are copied to the queue: sb is free afterwards */
         }
         if (rc != 0) {
             return rc;
         }
+        *sent = i;
     }
     return 0;
+}
+
+static int tcp_send_batch(duct_ep *base, const struct duct_msg *msgs, unsigned n, int timeout_ms) {
+    unsigned sent;
+    return send_groups((struct tcp_ep *)base, msgs, n, duct_deadline(timeout_ms), &sent);
+}
+
+static int tcp_send_some(duct_ep *base, const struct duct_msg *msgs, unsigned n) {
+    unsigned sent;
+    int rc = send_groups((struct tcp_ep *)base, msgs, n, duct_deadline(0), &sent);
+    if (rc == -ETIMEDOUT) {
+        return (int)sent;
+    }
+    return rc != 0 ? rc : (int)n;
 }
 
 static int tcp_send_mr(duct_ep *base, const duct_mr *mr, size_t off, size_t len, int timeout_ms,
@@ -995,10 +1118,23 @@ static int tcp_recv(duct_ep *base, struct duct_rx *rx, int timeout_ms) {
             rx->token = s;
             return 0;
         }
+        if (e->rcount == 0 && e->held < e->recv_depth && e->rxs == RX_HDR && e->hdr_off == 0 &&
+            ib_frame_ready(e)) {
+            uint32_t len = get_le32(e->ib + e->ib_pos);
+            rx->data = e->ib + e->ib_pos + FRAME_HEADER;
+            rx->len = len;
+            rx->token = e->nslots + e->ibcur;
+            e->ib_pos += FRAME_HEADER + (size_t)len;
+            e->ibrefs[e->ibcur]++;
+            e->held++;
+            return 0;
+        }
         if (e->broken != 0) {
             return e->broken; /* messages received before the failure were delivered first */
         }
+        e->lazy = 1;
         int rc = work(e);
+        e->lazy = 0;
         if (rc < 0) {
             if (e->rcount > 0 && e->held < e->recv_depth) {
                 continue;
@@ -1021,6 +1157,18 @@ static int tcp_recv(duct_ep *base, struct duct_rx *rx, int timeout_ms) {
 
 static int tcp_release(duct_ep *base, struct duct_rx *rx) {
     struct tcp_ep *e = (struct tcp_ep *)base;
+    if (rx->data != NULL && rx->token >= e->nslots && rx->token < e->nslots + 2) {
+        unsigned b = rx->token - e->nslots; /* delivered in place from input buffer b */
+        const uint8_t *p = rx->data;
+        if (e->ibrefs[b] == 0 || e->ibuf[b] == NULL || p < e->ibuf[b] || p > e->ibuf[b] + IBUF_SIZE) {
+            return -EINVAL;
+        }
+        e->ibrefs[b]--;
+        e->held--;
+        rx->data = NULL;
+        rx->len = 0;
+        return 0;
+    }
     if (rx->data == NULL || rx->token >= e->nslots || e->slot_state[rx->token] != SLOT_HELD ||
         rx->data != e->slot_buf[rx->token]) {
         return -EINVAL;
@@ -1044,7 +1192,9 @@ static int tcp_fd(const duct_ep *base) {
 
 static int tcp_arm(duct_ep *base) {
     struct tcp_ep *e = (struct tcp_ep *)base;
-    int rc = work(e);
+    /* After "no data" was reported, a further read would return EAGAIN; only flush the send queue. */
+    int rc = e->hint == HINT_REPORTED_EMPTY ? q_flush(e) : work(e);
+    e->hint = HINT_UNKNOWN;
     if (rc < 0) {
         return -EAGAIN; /* the error is reported by the next call */
     }
@@ -1054,7 +1204,9 @@ static int tcp_arm(duct_ep *base) {
     /* While every receive slot is in use the socket is not watched: only a release can make progress. */
     int slot_blocked = e->rxs == RX_DATA && e->cur == UINT32_MAX;
     uint32_t mask = (slot_blocked ? 0 : EPOLLIN) | (queued(e) > 0 ? EPOLLOUT : 0);
-    if (mask != e->epmask) {
+    if (e->direct) {
+        e->epmask = mask; /* the caller registers it (duct_ep_wait_events) */
+    } else if (mask != e->epmask) {
         struct epoll_event ev = {.events = mask, .data.fd = e->fd};
         if (epoll_ctl(e->epfd, EPOLL_CTL_MOD, e->fd, &ev) != 0) {
             return -errno;
@@ -1062,6 +1214,19 @@ static int tcp_arm(duct_ep *base) {
         e->epmask = mask;
     }
     return 0;
+}
+
+static int tcp_direct_fd(duct_ep *base) {
+    struct tcp_ep *e = (struct tcp_ep *)base;
+    if (!e->direct) {
+        epoll_ctl(e->epfd, EPOLL_CTL_DEL, e->fd, NULL);
+        e->direct = 1;
+    }
+    return e->fd;
+}
+
+static uint32_t tcp_wait_events(const duct_ep *base) {
+    return ((const struct tcp_ep *)base)->epmask;
 }
 
 static unsigned tcp_send_space(duct_ep *base) {
@@ -1093,6 +1258,7 @@ static void tcp_close(duct_ep *base) {
 static const struct duct_ep_ops tcp_ep_ops = {
     .send = tcp_send,
     .send_batch = tcp_send_batch,
+    .send_some = tcp_send_some,
     .recv = tcp_recv,
     .release = tcp_release,
     .close = tcp_close,
@@ -1100,6 +1266,8 @@ static const struct duct_ep_ops tcp_ep_ops = {
     .arm = tcp_arm,
     .progress = tcp_progress,
     .send_space = tcp_send_space,
+    .direct_fd = tcp_direct_fd,
+    .wait_events = tcp_wait_events,
     .send_mr = tcp_send_mr,
     .rma = tcp_rma,
     .completed = tcp_completed,
@@ -1152,7 +1320,8 @@ static int tcp_ep_create(duct_ctx *ctx, int fd, int64_t deadline, duct_ep **out)
     e->slot_state = calloc(e->nslots, sizeof(*e->slot_state));
     e->ready = calloc(e->nslots, sizeof(*e->ready));
     e->ops = calloc(e->send_depth, sizeof(*e->ops));
-    e->ib = malloc(IBUF_SIZE);
+    e->ibuf[0] = malloc(IBUF_SIZE);
+    e->ib = e->ibuf[0];
     e->epfd = epoll_create1(EPOLL_CLOEXEC);
     if (e->slot_buf == NULL || e->slot_len == NULL || e->slot_state == NULL || e->ready == NULL ||
         e->ops == NULL || e->ib == NULL || e->epfd < 0) {

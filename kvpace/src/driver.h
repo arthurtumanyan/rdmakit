@@ -60,7 +60,7 @@ typedef struct pace_adriver {
     int (*io)(pace_aconn *c);
     /* Takes the reply of the oldest outstanding request: 1 = reply, 0 = incomplete, PACE_ERR = failure. */
     int (*next)(pace_aconn *c, pace_reply *out);
-    /* Epoll events to wait for (EPOLLIN, and EPOLLOUT while output is pending). */
+    /* Epoll events to wait for (EPOLLIN, and EPOLLOUT while output is pending); read after arm(). */
     unsigned (*events)(pace_aconn *c);
     /* Prepares waiting: 0 = wait on the descriptor, 1 = progress is possible without waiting. */
     int (*arm)(pace_aconn *c);

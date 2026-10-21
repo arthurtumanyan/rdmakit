@@ -32,7 +32,7 @@ other people can read, run and challenge.
 | MPI | message passing with collectives | the application is an MPI program |
 | ZeroMQ, gRPC | general messaging / RPC, mainly over TCP | no RDMA hardware path is needed |
 
-What `rdmaduct` provides that the list above does not claim to: one small C library (about 3,500 lines including
+What `rdmaduct` provides that the list above does not claim to: one small C library (about 3,800 lines including
 headers) whose behavior is the same on RDMA reliable connections and on TCP for two-sided messages, registered
 regions, zero-copy sends, one-sided reads, writes and 64-bit atomics (emulated by the peer's library on TCP) and
 pollable descriptors for event loops, including credit-based flow control, ordering of delivery before a close
@@ -94,11 +94,12 @@ snapshots. The measurements in `benchmarks/` compare it with Valkey, Dragonfly a
 same machine.
 
 What the measurements show so far (data and caveats in `benchmarks/README.md`): over TCP on the measured machine
-the store serving the memcached protocol has the highest throughput in every row of the matrix [C1] and is faster than
-memcached at one server CPU [C3]; over its native protocol it is faster than Valkey and Dragonfly at four server CPUs
-[C2]. The margins range from 5% (over memcached, KV-cache requests, one CPU) to 59% (over Valkey, 64-byte values,
-four CPUs), measured on one host over loopback. Its design targets a transport without kernel TCP overhead, and that path has been exercised
-only on Soft-RoCE, a software implementation [C6], so no claim about RDMA hardware is made.
+the store has the highest throughput in every row of the matrix, over its native protocol or the memcached protocol
+[C1]; over the memcached protocol it is faster than memcached at one server CPU [C3], and over its native protocol it
+is faster than Valkey and Dragonfly at four server CPUs [C2]. The margins per row are in the tables of
+`benchmarks/README.md`; all were measured on one host over loopback. With one request in flight more than 80% of its
+server CPU time is spent in the kernel [C28]. Its design targets a transport without kernel TCP overhead, and that
+path has been exercised only on Soft-RoCE, a software implementation [C6], so no claim about RDMA hardware is made.
 
 What it does not do: replication, server-side clustering, per-user permissions, data structures beyond byte-string
 keys and values, the memcached binary protocol, RESP3, integration with inference serving engines. It is not

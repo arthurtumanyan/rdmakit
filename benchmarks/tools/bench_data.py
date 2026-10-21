@@ -70,10 +70,20 @@ def _metrics_kv(result):
                                  if kc and "cpu_seconds" in server and r["gets"] + r["puts"]
                                  else server.get("cpu_us_per_op")),
         "server_rss_mib": server["rss_bytes"] / 1048576 if "rss_bytes" in server else None,
+        # Kernel-mode share of the server CPU time (system calls and the network stack run on the server's
+        # behalf); recorded by kvpace since run3.
+        "server_system_share": (server["system_cpu_seconds"] / server["cpu_seconds"]
+                                if server.get("system_cpu_seconds") is not None and server.get("cpu_seconds")
+                                else None),
         "service_p99_us": r["service_time_ns"]["p99"] / 1e3,
         "max_lag_ms": r["max_lag_ns"] / 1e6,
         "achieved_ops": r["ops_per_sec"],
     }
+    # Split of the server CPU time per operation into its kernel-mode and user-mode parts, per run.
+    share, per_op = m["server_system_share"], m["server_cpu_us_per_op"]
+    if share is not None and per_op is not None:
+        m["server_system_us_per_op"] = per_op * share
+        m["server_user_us_per_op"] = per_op * (1 - share)
     # Fraction of work units (requests for the KV-cache scenario, operations otherwise) that failed.
     units = kc["requests"] if kc else r["ops"]
     m["error_rate"] = r["errors"] / (units + r["errors"]) if (units + r["errors"]) else 0.0

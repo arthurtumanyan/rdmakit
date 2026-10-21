@@ -152,6 +152,15 @@ int duct_send_batch(duct_ep *ep, const struct duct_msg *msgs, unsigned n, int ti
     return n == 0 ? 0 : ep->ops->send_batch(ep, msgs, n, timeout_ms);
 }
 
+int duct_send_some(duct_ep *ep, const struct duct_msg *msgs, unsigned n) {
+    for (unsigned i = 0; i < n; i++) {
+        if (msgs[i].len > ep->peer_max_msg) {
+            return -EMSGSIZE;
+        }
+    }
+    return n == 0 ? 0 : ep->ops->send_some(ep, msgs, n);
+}
+
 int duct_recv(duct_ep *ep, struct duct_rx *rx, int timeout_ms) {
     return ep->ops->recv(ep, rx, timeout_ms);
 }
@@ -168,6 +177,14 @@ int duct_ep_fd(const duct_ep *ep) {
 
 int duct_ep_arm(duct_ep *ep) {
     return ep->ops->arm(ep);
+}
+
+int duct_ep_direct_fd(duct_ep *ep) {
+    return ep->ops->direct_fd(ep);
+}
+
+uint32_t duct_ep_wait_events(const duct_ep *ep) {
+    return ep->ops->wait_events(ep);
 }
 
 int duct_progress(duct_ep *ep) {

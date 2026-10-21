@@ -40,9 +40,13 @@ This document is for people who change or review the code. Usage is in the [READ
 - **Overwrite**: an entry of equal total size is overwritten in place (value, flags, CAS, expiry); otherwise the new
   version is appended and the old one becomes dead log space (recognized during eviction because the index no longer
   points to it).
-- **Expiry**: each entry stores an expiry time in milliseconds of the engine clock (CLOCK_MONOTONIC since creation,
-  plus 1; 0 = none). A lookup that meets an expired entry clears its slot; eviction reclaims expired entries without
-  counting them as evictions.
+- **Expiry**: each entry stores an expiry time in milliseconds of the engine clock (CLOCK_MONOTONIC_COARSE since
+  creation, plus 1; 0 = none). A lookup that meets an expired entry clears its slot; eviction reclaims expired entries
+  without counting them as evictions. The coarse clock is read from the vDSO without the timestamp counter; its
+  resolution is one scheduler tick (`clock_getres`, 1 to 10 ms), so an entry can outlive its time to live by up to one
+  tick. memcached checks expiry against a clock of one-second resolution.
+- **Prefetch**: `akv_prefetch()` loads the first index bucket of a key without the lock. The server calls it for a
+  group of up to 8 pipelined native requests before executing them, so that their index cache misses overlap.
 - **CAS**: per-shard counter shifted left by 10 bits, ORed with the shard number; versions are unique in the engine.
 - **Increments** (`akv_incr`): memcached semantics (unsigned, wrap on increment, floor at 0, absent key is an error)
   or RESP semantics (signed, absent key counts as 0, overflow error); the result is stored as decimal text with flags
@@ -97,11 +101,13 @@ Threads (`src/server.c`):
 - **accept**: `poll()` on all listeners (native rdmaduct listener through `duct_listener_fd`, memcached, RESP, TLS
   variants). New connections are counted, checked against `max_conns`, and queued round robin to a worker, whose
   eventfd wakes it.
-- **workers**: one epoll set each. Native connections are driven through `duct_ep_fd` / `duct_ep_arm`: the worker
-  drains requests with `duct_recv(..., 0)`, executes them into a per-worker batch area (1 MiB, or `max_msg` if
-  larger) and sends up to 32 responses with one `duct_send_batch()`, limited to `duct_ep_send_space()`. Responses
-  that do not fit are queued and the connection stops reading until the queue is empty, so a client that does not
-  read cannot make the server buffer without bound. Text connections use non-blocking sockets (or OpenSSL with
+- **workers**: one epoll set each. Native connections are driven through direct waiting (`duct_ep_direct_fd`, on
+  TCP the socket itself) and `duct_ep_arm`; the registered events follow `duct_ep_wait_events`. The worker drains
+  requests with `duct_recv(..., 0)` in groups of up to 8 (their index buckets are prefetched first), executes them
+  into a per-worker batch area (1 MiB, or `max_msg` if larger) and sends up to 64 responses with one
+  `duct_send_some()`, which on TCP accepts a batch of small responses in full (one `send()`). Responses that are not
+  accepted are queued and the connection stops reading until the queue is empty, so a client that does not read
+  cannot make the server buffer without bound. Text connections use non-blocking sockets (or OpenSSL with
   non-blocking BIOs); input accumulates until the protocol module consumes complete commands, replies accumulate in an
   output buffer, and reading stops while more than 4 MiB of replies are pending.
 - **fairness**: a connection is served for at most 64 requests or reads per turn. A connection with work left that
@@ -125,6 +131,8 @@ lengths.
   which keeps the client from blocking on credits while the server waits for the client to read responses.
 - Posted requests are packed into a staging area (2 x `max_msg`) and sent with one `duct_send_batch()` by
   `akvc_push`, `akvc_next` or `akvc_arm`, or when 32 requests or `max_msg` bytes are staged.
+- Event loops wait on `akvc_direct_fd()` for the events of `akvc_wait_events()` (rdmaduct direct waiting), or on
+  `akvc_fd()` for `EPOLLIN`.
 - `akvc_pool`: 160 points per server on a 64-bit ring (hash of `"host:port-i"` with a fixed seed), binary search for
   the first point at or after the key's hash. Removing a server moves only the keys it owned (tested).
 

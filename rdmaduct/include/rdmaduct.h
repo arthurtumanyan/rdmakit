@@ -159,6 +159,15 @@ int duct_send(duct_ep *ep, const void *data, size_t len, int timeout_ms);
 int duct_send_batch(duct_ep *ep, const struct duct_msg *msgs, unsigned n, int timeout_ms);
 
 /*
+ * Sends, in order, as many of the n messages as the endpoint accepts without waiting and returns that
+ * number (0 to n), -EMSGSIZE when any message exceeds the size limit (nothing is sent), or a transport
+ * error. The messages not accepted are untouched and may be passed again later. TCP endpoints accept by
+ * bytes (the send queue limit of send_depth full-size frames), so a batch of small messages is accepted
+ * in full; RDMA endpoints accept as many messages as credits and send-ring slots allow.
+ */
+int duct_send_some(duct_ep *ep, const struct duct_msg *msgs, unsigned n);
+
+/*
  * Receives one message. Returns 0 and fills rx, -ETIMEDOUT, or a transport error. An endpoint holds at
  * most recv_depth unreleased messages; while all are held, further messages wait in the transport.
  */
@@ -188,10 +197,27 @@ int duct_ep_fd(const duct_ep *ep);
 int duct_ep_arm(duct_ep *ep);
 
 /*
+ * Switches the endpoint to direct waiting and returns the descriptor to wait on. The event loop then
+ * waits on the transport's own descriptor (TCP: the socket) instead of the endpoint's epoll set returned
+ * by duct_ep_fd(), which saves one nested epoll wake-up per event (fs/eventpoll.c: ep_poll_callback runs
+ * once per level). After each duct_ep_arm() that returns 0, duct_ep_wait_events() gives the events to
+ * wait for (EPOLLIN, EPOLLOUT, or 0 while only a release of a held message can make progress); the
+ * caller updates its registration when they change. duct_ep_fd() must not be waited on afterwards. RDMA
+ * endpoints return the descriptor of duct_ep_fd() and always EPOLLIN.
+ */
+int duct_ep_direct_fd(duct_ep *ep);
+
+/* Returns the epoll events to wait for on the descriptor of duct_ep_direct_fd(); see there. */
+uint32_t duct_ep_wait_events(const duct_ep *ep);
+
+/*
  * Performs pending work without blocking: polls completions, returns flow-control credits, flushes queued
  * TCP data, and services one-sided operations that the peer emulates over TCP. Returns 0 or a transport
- * error. duct_recv() and duct_send() perform the same work; duct_progress() is needed only by an
- * endpoint that is the target of one-sided operations over TCP and otherwise idle.
+ * error. duct_recv() and duct_send() perform the same work. A TCP send that finds the socket full leaves
+ * the rest of its data in the send queue, which only later calls on the endpoint (or duct_ep_close())
+ * write out; an event loop waits for EPOLLOUT while duct_ep_arm() reports it, and an otherwise idle
+ * caller calls duct_progress() until the peer has the data. It is also needed by an endpoint that is the
+ * target of one-sided operations over TCP and otherwise idle.
  */
 int duct_progress(duct_ep *ep);
 

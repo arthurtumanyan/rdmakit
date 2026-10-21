@@ -29,6 +29,8 @@ int pace_proc_sample_pid(int pid, pace_proc_sample *out) {
     }
     long hz = sysconf(_SC_CLK_TCK);
     out->cpu_seconds = (double)(utime + stime) / (double)hz;
+    out->user_seconds = (double)utime / (double)hz;
+    out->system_seconds = (double)stime / (double)hz;
 
     snprintf(path, sizeof(path), "/proc/%d/statm", pid);
     f = fopen(path, "r");

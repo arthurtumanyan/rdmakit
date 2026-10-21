@@ -15,6 +15,7 @@
  */
 #include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -396,6 +397,62 @@ static void test_growth(void) {
     akv_destroy(s);
 }
 
+/* akv_prefetch() runs without the lock while another thread grows the index (checked under TSan). */
+struct prefetch_arg {
+    akv *s;
+    atomic_int stop;
+    unsigned long calls;
+};
+
+static void *prefetch_main(void *arg) {
+    struct prefetch_arg *a = arg;
+    char key[32];
+    size_t klen;
+    unsigned i = 0;
+    while (!atomic_load(&a->stop)) {
+        key_of(i++ % 300000, key, &klen);
+        akv_prefetch(a->s, key, klen);
+        a->calls++;
+    }
+    return NULL;
+}
+
+static void test_prefetch(void) {
+    akv_config cfg;
+    akv_config_default(&cfg);
+    cfg.capacity = 64 << 20;
+    cfg.shards = 4;
+    cfg.hash_seed = 5;
+    akv *s = akv_create(&cfg);
+    struct prefetch_arg a = {.s = s};
+    pthread_t th;
+    pthread_create(&th, NULL, prefetch_main, &a);
+    char key[32];
+    size_t klen;
+    unsigned char val[16] = {0};
+    unsigned char out[16];
+    size_t n;
+    enum { N = 100000 };
+    for (unsigned i = 0; i < N; i++) {
+        key_of(i, key, &klen);
+        EXPECT(akv_put(s, key, klen, val, sizeof(val)) == 0, "prefetch put %u", i);
+    }
+    atomic_store(&a.stop, 1);
+    pthread_join(th, NULL);
+    unsigned missing = 0;
+    for (unsigned i = 0; i < N; i++) {
+        key_of(i, key, &klen);
+        akv_prefetch(s, key, klen);
+        missing += akv_get(s, key, klen, out, sizeof(out), &n) != 0;
+    }
+    akv_stats st;
+    akv_stats_get(s, &st);
+    EXPECT(missing == 0, "%u entries missing after prefetching during growth", missing);
+    EXPECT(st.index_grows > 0, "the index never grew during the prefetch test");
+    printf("prefetch: %lu hints during %llu index doublings\n", a.calls, (unsigned long long)st.index_grows);
+    akv_destroy(s);
+}
+
 /* ---- store modes, flags and CAS ------------------------------------------------------------------- */
 
 static void test_modes(void) {
@@ -661,6 +718,7 @@ int main(void) {
     test_inplace();
     test_threads();
     test_growth();
+    test_prefetch();
     test_modes();
     test_ttl();
     test_incr();

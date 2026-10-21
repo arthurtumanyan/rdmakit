@@ -22,8 +22,11 @@
  *
  * Index slot: 16-bit tag (never 0 for an occupied slot) and 48-bit value (arena offset / 8 + 1).
  *
- * Engine clock: milliseconds of CLOCK_MONOTONIC since the engine was created, plus 1, so that 0 can mean
- * "no expiry". Expiry is therefore unaffected by changes of the wall clock.
+ * Engine clock: milliseconds of CLOCK_MONOTONIC_COARSE since the engine was created, plus 1, so that 0 can
+ * mean "no expiry". Expiry is therefore unaffected by changes of the wall clock. The coarse clock is read
+ * from the vDSO without the timestamp counter (clock_gettime(2)); its resolution is one scheduler tick
+ * (clock_getres: 1 to 10 ms), so an entry can outlive its time to live by up to one tick. memcached checks
+ * expiry against a clock with a resolution of one second (memcached.c, current_time).
  *
  * CAS versions: per shard counter shifted left by 10 bits, ORed with the shard index (at most 1024
  * shards), so versions are unique within the engine without a shared counter.
@@ -111,7 +114,7 @@ void akv_config_default(akv_config *cfg) {
 /* Current engine time in milliseconds (>= 1). */
 static uint64_t now_ms(const akv *s) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
     int64_t ms = (int64_t)(ts.tv_sec - s->epoch.tv_sec) * 1000 + (ts.tv_nsec - s->epoch.tv_nsec) / 1000000;
     return (uint64_t)(ms < 0 ? 0 : ms) + 1;
 }
@@ -276,9 +279,10 @@ static int index_grow(struct shard *sh) {
         }
     }
     munmap(sh->buckets, sh->nbuckets * sizeof(struct bucket));
-    sh->buckets = tab;
+    /* Atomic stores: akv_prefetch() reads both without the lock. */
+    __atomic_store_n(&sh->buckets, tab, __ATOMIC_RELAXED);
     sh->nbuckets = n;
-    sh->mask = mask;
+    __atomic_store_n(&sh->mask, mask, __ATOMIC_RELAXED);
     sh->st.index_grows++;
     return 0;
 }
@@ -467,7 +471,7 @@ akv *akv_create(const akv_config *in) {
     s->cfg = cfg;
     s->nshards = cfg.shards;
     s->seed = cfg.hash_seed;
-    clock_gettime(CLOCK_MONOTONIC, &s->epoch);
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &s->epoch);
     if (s->seed == 0) {
         uint64_t seed = 0x243f6a8885a308d3ull ^ (uint64_t)(uintptr_t)s ^ ((uint64_t)getpid() << 32);
         struct timespec ts;
@@ -542,6 +546,42 @@ void akv_destroy(akv *s) {
 
 static inline struct shard *shard_of(akv *s, uint64_t h) {
     return &s->shards[(h >> 32) & (s->nshards - 1)];
+}
+
+/*
+ * Prefetches the first index bucket of the key (both cache lines of the 128-byte bucket). Reads the table
+ * pointer and mask without the lock: during a concurrent index growth they may belong to different
+ * tables, and the address may then lie outside the current table. A prefetch of any address neither
+ * faults nor changes memory (Intel SDM vol. 2, PREFETCHh), so the hint is harmless.
+ */
+void akv_prefetch(akv *s, const void *key, size_t klen) {
+    uint64_t h = akv_hash64(key, klen, s->seed);
+    struct shard *sh = shard_of(s, h);
+    struct bucket *tab = __atomic_load_n(&sh->buckets, __ATOMIC_RELAXED);
+    uint64_t mask = __atomic_load_n(&sh->mask, __ATOMIC_RELAXED);
+    const char *b = (const char *)(tab + (h & mask));
+    __builtin_prefetch(b, 0, 3);
+    __builtin_prefetch(b + 64, 0, 3);
+}
+
+/*
+ * Second prefetch stage: finds the entry of the key under the shard lock (trylock: a contended shard is
+ * skipped) and prefetches its header and key. Called after akv_prefetch() for every key of a group, when
+ * the buckets are expected to be in the cache.
+ */
+void akv_prefetch_entry(akv *s, const void *key, size_t klen) {
+    uint64_t h = akv_hash64(key, klen, s->seed);
+    struct shard *sh = shard_of(s, h);
+    if (pthread_mutex_trylock(&sh->lock) != 0) {
+        return;
+    }
+    uint16_t tag = tag_of(h);
+    struct bucket *b = bucket_at(sh, h, 0);
+    uint32_t m = akv_match16(b->tags, tag);
+    if (m != 0) {
+        __builtin_prefetch(entry_at(sh, (slot_get(b, (unsigned)__builtin_ctz(m)) - 1) * 8), 0, 3);
+    }
+    pthread_mutex_unlock(&sh->lock);
 }
 
 static inline uint64_t next_cas(struct shard *sh) {

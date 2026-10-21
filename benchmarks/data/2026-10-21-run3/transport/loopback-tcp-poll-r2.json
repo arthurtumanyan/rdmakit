@@ -1,0 +1,10 @@
+{"tool": "duct_bench", "transport": "tcp", "wait": "poll", "pingpong_max": 5000, "stream_max": 20000, "results": [
+  {"size": 64, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 7.50, "p50": 7.17, "p99": 15.23, "p999": 17.15, "min": 6.78, "max": 45.78}, "pingpong_mb_s": 17.03, "stream_msgs_per_s": 5104932, "stream_mb_s": 326.72},
+  {"size": 256, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 7.10, "p50": 6.99, "p99": 9.15, "p999": 9.98, "min": 6.76, "max": 14.39}, "pingpong_mb_s": 71.97, "stream_msgs_per_s": 5848400, "stream_mb_s": 1497.19},
+  {"size": 1024, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 10.42, "p50": 7.83, "p99": 21.95, "p999": 91.10, "min": 7.22, "max": 123.49}, "pingpong_mb_s": 196.26, "stream_msgs_per_s": 3354451, "stream_mb_s": 3434.96},
+  {"size": 4096, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 8.89, "p50": 8.55, "p99": 11.48, "p999": 20.74, "min": 7.64, "max": 65.86}, "pingpong_mb_s": 919.87, "stream_msgs_per_s": 1979788, "stream_mb_s": 8109.21},
+  {"size": 16384, "pingpong_count": 4096, "stream_count": 16384, "rtt_us": {"mean": 11.64, "p50": 12.02, "p99": 14.06, "p999": 19.08, "min": 9.92, "max": 69.90}, "pingpong_mb_s": 2809.74, "stream_msgs_per_s": 697456, "stream_mb_s": 11427.12},
+  {"size": 65536, "pingpong_count": 1024, "stream_count": 4096, "rtt_us": {"mean": 24.03, "p50": 22.94, "p99": 50.81, "p999": 123.42, "min": 21.73, "max": 168.60}, "pingpong_mb_s": 5450.47, "stream_msgs_per_s": 141255, "stream_mb_s": 9257.27},
+  {"size": 262144, "pingpong_count": 256, "stream_count": 1024, "rtt_us": {"mean": 79.77, "p50": 56.65, "p99": 122.93, "p999": 928.22, "min": 47.83, "max": 928.22}, "pingpong_mb_s": 6569.78, "stream_msgs_per_s": 16071, "stream_mb_s": 4212.96},
+  {"size": 1048576, "pingpong_count": 200, "stream_count": 256, "rtt_us": {"mean": 181.75, "p50": 180.82, "p99": 199.69, "p999": 200.51, "min": 177.09, "max": 200.51}, "pingpong_mb_s": 11536.62, "stream_msgs_per_s": 6107, "stream_mb_s": 6404.17}
+]}

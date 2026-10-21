@@ -86,7 +86,7 @@ Written with `--out FILE`. Schema version 2. Fields (times in nanoseconds unless
 | `results.latency_ns.<op>` | the same summary for every operation type with samples |
 | `results.max_lag_ns` | largest delay of an actual send behind its intended time |
 | `results.series` | completed operations per second of the measurement phase |
-| `results.server` | present with `--server-pid`: `cpu_seconds`, `cpu_us_per_op`, `rss_bytes` |
+| `results.server` | present with `--server-pid`: `cpu_seconds`, `system_cpu_seconds` (kernel-mode part, `stime` of `/proc/<pid>/stat`), `cpu_us_per_op`, `rss_bytes` |
 | `results.kvcache` | present for the KV-cache scenario: parameters, `requests`, `block_gets`, `block_hits`, `hit_rate`, `reuse_rate`, `block_puts`, `bytes_get`, `bytes_put`, `corrupt`, `request_latency_ns` |
 | `results.histograms` | non-empty buckets of every histogram (`service`, `request`, one per operation) as `[index, count]` pairs of the log-linear histogram described in [`ARCHITECTURE.md`](ARCHITECTURE.md#histogram) |
 

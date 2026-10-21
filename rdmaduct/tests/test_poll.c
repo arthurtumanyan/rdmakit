@@ -6,6 +6,9 @@
  * non-blocking sends and receives, so senders run out of send space and flow-control credits and must
  * be woken through the descriptors. Every echo is checked for content and order per connection.
  *
+ * Each case runs twice: waiting on duct_ep_fd(), and with direct waiting (duct_ep_direct_fd), where both
+ * loops register the events of duct_ep_wait_events() after every arm.
+ *
  * Runs over TCP on the loopback interface and, when DUCT_TEST_ADDR is set and RDMA support is compiled
  * in, over RDMA in both wait modes.
  */
@@ -39,6 +42,7 @@ static int failures;
 struct server {
     duct_ctx *ctx;
     duct_listener *l;
+    int direct;
     int accepted;
     int closed;
     long echoed;
@@ -63,10 +67,29 @@ static int ep_wait(int epfd, struct epoll_event *evs, int max, int ms) {
     return n < 0 ? 0 : n;
 }
 
-/* Arms an endpoint; returns 1 if progress is possible now (-EAGAIN), 0 if armed, negative on error. */
-static int arm(duct_ep *ep) {
+/*
+ * Arms an endpoint; returns 1 if progress is possible now (-EAGAIN), 0 if armed, negative on error. With
+ * direct waiting, a successful arm updates the registration of fd in epfd to duct_ep_wait_events();
+ * *mask holds the registered events.
+ */
+static int arm(duct_ep *ep, int direct, int epfd, int fd, uint32_t *mask, uint64_t id) {
     int rc = duct_ep_arm(ep);
+    if (rc == 0 && direct) {
+        uint32_t want = duct_ep_wait_events(ep);
+        if (want != *mask) {
+            struct epoll_event ev = {.events = want, .data.u64 = id};
+            if (epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev) != 0) {
+                return -errno;
+            }
+            *mask = want;
+        }
+    }
     return rc == -EAGAIN ? 1 : rc;
+}
+
+/* Returns the descriptor to register for ep: duct_ep_direct_fd() with direct waiting. */
+static int wait_fd(duct_ep *ep, int direct) {
+    return direct ? duct_ep_direct_fd(ep) : duct_ep_fd(ep);
 }
 
 /*
@@ -76,6 +99,8 @@ static int arm(duct_ep *ep) {
  */
 struct sconn {
     duct_ep *ep;
+    int fd;
+    uint32_t mask;
     struct duct_rx pending;
     int has_pending;
     int dead;
@@ -105,8 +130,10 @@ static void *server_main(void *arg) {
                 duct_ep *ep;
                 while (s->accepted < NCONN && duct_accept(s->l, 0, &ep) == 0) {
                     c[s->accepted].ep = ep;
+                    c[s->accepted].fd = wait_fd(ep, s->direct);
+                    c[s->accepted].mask = EPOLLIN;
                     struct epoll_event ev = {.events = EPOLLIN, .data.u64 = (uint64_t)s->accepted};
-                    epoll_ctl(epfd, EPOLL_CTL_ADD, duct_ep_fd(ep), &ev);
+                    epoll_ctl(epfd, EPOLL_CTL_ADD, c[s->accepted].fd, &ev);
                     s->accepted++;
                 }
                 continue;
@@ -145,7 +172,7 @@ static void *server_main(void *arg) {
                     break;
                 }
             rearm:
-                rc = arm(sc->ep);
+                rc = arm(sc->ep, s->direct, epfd, sc->fd, &sc->mask, id);
                 if (rc == 0) {
                     break;
                 }
@@ -170,11 +197,15 @@ static void *server_main(void *arg) {
 
 struct cconn {
     duct_ep *ep;
+    int fd;
+    uint32_t mask;
     int sent;
     int received;
 };
 
-static void run(enum duct_transport t, enum duct_wait w, const char *addr, const char *name) {
+static void run(enum duct_transport t, enum duct_wait w, const char *addr, const char *base, int direct) {
+    char name[64];
+    snprintf(name, sizeof(name), "%s%s", base, direct ? "-direct" : "");
     struct duct_opts o;
     duct_opts_default(&o);
     o.transport = t;
@@ -183,7 +214,7 @@ static void run(enum duct_transport t, enum duct_wait w, const char *addr, const
     o.recv_depth = DEPTH;
     o.send_depth = DEPTH;
     o.connect_timeout_ms = 10000;
-    struct server s = {0};
+    struct server s = {.direct = direct};
     int rc = duct_ctx_create(&o, &s.ctx);
     EXPECT(rc == 0, "%s: ctx: %s", name, duct_strerror(rc));
     if (rc != 0) {
@@ -212,8 +243,10 @@ static void run(enum duct_transport t, enum duct_wait w, const char *addr, const
     }
     int epfd = epoll_create1(0);
     for (int i = 0; i < connected; i++) {
-        struct epoll_event ev = {.events = EPOLLIN, .data.u32 = (uint32_t)i};
-        epoll_ctl(epfd, EPOLL_CTL_ADD, duct_ep_fd(c[i].ep), &ev);
+        c[i].fd = wait_fd(c[i].ep, direct);
+        c[i].mask = EPOLLIN;
+        struct epoll_event ev = {.events = EPOLLIN, .data.u64 = (uint64_t)i};
+        epoll_ctl(epfd, EPOLL_CTL_ADD, c[i].fd, &ev);
     }
     int done = 0;
     int stalls = 0;
@@ -223,15 +256,15 @@ static void run(enum duct_transport t, enum duct_wait w, const char *addr, const
     /* Every connection starts runnable. */
     int n = connected;
     for (int i = 0; i < n; i++) {
-        evs[i].data.u32 = (uint32_t)i;
+        evs[i].data.u64 = (uint64_t)i;
     }
     while (done < connected && stalls < 5) {
         for (int k = 0; k < n; k++) {
-            struct cconn *cc = &c[evs[k].data.u32];
+            struct cconn *cc = &c[evs[k].data.u64];
             if (cc->received == PER_CONN) {
                 continue;
             }
-            int idx = (int)evs[k].data.u32;
+            int idx = (int)evs[k].data.u64;
             for (;;) {
                 int progressed = 0;
                 while (cc->sent < PER_CONN) {
@@ -266,7 +299,7 @@ static void run(enum duct_transport t, enum duct_wait w, const char *addr, const
                 if (progressed) {
                     continue;
                 }
-                rc = arm(cc->ep);
+                rc = arm(cc->ep, direct, epfd, cc->fd, &cc->mask, (uint64_t)idx);
                 if (rc == 0) {
                     break;
                 }
@@ -287,7 +320,7 @@ static void run(enum duct_transport t, enum duct_wait w, const char *addr, const
             fallbacks++;
             /* Time out: poll everything once more; repeated stalls mean a lost wake-up. */
             for (int i = 0; i < connected; i++) {
-                evs[n++].data.u32 = (uint32_t)i;
+                evs[n++].data.u64 = (uint64_t)i;
             }
         } else {
             stalls = 0;
@@ -311,12 +344,15 @@ static void run(enum duct_transport t, enum duct_wait w, const char *addr, const
 }
 
 int main(void) {
-    run(DUCT_TRANSPORT_TCP, DUCT_WAIT_POLL, "127.0.0.1", "tcp");
+    run(DUCT_TRANSPORT_TCP, DUCT_WAIT_POLL, "127.0.0.1", "tcp", 0);
+    run(DUCT_TRANSPORT_TCP, DUCT_WAIT_POLL, "127.0.0.1", "tcp", 1);
 #ifdef DUCT_HAVE_RDMA
     const char *addr = getenv("DUCT_TEST_ADDR");
     if (addr != NULL && addr[0] != '\0') {
-        run(DUCT_TRANSPORT_RDMA, DUCT_WAIT_POLL, addr, "rdma-poll");
-        run(DUCT_TRANSPORT_RDMA, DUCT_WAIT_EVENT, addr, "rdma-event");
+        for (int direct = 0; direct <= 1; direct++) {
+            run(DUCT_TRANSPORT_RDMA, DUCT_WAIT_POLL, addr, "rdma-poll", direct);
+            run(DUCT_TRANSPORT_RDMA, DUCT_WAIT_EVENT, addr, "rdma-event", direct);
+        }
     } else {
         puts("test_poll: RDMA cases skipped (DUCT_TEST_ADDR not set)");
     }

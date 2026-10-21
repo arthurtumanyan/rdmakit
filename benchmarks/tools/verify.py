@@ -8,7 +8,9 @@ Checks (every failure is listed; the exit status is non-zero when any check fail
      and every raw file listed in the manifest exists;
   2. the SHA-256 of every raw input file equals the one recorded in generated/summary.json;
   3. recomputing the summary from the raw files reproduces generated/summary.json exactly;
-  4. every figure embeds the digest of that summary;
+  4. every figure embeds the digest of that summary and equals, byte for byte, the figure redrawn from the
+     summary (rendering is deterministic: fixed SVG hash salt, no date or creator metadata, text kept as text),
+     every figure of report.FIGURES exists, and every image a document references exists;
   5. every generated table equals the table recomputed from the data;
   6. every GENERATED block in the documentation equals the generated table of the same name;
   7. every claim cited in the documentation as [C<number>] exists in claims.py and holds for the data, and
@@ -20,6 +22,7 @@ import json
 import pathlib
 import re
 import sys
+import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import bench_data  # noqa: E402
@@ -76,6 +79,21 @@ def main():
             problems.append("figure %s was not generated from this data (digest mismatch)" % svg.name)
     if not list(FIG.glob("*.svg")):
         problems.append("no figures found")
+    with tempfile.TemporaryDirectory() as tmp:
+        expected = set()
+        for name, fn in report.FIGURES.items():
+            for theme in ("light", "dark"):
+                fname = "%s%s.svg" % (name, report.THEMES[theme]["suffix"])
+                expected.add(fname)
+                fn(summary, theme, pathlib.Path(tmp) / fname, digest)
+                committed_fig = FIG / fname
+                if not committed_fig.exists():
+                    problems.append("figure %s is missing" % fname)
+                elif committed_fig.read_bytes() != (pathlib.Path(tmp) / fname).read_bytes():
+                    problems.append("figure %s differs from the figure redrawn from the data" % fname)
+        for svg in sorted(FIG.glob("*.svg")):
+            if svg.name not in expected:
+                problems.append("figure %s is not produced by report.py (stale file)" % svg.name)
 
     blocks = report.tables(summary, digest)
     for name, text in blocks.items():
@@ -95,6 +113,9 @@ def main():
             elif m.group("body") != blocks[m.group("name")]:
                 problems.append("%s: block %s differs from the data" % (md.relative_to(ROOT), m.group("name")))
         cited |= {f"C{n}" for n in re.findall(r"\[C(\d+)\]", text)}
+        for ref in re.findall(r'(?:src|srcset)="([^"]+\.(?:svg|png))"', text):
+            if not ref.startswith("http") and not (md.parent / ref).exists():
+                problems.append("%s: referenced image %s does not exist" % (md.relative_to(ROOT), ref))
 
     known = {c["id"]: c for c in claims.CLAIMS}
     for cid in sorted(cited - set(known)):

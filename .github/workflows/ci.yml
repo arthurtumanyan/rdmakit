@@ -63,6 +63,8 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y build-essential libibverbs-dev librdmacm-dev
       - name: Compile with RDMA support (RDMA suites need a device and run elsewhere)
         run: make
+      - name: Compile the lab programs with warnings as errors
+        run: make -C lab clean all CFLAGS="-O2 -g -Wall -Wextra -Wno-unused-parameter -std=gnu11 -Werror"
 
   benchmark-verification:
     runs-on: ubuntu-24.04

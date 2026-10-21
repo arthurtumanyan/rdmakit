@@ -11,6 +11,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -212,10 +213,12 @@ static void echo_once(duct_ep *ep, size_t len, unsigned seed) {
  * Streaming stress test. One producer sends `count` sequence-numbered messages of varying size in
  * batches of random length; the consumer verifies order and content, sleeps at intervals, and keeps up
  * to STRESS_HOLD received messages unreleased, so the producer repeatedly exhausts its send credits.
- * Batches of up to 80 messages span several RDMA doorbell chunks (16) and several TCP sendmsg groups (32).
+ * Batches of up to 80 messages span several RDMA doorbell chunks (16); on TCP the sizes (12 to 2048 bytes)
+ * mix staged payloads (at most 512 bytes) with payloads sent in place, and large batches span several
+ * sendmsg groups. Every other batch is sent with duct_send_some(), resubmitting the part not accepted.
  */
 #define STRESS_MAX_BATCH 80
-#define STRESS_MAX_LEN 512
+#define STRESS_MAX_LEN 2048
 #define STRESS_HOLD 3
 
 struct stress_server {
@@ -224,6 +227,7 @@ struct stress_server {
     uint64_t received;
     unsigned hold; /* unreleased messages kept by the consumer; TCP endpoints allow none */
     int failed;
+    atomic_int done; /* set by the consumer when it stops receiving */
 };
 
 static unsigned stress_len(uint64_t seq) {
@@ -244,6 +248,7 @@ static void *stress_consumer(void *arg) {
     duct_ep *ep;
     if (duct_accept(s->listener, 10000, &ep) != 0) {
         s->failed = 1;
+        atomic_store(&s->done, 1);
         return NULL;
     }
     struct duct_rx held[STRESS_HOLD];
@@ -291,6 +296,7 @@ static void *stress_consumer(void *arg) {
         duct_rx_release(ep, &held[i]);
     }
     duct_ep_close(ep);
+    atomic_store(&s->done, 1);
     return NULL;
 }
 
@@ -340,12 +346,35 @@ static void *stress_consumer(void *arg) {
                 stress_fill(pool[i], seq + i);
                 batch[i] = (struct duct_msg){.data = pool[i], .len = stress_len(seq + i)};
             }
-            rc = duct_send_batch(ep, batch, n, 10000);
+            if ((rnd >> 8) & 1) {
+                rc = duct_send_batch(ep, batch, n, 10000);
+            } else {
+                unsigned off = 0;
+                rc = 0;
+                while (off < n && rc == 0) {
+                    int k = duct_send_some(ep, batch + off, n - off);
+                    if (k < 0) {
+                        rc = k;
+                    } else if (k == 0) {
+                        rc = duct_progress(ep);
+                        usleep(50); /* no send space: the consumer is sleeping */
+                    } else {
+                        off += (unsigned)k;
+                    }
+                }
+            }
             if (rc != 0) {
                 EXPECT(0, "stress send at %llu: %s", (unsigned long long)seq, duct_strerror(rc));
                 break;
             }
             seq += n;
+        }
+        /* The last frames may still be in the TCP send queue; only calls on the endpoint write them out. */
+        while (!atomic_load(&srv.done)) {
+            if (duct_progress(ep) != 0) {
+                break;
+            }
+            usleep(100);
         }
         pthread_join(th, NULL);
         EXPECT(!srv.failed, "consumer failed");

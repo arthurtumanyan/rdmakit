@@ -505,6 +505,56 @@ def fig_concurrency(summary, theme, path, digest):
     finish(fig, path, theme, digest, "Pipelining and connection count, one server CPU, 64-byte values",
            "Closed loop, 4 client threads, 90% GET. Points: mean of repetitions; whiskers: minimum to maximum.")
 
+def fig_cpu_split(summary, theme, path, digest):
+    """Server CPU time per operation split into kernel and user mode, pipeline depths 1 and 32."""
+    t = style(theme)
+    depths = [d for d in (1, 32) if any(k.endswith("|%d" % d) for k in summary["pipeline"])]
+    fig, axes = plt.subplots(1, max(1, len(depths)), figsize=(10.5, 4.3), gridspec_kw={"wspace": 0.25})
+    axes = list(axes) if hasattr(axes, "__len__") else [axes]
+    drawn = False
+    for ax, depth in zip(axes, depths):
+        ymax = 0.0
+        for i, system in enumerate(LOOP_ORDER):
+            k = "%s|%d" % (system, depth)
+            ker = get(summary, "pipeline", k, "server_system_us_per_op")
+            usr = get(summary, "pipeline", k, "server_user_us_per_op")
+            tot = get(summary, "pipeline", k, "server_cpu_us_per_op")
+            share = get(summary, "pipeline", k, "server_system_share")
+            if ker is None or usr is None or tot is None or share is None:
+                continue
+            drawn = True
+            color = t["series"][SYSTEM_SLOT[system]]
+            hatch = HATCH.get(system)
+            ax.bar(i, ker["mean"], width=0.5, color=color, hatch=hatch, edgecolor=t["surface"], linewidth=0, zorder=3)
+            ax.bar(i, usr["mean"], width=0.5, bottom=ker["mean"], color=color, alpha=0.35, hatch=hatch,
+                   edgecolor=t["surface"], linewidth=0, zorder=3)
+            ax.vlines(i, tot["min"], tot["max"], color=t["text2"], linewidth=1.0, zorder=4)
+            ax.text(i, tot["max"], "%.2f us\nkernel %.0f%%" % (tot["mean"], share["mean"] * 100), ha="center",
+                    va="bottom", fontsize=6.5, color=t["text"], zorder=5)
+            ymax = max(ymax, tot["max"])
+        ax.set_xlim(-0.7, len(LOOP_ORDER) - 0.3)
+        ax.set_xticks([])
+        ax.set_ylim(0, (ymax or 1) * 1.28)
+        ax.set_ylabel("server CPU (us / op)")
+        ax.set_title("%d request%s in flight per connection" % (depth, "" if depth == 1 else "s"), loc="left",
+                     color=t["text"])
+        ax.grid(axis="y", zorder=0)
+        ax.spines["left"].set_visible(False)
+        ax.tick_params(axis="y", length=0)
+    if not drawn:
+        axes[0].text(0.5, 0.5, "The kernel and user split is not recorded in this run.", ha="center", va="center",
+                     transform=axes[0].transAxes, color=t["text2"])
+    handles = [Patch(facecolor=t["series"][SYSTEM_SLOT[s]], hatch=HATCH.get(s), edgecolor=t["surface"], linewidth=0,
+                     label=SYSTEM_LABEL[s]) for s in LOOP_ORDER]
+    handles += [Patch(facecolor=t["muted"], label="kernel mode (solid)"),
+                Patch(facecolor=t["muted"], alpha=0.35, label="user mode (faded)")]
+    fig.legend(handles=handles, loc="lower center", ncol=len(handles), bbox_to_anchor=(0.5, 0.0), fontsize=7)
+    fig.subplots_adjust(top=0.78, bottom=0.14, left=0.07, right=0.99)
+    finish(fig, path, theme, digest, "Where the server CPU time per operation goes: kernel and user mode",
+           "One server CPU, 16 connections over loopback TCP, 64-byte values, 90% GET. Bars: mean of repetitions; whiskers: "
+           "minimum to maximum of the total.\nSolid: kernel mode, i.e. system calls and the TCP stack (stime of "
+           "/proc/<pid>/stat); faded: user mode.")
+
 # ---- tables ---------------------------------------------------------------------------------------------
 
 def fmt_stat(st, digits=0, unit=""):
@@ -513,6 +563,13 @@ def fmt_stat(st, digits=0, unit=""):
     mean = st["mean"]
     s = ("{:,.%df}" % digits).format(mean)
     return "%s%s (cv %.1f%%)" % (s, unit, st["cv"] * 100)
+
+
+def fmt_pct(st):
+    """Mean of a fraction as a percentage, with its coefficient of variation."""
+    if not st:
+        return "n/a"
+    return "%.0f%% (cv %.1f%%)" % (st["mean"] * 100, st["cv"] * 100)
 
 
 def md_table(header, rows):
@@ -553,7 +610,8 @@ def tables(summary, digest):
         ["Container runtime", "Docker %s" % env["docker"]],
         ["Source commit", env["git_commit"][:12]],
         ["Uncommitted files at run start", env["git_uncommitted_files"]],
-    ])
+    ] + [[label, env[key]] for label, key in (("Containers running at run start", "running_containers"),
+                                              ("Load average (1 min) at run start", "load_avg_1min")) if key in env])
 
     def matrix_table(metric, digits, title_unit):
         rows = []
@@ -647,9 +705,12 @@ def tables(summary, digest):
                     rows.append([SYSTEM_LABEL[sname], "{:,}".format(x), fmt_stat(get(summary, section, k, "throughput"), 0),
                                  fmt_stat(get(summary, section, k, "p50_us"), 0), fmt_stat(get(summary, section, k, "p99_us"), 0),
                                  fmt_stat(get(summary, section, k, "server_cpu_us_per_op"), 2),
+                                 fmt_pct(get(summary, section, k, "server_system_share")),
                                  fmt_stat(get(summary, section, k, "server_rss_mib"), 0)])
-        out[section] = pv + "\n" + text + " Latencies are GET latencies in microseconds.\n\n" + md_table(
-            ["System", xname, "ops/s", "p50", "p99", "Server CPU µs/op", "Server RSS MiB"], rows)
+        out[section] = pv + "\n" + text + (" Latencies are GET latencies in microseconds. Server kernel share: kernel-mode part"
+                                          " of the server CPU time (stime in /proc/<pid>/stat), that is system calls and the"
+                                          " TCP stack run on the server's behalf.\n\n") + md_table(
+            ["System", xname, "ops/s", "p50", "p99", "Server CPU µs/op", "Server kernel share", "Server RSS MiB"], rows)
 
     rows = []
     vlabel = {"valkey": "Valkey (RESP)", "kvstore-mc": "arenakv (memcached protocol)"}
@@ -693,6 +754,7 @@ FIGURES = {
                                                  "Same runs as the throughput figure. KV-cache panels: per block GET or PUT. Whiskers: minimum to maximum."),
     "sweep": fig_sweep,
     "concurrency": fig_concurrency,
+    "cpu-split": fig_cpu_split,
     "coordinated-omission": fig_coordinated,
     "capacity": fig_capacity,
     "transport": fig_transport,

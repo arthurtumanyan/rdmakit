@@ -8,12 +8,13 @@
  *   saver    periodic snapshots (save_interval_s); background snapshots run on their own thread
  *
  * Native connections (rdmaduct): the worker drains messages with duct_recv(..., 0), executes each
- * request into the worker's batch area and sends up to BATCH_MSGS responses with one duct_send_batch(),
+ * request into the worker's batch area and sends up to BATCH_MSGS responses with one duct_send_some(),
  * so pipelined requests cost one send call per batch instead of one per response (on TCP one sendmsg).
- * The batch is limited to duct_ep_send_space(); responses that do not fit (no credit or send space) are
- * queued in conn.pend and the connection stops reading until the queue is empty, so a client that does
- * not read its responses cannot make the server buffer without bound. The connection is armed with
- * duct_ep_arm() before the worker waits.
+ * Responses that the endpoint does not accept (no credit or send space) are queued in conn.pend and the
+ * connection stops reading until the queue is empty, so a client that does not read its responses cannot
+ * make the server buffer without bound. The worker waits on duct_ep_direct_fd() (on TCP the socket
+ * itself, without the endpoint's nested epoll set); the connection is armed with duct_ep_arm() before the
+ * worker waits, and its registration follows duct_ep_wait_events().
  *
  * Text connections (memcached, RESP): non-blocking sockets (optionally TLS). Input accumulates in
  * conn.in until the protocol module consumes complete commands; replies accumulate in conn.out. Reading
@@ -59,8 +60,9 @@
 
 #define READ_CHUNK 65536u
 #define BURST 64               /* requests or reads per connection before other connections are served */
-#define BATCH_MSGS 32          /* native responses sent with one duct_send_batch() */
+#define BATCH_MSGS 64          /* native responses sent with one duct_send_batch(): one turn (BURST) */
 #define BATCH_BYTES (1u << 20) /* size of the native batch area, at least max_msg */
+#define PREFETCH 8             /* native requests whose index buckets are prefetched together */
 
 enum conn_kind {
     CK_NATIVE = 0,
@@ -75,14 +77,14 @@ struct conn {
     struct worker *w;
     struct conn *prev;
     struct conn *next;
-    uint64_t last_active; /* seconds of CLOCK_MONOTONIC */
+    uint64_t last_active; /* seconds of CLOCK_MONOTONIC_COARSE */
     struct session ss;
     /* native */
     duct_ep *ep;
     struct obuf pend; /* queued responses: 4-byte length, then the message */
-    /* text */
+    /* text: the socket; native: the descriptor of duct_ep_direct_fd(), owned by the endpoint */
     int fd;
-    uint32_t epmask;
+    uint32_t epmask; /* events registered for fd in the worker's epoll set */
     struct obuf in;
     struct obuf out;
 #ifdef AKV_HAVE_TLS
@@ -542,9 +544,11 @@ static void *saver_main(void *arg) {
 
 /* ---- connections -------------------------------------------------------------------------------------- */
 
+/* Monotonic seconds for idle accounting. The coarse clock is read without the timestamp counter
+ * (clock_gettime(2)); its tick resolution is far below the one-second granularity used here. */
 static uint64_t mono_s(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
     return (uint64_t)ts.tv_sec;
 }
 
@@ -553,7 +557,7 @@ static void conn_free(struct conn *c) {
     akvd *d = w->d;
     if (c->kind == CK_NATIVE) {
         if (c->ep != NULL) {
-            epoll_ctl(w->epfd, EPOLL_CTL_DEL, duct_ep_fd(c->ep), NULL);
+            epoll_ctl(w->epfd, EPOLL_CTL_DEL, c->fd, NULL);
             duct_ep_close(c->ep);
         }
         ob_free(&c->pend);
@@ -884,36 +888,49 @@ static int native_flush(struct conn *c) {
 }
 
 /*
- * Sends the responses w->bmsg[0..n), as many as the endpoint accepts now (duct_ep_send_space), and queues
+ * Sends the responses w->bmsg[0..n), as many as the endpoint accepts now (duct_send_some), and queues
  * the rest in c->pend in order. Returns 0 (all sent), 1 (some queued), or a negative error.
  */
 static int native_send_batch(struct worker *w, struct conn *c, unsigned n) {
-    unsigned i = 0;
-    while (i < n) {
-        unsigned space = duct_ep_send_space(c->ep);
-        if (space == 0) {
-            break;
-        }
-        unsigned k = n - i < space ? n - i : space;
-        int rc = duct_send_batch(c->ep, w->bmsg + i, k, 0); /* accepted in full: k <= send space */
-        if (rc != 0) {
-            return rc;
-        }
-        i += k;
+    int sent = duct_send_some(c->ep, w->bmsg, n);
+    if (sent < 0) {
+        return sent;
     }
-    for (unsigned j = i; j < n; j++) {
+    for (unsigned j = (unsigned)sent; j < n; j++) {
         uint8_t len4[4];
         akvp_put32(len4, (uint32_t)w->bmsg[j].len);
         if (ob_add(&c->pend, len4, 4) != 0 || ob_add(&c->pend, w->bmsg[j].data, w->bmsg[j].len) != 0) {
             return -ENOMEM;
         }
     }
-    return i < n ? 1 : 0;
+    return (unsigned)sent < n ? 1 : 0;
+}
+
+/*
+ * Prefetch stage of a native request: stage 0 the index bucket (akv_prefetch), stage 1 the entry
+ * (akv_prefetch_entry). Ignores malformed input.
+ */
+static void native_prefetch(akvd *d, const uint8_t *msg, size_t len, int stage) {
+    struct akvp_req rq;
+    if (akvp_req_decode(msg, len, &rq) != 0 || rq.klen == 0) {
+        return;
+    }
+    size_t off = AKVP_REQ_HDR + ((rq.flags & AKVP_F_EXT) ? AKVP_EXT : 0);
+    if (off + rq.klen > len) {
+        return;
+    }
+    if (stage == 0) {
+        akv_prefetch(d->store, msg + off, rq.klen);
+    } else {
+        akv_prefetch_entry(d->store, msg + off, rq.klen);
+    }
 }
 
 /* Serves a native connection for one turn. Returns 0 (armed, waiting), 1 (work left), or -1 (closed). */
 static int native_serve(struct worker *w, struct conn *c) {
     akvd *d = w->d;
+    /* At most recv_depth messages can be held at once (duct_recv). */
+    unsigned prefetch = d->cfg.recv_depth < PREFETCH ? d->cfg.recv_depth : PREFETCH;
     size_t cap = d->cfg.max_msg;
     uint32_t peer = duct_ep_peer_max_msg(c->ep);
     if (cap > peer) {
@@ -931,29 +948,41 @@ static int native_serve(struct worker *w, struct conn *c) {
             size_t used = 0;
             int more = 1;
             /* Execute requests into the batch area until it is full (the next response may need cap
-             * bytes), the burst ends, or no message waits. */
-            while (nb < BATCH_MSGS && handled < BURST && used + cap <= w->resp_cap) {
-                struct duct_rx rx;
-                int r = duct_recv(c->ep, &rx, 0);
-                if (r == -ETIMEDOUT) {
-                    more = 0;
-                    break;
+             * bytes), the burst ends, or no message waits. Requests are taken in groups of up to
+             * PREFETCH: the index buckets of a group are prefetched before its requests execute, so that
+             * their cache misses overlap instead of following one another. */
+            while (more && nb < BATCH_MSGS && handled < BURST && used + cap <= w->resp_cap) {
+                struct duct_rx rx[PREFETCH];
+                unsigned k = 0;
+                while (k < prefetch && nb + k < BATCH_MSGS && handled + (int)k < BURST &&
+                       used + (k + 1) * cap <= w->resp_cap) {
+                    int r = duct_recv(c->ep, &rx[k], 0);
+                    if (r == -ETIMEDOUT) {
+                        more = 0;
+                        break;
+                    }
+                    if (r != 0) {
+                        conn_free(c); /* closing the endpoint releases the held messages */
+                        return -1;
+                    }
+                    native_prefetch(d, rx[k].data, rx[k].len, 0);
+                    k++;
                 }
-                if (r != 0) {
-                    conn_free(c);
-                    return -1;
+                for (unsigned j = 0; k > 1 && j < k; j++) {
+                    native_prefetch(d, rx[j].data, rx[j].len, 1);
                 }
-                c->last_active = mono_s();
-                uint8_t *out = w->resp + used;
-                size_t n = native_handle(d, c, rx.data, rx.len, out, cap);
-                duct_rx_release(c->ep, &rx);
-                if (n == 0) {
-                    conn_free(c);
-                    return -1;
+                for (unsigned j = 0; j < k; j++) {
+                    uint8_t *out = w->resp + used;
+                    size_t n = native_handle(d, c, rx[j].data, rx[j].len, out, cap);
+                    duct_rx_release(c->ep, &rx[j]);
+                    if (n == 0) {
+                        conn_free(c);
+                        return -1;
+                    }
+                    w->bmsg[nb++] = (struct duct_msg){.data = out, .len = n};
+                    used += n;
+                    handled++;
                 }
-                w->bmsg[nb++] = (struct duct_msg){.data = out, .len = n};
-                used += n;
-                handled++;
             }
             if (nb > 0) {
                 rc = native_send_batch(w, c, nb);
@@ -966,11 +995,23 @@ static int native_serve(struct worker *w, struct conn *c) {
                 break;
             }
         }
+        if (handled > 0) {
+            c->last_active = mono_s(); /* once per turn, not per request */
+        }
         if (handled == BURST) {
             return 1;
         }
         int a = duct_ep_arm(c->ep);
         if (a == 0) {
+            uint32_t want = duct_ep_wait_events(c->ep);
+            if (want != c->epmask) {
+                struct epoll_event ev = {.events = want, .data.ptr = c};
+                if (epoll_ctl(w->epfd, EPOLL_CTL_MOD, c->fd, &ev) != 0) {
+                    conn_free(c);
+                    return -1;
+                }
+                c->epmask = want;
+            }
             return 0;
         }
         if (a != -EAGAIN) {
@@ -1226,10 +1267,12 @@ static void adopt(struct worker *w) {
         w->conns = c;
         c->w = w;
         c->last_active = mono_s();
-        int fd = c->kind == CK_NATIVE ? duct_ep_fd(c->ep) : c->fd;
+        if (c->kind == CK_NATIVE) {
+            c->fd = duct_ep_direct_fd(c->ep);
+        }
         struct epoll_event ev = {.events = EPOLLIN, .data.ptr = c};
         c->epmask = EPOLLIN;
-        if (epoll_ctl(w->epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
+        if (epoll_ctl(w->epfd, EPOLL_CTL_ADD, c->fd, &ev) != 0) {
             conn_free(c);
             continue;
         }

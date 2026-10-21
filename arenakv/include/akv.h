@@ -158,6 +158,16 @@ int akv_get(akv *s, const void *key, size_t klen, void *buf, size_t cap, size_t 
 /* Returns 1 when key is present and not expired, 0 otherwise. Does not count as a read for eviction. */
 int akv_exists(akv *s, const void *key, size_t klen);
 
+/*
+ * Cache hint: starts loading the index bucket of key, without a lock and without changing anything, so
+ * that the lookups of a batch of requests overlap their memory latency (call it for every key of the
+ * batch, then perform the operations). Thread-safe.
+ */
+void akv_prefetch(akv *s, const void *key, size_t klen);
+
+/* Second stage of akv_prefetch(): starts loading the entry of key (takes the shard lock briefly). */
+void akv_prefetch_entry(akv *s, const void *key, size_t klen);
+
 /* Removes key. Returns 0 when it existed, -ENOENT otherwise. */
 int akv_del(akv *s, const void *key, size_t klen);
 

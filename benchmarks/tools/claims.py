@@ -41,7 +41,8 @@ def loop(s, section, system, x, metric="throughput"):
 
 
 def c1(s):
-    return all(max(ALL_SYSTEMS, key=lambda x: mean(s, x, cpus, wl)) == "kvstore-mc" for cpus in (1, 4) for wl in WORKLOADS)
+    return all(max(ALL_SYSTEMS, key=lambda x: mean(s, x, cpus, wl)) in ("kvstore", "kvstore-mc")
+               for cpus in (1, 4) for wl in WORKLOADS)
 
 
 def c2(s):
@@ -55,8 +56,12 @@ def c3(s):
 
 
 def c4(s):
-    return all(min(TCP_SYSTEMS, key=lambda x: mean(s, x, cpus, wl, "server_cpu_us_per_op")) == "kvstore-mc"
-               for cpus in (1, 4) for wl in WORKLOADS)
+    def lowest(cpus, wl):
+        return min(TCP_SYSTEMS, key=lambda x: mean(s, x, cpus, wl, "server_cpu_us_per_op"))
+    rows = [(cpus, wl) for cpus in (1, 4) for wl in WORKLOADS if (cpus, wl) != (4, "kvcache")]
+    last = mean(s, "kvstore", 4, "kvcache", "server_cpu_us_per_op") / mean(s, "memcached", 4, "kvcache", "server_cpu_us_per_op")
+    return (all(lowest(cpus, wl) in ("kvstore", "kvstore-mc") for cpus, wl in rows)
+            and lowest(4, "kvcache") == "memcached" and last < 1.02)
 
 
 def c5(s):
@@ -70,8 +75,8 @@ def c6(s):
 
 def c7(s):
     mine = sweep(s, "kvstore", 260000, "achieved_ops")
-    return (all(above(mine, sweep(s, other, 260000, "achieved_ops")) for other in ("valkey", "dragonfly"))
-            and above(sweep(s, "memcached", 260000, "achieved_ops"), mine))
+    return (mine["min"] > 0.99 * 260000
+            and all(sweep(s, other, 260000, "achieved_ops")["max"] < 240000 for other in ("valkey", "dragonfly", "memcached")))
 
 
 def c8(s):
@@ -81,7 +86,7 @@ def c8(s):
 
 def c9(s):
     return all(sweep(s, system, 260000, "p99_us")["mean"] > 1000 * sweep(s, system, 260000, "service_p99_us")["mean"]
-               for system in SWEEP_SYSTEMS)
+               for system in ("valkey", "dragonfly", "memcached"))
 
 
 def c10(s):
@@ -94,10 +99,9 @@ def c11(s):
 
 
 def c12(s):
-    higher = all(cap(s, "memcached", c, "reuse_rate")["mean"] > cap(s, "kvstore", c, "reuse_rate")["mean"] for c in ("16mb", "64mb"))
-    close = all(abs(cap(s, "memcached", c, "reuse_rate")["mean"] - cap(s, "kvstore", c, "reuse_rate")["mean"]) < 0.02
-                for c in ("256mb", "1gb", "4gb"))
-    return higher and close
+    def diff(c):
+        return cap(s, "memcached", c, "reuse_rate")["mean"] - cap(s, "kvstore", c, "reuse_rate")["mean"]
+    return all(diff(c) > 0 for c in ("16mb", "64mb", "256mb", "1gb")) and all(diff(c) < 0.03 for c in ("256mb", "1gb"))
 
 
 def c13(s):
@@ -168,42 +172,65 @@ def c23(s):
 
 
 def c24(s):
-    mc = loop(s, "pipeline", "kvstore-mc", 32)
-    others = [loop(s, "pipeline", x, 32) for x in ("kvstore", "valkey", "dragonfly", "memcached")]
-    native, valkey = loop(s, "pipeline", "kvstore", 32)["mean"], loop(s, "pipeline", "valkey", 32)["mean"]
-    return all(above(mc, o) for o in others) and abs(native / valkey - 1) < 0.01
+    native = loop(s, "pipeline", "kvstore", 32)
+    others = [loop(s, "pipeline", x, 32) for x in ("kvstore-mc", "valkey", "dragonfly", "memcached")]
+    return (all(above(native, o) for o in others)
+            and all(native["mean"] >= 2 * loop(s, "pipeline", x, 32)["mean"] for x in ("valkey", "dragonfly", "memcached")))
 
 
 def c25(s):
     def gain(x):
         return loop(s, "pipeline", x, 32)["mean"] / loop(s, "pipeline", x, 1)["mean"]
-    return all(9 < gain(x) < 12 for x in ("kvstore", "kvstore-mc", "valkey")) and all(gain(x) < 6.5 for x in ("dragonfly", "memcached"))
+    return (gain("kvstore") > 15 and all(9 < gain(x) < 13 for x in ("kvstore-mc", "valkey"))
+            and all(gain(x) < 6.5 for x in ("dragonfly", "memcached")))
 
 
 def c26(s):
     def keep(x):
         return loop(s, "connections", x, 1024)["mean"] / loop(s, "connections", x, 16)["mean"]
-    return (all(keep(x) > 0.96 for x in ("kvstore-mc", "memcached", "valkey")) and 0.85 < keep("kvstore") < 0.92
-            and keep("dragonfly") < 0.85)
+    return all(keep(x) > 0.95 for x in ("kvstore", "kvstore-mc", "memcached", "valkey")) and keep("dragonfly") < 0.85
 
 
 def c27(s):
     return min(TCP_SYSTEMS, key=lambda x: loop(s, "connections", x, 1024, "p99_us")["mean"]) == "kvstore-mc"
 
 
+def c28(s):
+    def share(x):
+        return loop(s, "pipeline", x, 1, "server_system_share")
+    return share("kvstore")["min"] > 0.80 and all(share(x)["mean"] > 0.70 for x in TCP_SYSTEMS)
+
+
+def c29(s):
+    return all(abs(mean(s, "kvstore", cpus, wl, "server_cpu_us_per_op") / mean(s, "kvstore-mc", cpus, wl, "server_cpu_us_per_op") - 1)
+               < 0.05 for cpus in (1, 4) for wl in WORKLOADS)
+
+
+def c30(s):
+    return all(above(loop(s, "pipeline", x, 1, "server_system_share"), loop(s, "pipeline", x, 32, "server_system_share"))
+               for x in TCP_SYSTEMS)
+
+
+def c31(s):
+    def lead(cpus):
+        best = max(mean(s, x, cpus, "kvcache") for x in ("kvstore", "kvstore-mc"))
+        return best / mean(s, "memcached", cpus, "kvcache")
+    return all(1 < lead(cpus) < 1.15 for cpus in (1, 4))
+
+
 _TEXT = {
-    1: "arenakv over the memcached protocol has the highest mean throughput in all six matrix rows",
+    1: "arenakv over TCP, with its native protocol or with the memcached protocol, has the highest mean throughput in all six matrix rows",
     2: "at four server CPUs the throughput of arenakv (TCP, native protocol) is higher than that of Valkey and of Dragonfly in all three workloads, with non-overlapping ranges",
     3: "at one server CPU arenakv over the memcached protocol has higher throughput than memcached in all three workloads, with non-overlapping ranges",
-    4: "arenakv over the memcached protocol has the lowest mean server CPU time per operation of the five TCP servers in all six matrix rows",
+    4: "one of the two arenakv TCP rows (native protocol or memcached protocol) has the lowest mean server CPU time per operation of the five TCP servers in five of the six matrix rows; in the KV-cache row at four server CPUs memcached is lowest and native arenakv is within 2% of it",
     5: "at four server CPUs arenakv (TCP) uses less server CPU time per operation than Valkey and Dragonfly in all three workloads (means)",
     6: "arenakv over Soft-RoCE has lower mean throughput than arenakv over TCP in all six matrix rows",
-    7: "at 260,000 offered operations per second arenakv (TCP) achieves a higher rate than Valkey and Dragonfly and a lower rate than memcached, with non-overlapping ranges",
+    7: "at 260,000 offered operations per second arenakv (TCP) achieves the offered rate within 1% in every repetition, while Valkey, Dragonfly and memcached achieve less than 240,000 operations per second in every repetition",
     8: "up to 140,000 offered operations per second all four servers of the sweep achieve the offered rate within 1%",
-    9: "at 260,000 offered operations per second the p99 latency from the intended send time exceeds the p99 service time by more than a factor of 1,000 for every server of the sweep",
+    9: "at 260,000 offered operations per second the p99 latency from the intended send time exceeds the p99 service time by more than a factor of 1,000 for Valkey, Dragonfly and memcached",
     10: "below saturation (up to 140,000 offered operations per second) the p99 latency has a coefficient of variation above 20% between repetitions in at least half of the 16 cells (four servers, four rates)",
     11: "at 16, 64 and 256 MB configured capacity the reuse rate of arenakv (TCP) is higher than that of Valkey, with non-overlapping ranges",
-    12: "memcached has a higher mean reuse rate than arenakv (TCP) at 16 and 64 MB and differs from it by less than 0.02 at 256 MB, 1 GB and 4 GB",
+    12: "memcached has a higher mean reuse rate than arenakv (TCP) at every configured capacity from 16 MB to 1 GB, and the difference is below 0.03 at 256 MB and 1 GB",
     13: "at 4 GB configured capacity the mean reuse rates of all systems that ran differ by less than 0.005",
     14: "with default flags Dragonfly in cache mode failed more than 90% of requests at 256 MB and more than 80% at 1 GB; with --max_eviction_per_heartbeat raised no request failed",
     15: "memcached failed fewer than 0.1% of requests in every capacity configuration; arenakv and Valkey failed none",
@@ -215,10 +242,14 @@ _TEXT = {
     21: "with the client model of memtier_benchmark kvpace measures a throughput within 3% of memtier_benchmark with 16 connections, and at least 25% higher with one connection, on both validation servers",
     22: "no operation failed in any matrix run",
     23: "with one blocking thread per connection kvpace measures between 5% and 15% less throughput than memtier_benchmark with 16 connections on both validation servers",
-    24: "at pipeline depth 32 arenakv over the memcached protocol has the highest throughput of the five servers, with non-overlapping ranges, and native arenakv and Valkey differ by less than 1%",
-    25: "from pipeline depth 1 to 32 the throughput of native arenakv, arenakv over the memcached protocol and Valkey grows by a factor between 9 and 12, that of Dragonfly and memcached by less than 6.5",
-    26: "from 16 to 1024 connections the throughput of arenakv over the memcached protocol, memcached and Valkey falls by less than 4%, that of native arenakv by 8% to 15%, and that of Dragonfly by more than 15%",
+    24: "at pipeline depth 32 native arenakv has the highest throughput of the five servers, with non-overlapping ranges, and at least twice the mean throughput of Valkey, Dragonfly and memcached",
+    25: "from pipeline depth 1 to 32 the throughput of native arenakv grows by a factor above 15, that of arenakv over the memcached protocol and of Valkey by a factor between 9 and 13, and that of Dragonfly and memcached by less than 6.5",
+    26: "from 16 to 1024 connections the throughput of native arenakv, arenakv over the memcached protocol, memcached and Valkey falls by less than 5%, that of Dragonfly by more than 15%",
     27: "at 1024 connections arenakv over the memcached protocol has the lowest mean GET p99 latency of the five servers",
+    28: "at pipeline depth 1 kernel mode accounts for more than 80% of the server CPU time of native arenakv in every repetition, and for more than 70% of the server CPU time of each of the five TCP servers (means)",
+    29: "in every matrix row the mean server CPU time per operation of native arenakv and of arenakv over the memcached protocol differ by less than 5%",
+    30: "for each of the five TCP servers the kernel-mode share of the server CPU time is lower at pipeline depth 32 than at depth 1, with non-overlapping ranges",
+    31: "in the KV-cache rows the higher of the two arenakv TCP means exceeds the mean throughput of memcached by less than 15%, at one and at four server CPUs",
 }
 _CHECK = {n: globals()["c%d" % n] for n in _TEXT}
 CLAIMS = [{"id": "C%d" % n, "text": _TEXT[n], "check": _CHECK[n]} for n in sorted(_TEXT)]

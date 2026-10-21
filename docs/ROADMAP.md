@@ -10,20 +10,24 @@ developed further. Dates refer to the history of this repository.
 | rdmaduct | RDMA and TCP transports, credit-based flow control, batching, event-driven waiting, graceful close, pollable descriptors, registered regions, zero-copy send, one-sided read/write and atomics (emulated on TCP), fault injection and fuzzing of handshake, framing and control frames | GPU memory, multiple devices, TCP progress thread, coverage-guided fuzzing |
 | kvpace | closed and open loop; several connections per thread with pipelining; operation mixes and YCSB workloads A, B, C, D, F; five key distributions and value-size lists; KV-cache scenario; RESP, memcached and native drivers with authentication and TLS; CSV and HdrHistogram output; synchronized multi-host start and result merging; server CPU sampling | trace replay, cluster-aware clients, coordinated distributed generation |
 | arenakv | engine with expiry, CAS, conditional stores, increments and a growing index; event-loop server; memcached text and meta, RESP2 and native protocols; authentication, TLS, snapshots; client with pipelining and consistent hashing; tests under three sanitizers and with third-party clients | zero-copy GET from registered memory, one-sided GET, incremental rehashing, replication |
-| benchmarks | orchestrator, environment capture, figures, tables, claim verification | runs on RDMA hardware, runs with the `performance` CPU governor, cross-host runs |
+| benchmarks | orchestrator, environment capture, figures, tables, claim verification, kernel and user split of the server CPU time, a run with the `performance` CPU governor | runs on RDMA hardware, cross-host runs |
 
 ## Gate for the store
 
 The store is developed further only if it shows a clear, repeatable advantage over the established systems under at
-least one KV-cache scenario, on hardware where the transport can show it. Over TCP on the measured machine it leads
-the matrix over the memcached protocol by 5% to 11% over memcached at one server CPU and is ahead of Valkey and Dragonfly at four
-(see [`benchmarks/README.md`](../benchmarks/README.md), [C1] [C2] [C3]); the KV-cache rows differ by less than 15%
-between arenakv and memcached, which is not the clear advantage the gate asks for. The remaining candidates are a transport without kernel TCP overhead, server CPU per large block, and
-memory efficiency. They need RDMA hardware to be evaluated; Soft-RoCE results are not evidence.
+least one KV-cache scenario, on hardware where the transport can show it. Over TCP on the measured machine arenakv has
+the highest throughput in every matrix row, is faster than memcached over the same protocol at one server CPU, and is
+ahead of Valkey and Dragonfly at four (see [`benchmarks/README.md`](../benchmarks/README.md), [C1] [C2] [C3]). In the
+KV-cache rows arenakv is ahead of memcached by less than 15% [C31], which is not the clear advantage the gate asks
+for.
+
+With one request in flight, kernel mode accounts for more than 80% of the server CPU time of arenakv [C28], so the
+remaining per-request cost over TCP is mostly the kernel network path. That is the part a transport without kernel
+involvement removes, and it is why the next measurement needs RDMA hardware; Soft-RoCE results are not evidence.
 
 ## Next steps
 
-1. Repeat the benchmark suite on RDMA hardware (ConnectX class), with the `performance` governor.
+1. Repeat the benchmark suite on RDMA hardware (ConnectX class), with the `performance` governor, on two hosts.
 2. Worker-per-core serving model for `arenakvd` with polling completion queues.
 3. Zero-copy GET (send from the registered arena) and a one-sided GET path with checksummed buckets, measured against
    the RPC path.
