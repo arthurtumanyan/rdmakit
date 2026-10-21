@@ -105,22 +105,22 @@ the figures and every tagged statement ([C1] ...) match it. The complete data, m
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="benchmarks/figures/throughput-dark.svg">
-  <img alt="Grouped bar charts of throughput for five systems in six panels" src="benchmarks/figures/throughput.svg">
+  <img alt="Grouped bar charts of throughput for six systems in six panels" src="benchmarks/figures/throughput.svg">
 </picture>
 
 <!-- BEGIN GENERATED:matrix-throughput -->
-Data: `benchmarks/data/2026-10-20-run1` (353 runs: 336 ok, 11 with operation errors, 0 failed, 6 skipped), commit `fc0dc39b5653`, summary digest `aaaad406e27486af`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-21-run2` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `46efd6447c6d`, summary digest `95813d0d095ed976`. Mean over repetitions; `cv` is the coefficient of variation.
 
 Operations per second (KV-cache rows: requests per second).
 
-| Workload | Server CPUs | arenakv (TCP) | arenakv (Soft-RoCE) | Valkey | Dragonfly | memcached |
-|---|---|---|---|---|---|---|
-| 64-byte values | 1 | 169,230 (cv 1.3%) | 190,098 (cv 2.6%) | 202,099 (cv 1.2%) | 201,584 (cv 1.1%) | 221,236 (cv 0.7%) |
-| 64-byte values | 4 | 601,090 (cv 1.0%) | 239,042 (cv 2.3%) | 521,525 (cv 3.6%) | 556,645 (cv 2.2%) | 749,478 (cv 3.9%) |
-| 16 KiB values | 1 | 127,136 (cv 0.6%) | 99,118 (cv 1.8%) | 135,476 (cv 1.3%) | 130,974 (cv 3.2%) | 139,778 (cv 1.9%) |
-| 16 KiB values | 4 | 453,342 (cv 2.6%) | 147,657 (cv 1.4%) | 352,473 (cv 5.0%) | 404,556 (cv 2.2%) | 506,687 (cv 5.2%) |
-| KV-cache requests | 1 | 1,616 (cv 1.6%) | 1,328 (cv 2.5%) | 1,669 (cv 4.2%) | 1,711 (cv 3.6%) | 1,748 (cv 4.5%) |
-| KV-cache requests | 4 | 4,526 (cv 2.0%) | 1,944 (cv 1.5%) | 4,114 (cv 1.4%) | 2,352 (cv 11.1%) | 4,376 (cv 4.3%) |
+| Workload | Server CPUs | arenakv (TCP) | arenakv (Soft-RoCE) | arenakv (memcached protocol) | Valkey | Dragonfly | memcached |
+|---|---|---|---|---|---|---|---|
+| 64-byte values | 1 | 221,649 (cv 0.4%) | 203,726 (cv 0.8%) | 250,825 (cv 1.1%) | 207,438 (cv 0.5%) | 204,562 (cv 0.6%) | 226,135 (cv 0.7%) |
+| 64-byte values | 4 | 731,229 (cv 0.6%) | 233,217 (cv 2.3%) | 849,389 (cv 0.8%) | 534,587 (cv 1.0%) | 567,459 (cv 1.4%) | 775,447 (cv 1.7%) |
+| 16 KiB values | 1 | 143,866 (cv 1.1%) | 112,277 (cv 2.3%) | 154,248 (cv 2.0%) | 140,608 (cv 0.3%) | 134,652 (cv 0.8%) | 144,826 (cv 0.4%) |
+| 16 KiB values | 4 | 511,973 (cv 1.3%) | 144,497 (cv 1.8%) | 558,377 (cv 1.9%) | 371,017 (cv 2.0%) | 415,075 (cv 2.3%) | 531,024 (cv 1.0%) |
+| KV-cache requests | 1 | 1,839 (cv 0.6%) | 1,426 (cv 0.9%) | 1,932 (cv 1.0%) | 1,746 (cv 0.4%) | 1,773 (cv 0.5%) | 1,846 (cv 1.0%) |
+| KV-cache requests | 4 | 4,800 (cv 1.2%) | 1,873 (cv 1.1%) | 5,227 (cv 1.4%) | 4,213 (cv 0.8%) | 2,809 (cv 11.9%) | 4,552 (cv 1.7%) |
 <!-- END GENERATED:matrix-throughput -->
 
 <picture>
@@ -129,30 +129,38 @@ Operations per second (KV-cache rows: requests per second).
 </picture>
 
 <!-- BEGIN GENERATED:capacity-reuse -->
-Data: `benchmarks/data/2026-10-20-run1` (353 runs: 336 ok, 11 with operation errors, 0 failed, 6 skipped), commit `fc0dc39b5653`, summary digest `aaaad406e27486af`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-21-run2` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `46efd6447c6d`, summary digest `95813d0d095ed976`. Mean over repetitions; `cv` is the coefficient of variation.
 
 KV-cache scenario, reuse rate (fraction of needed blocks served from the cache) by configured capacity.
 
 | System | 16 MB | 64 MB | 256 MB | 1 GB | 4 GB |
 |---|---|---|---|---|---|
-| arenakv (TCP) | 0.193 (cv 1.4%) | 0.441 (cv 0.3%) | 0.660 (cv 0.2%) | 0.836 (cv 0.1%) | 0.902 (cv 0.0%) |
-| Valkey | 0.037 (cv 1.6%) | 0.115 (cv 2.6%) | 0.307 (cv 0.4%) | 0.795 (cv 0.7%) | 0.902 (cv 0.0%) |
-| Dragonfly | n/a | n/a | 0.407 (cv 2.1%) | 0.695 (cv 0.7%) | 0.902 (cv 0.0%) |
-| Dragonfly (eviction flag raised) | n/a | n/a | 0.438 (cv 0.4%) | 0.614 (cv 1.5%) | 0.901 (cv 0.1%) |
-| memcached | 0.355 (cv 0.3%) | 0.502 (cv 0.5%) | 0.665 (cv 0.1%) | 0.847 (cv 0.0%) | 0.903 (cv 0.0%) |
+| arenakv (TCP) | 0.186 (cv 1.2%) | 0.437 (cv 0.4%) | 0.652 (cv 0.4%) | 0.830 (cv 0.1%) | 0.903 (cv 0.0%) |
+| Valkey | 0.036 (cv 4.6%) | 0.116 (cv 2.1%) | 0.308 (cv 0.7%) | 0.791 (cv 0.3%) | 0.902 (cv 0.0%) |
+| Dragonfly | n/a | n/a | 0.411 (cv 1.3%) | 0.690 (cv 0.6%) | 0.902 (cv 0.0%) |
+| Dragonfly (eviction flag raised) | n/a | n/a | 0.435 (cv 0.8%) | 0.604 (cv 0.7%) | 0.902 (cv 0.0%) |
+| memcached | 0.354 (cv 0.8%) | 0.500 (cv 0.2%) | 0.665 (cv 0.2%) | 0.846 (cv 0.1%) | 0.903 (cv 0.0%) |
 <!-- END GENERATED:capacity-reuse -->
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="benchmarks/figures/concurrency-dark.svg">
+  <img alt="Line charts of throughput by pipeline depth and by connection count, and p99 latency by connection count" src="benchmarks/figures/concurrency.svg">
+</picture>
 
 Findings:
 
-- Over TCP, memcached has the highest throughput in most rows and the lowest server CPU time per operation
-  [C1] [C4]. At four server CPUs arenakv is faster than Valkey and Dragonfly [C2]; at one CPU it is slower than all
-  three on small values [C3].
+- arenakv serving the memcached text protocol has the highest throughput in every matrix row and the lowest server
+  CPU time per operation [C1] [C4]; at one server CPU it is faster than memcached itself in all three workloads
+  [C3]. Its native protocol over TCP is faster than Valkey and Dragonfly at four server CPUs [C2].
+- With pipelined requests arenakv over the memcached protocol leads at depth 32; the native protocol and Valkey scale
+  by a factor of 9 to 12 from depth 1 to 32, Dragonfly and memcached by about 6 [C24] [C25]. With 1024 connections
+  arenakv over the memcached protocol keeps its throughput and has the lowest p99 latency [C26] [C27].
 - In the KV-cache workload arenakv reuses more cached blocks than Valkey at small capacities [C11]; memcached is at
   least as good [C12]. Dragonfly's default eviction settings rejected most requests at 256 MB and 1 GB [C14].
-- arenakv uses far more resident memory than the others for small values, because its hash index is sized from the
-  configured capacity [C16]. This is a design weakness, not a measurement artifact.
-- Under open-loop load arenakv saturates earlier than the other three [C7]. Measuring latency from the intended
-  send time exposes backlogs that service-time measurements hide [C9].
+- With 64-byte values arenakv has the smallest resident memory of the four servers, because its hash index starts
+  small and grows with the data [C16].
+- Under open-loop load arenakv sustains a higher rate than Valkey and Dragonfly and a lower one than memcached [C7].
+  Measuring latency from the intended send time exposes backlogs that service-time measurements hide [C9].
 - Soft-RoCE results describe software behavior only [C6] [C19] [C20].
 
 ## Quick start

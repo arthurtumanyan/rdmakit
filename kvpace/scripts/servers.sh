@@ -7,8 +7,10 @@
 #   servers.sh pid SERVER                    print the host PID of the server process
 #
 # SERVER is one of: valkey, dragonfly, memcached (containers on the host network, persistence off),
-# kvstore, kvstore-rdma (native arenakvd under taskset; kvstore-rdma listens on RDMA_ADDR). The ids "kvstore" and
-# "kvstore-rdma" name arenakv in the benchmark data (its name during development).
+# kvstore, kvstore-rdma, kvstore-mc (native arenakvd under taskset with one worker per CPU of CPUSET; kvstore-rdma
+# listens on RDMA_ADDR; kvstore-mc serves the memcached text protocol on PORT and the native protocol on PORT + 1).
+# The ids "kvstore", "kvstore-rdma" and "kvstore-mc" name arenakv in the benchmark data (its name during
+# development).
 #
 # Environment:
 #   CAPACITY     cache size limit with eviction, for example 256mb or 4gb. Unset: 8 GiB limit.
@@ -69,16 +71,20 @@ start)
         docker run -d --rm --name pace-memcached --network host --cpuset-cpus "$cpus" memcached:latest \
             memcached -p "$port" -t "$ncpu" -m "$cap_mb" ${EXTRA_ARGS:-} >/dev/null
         ;;
-    kvstore | kvstore-rdma)
+    kvstore | kvstore-rdma | kvstore-mc)
         bin="$here/../../arenakv/build/$(uname -m)/arenakvd"
+        listen="--port $port"
         if [ "$name" = kvstore-rdma ]; then
             transport="rdma --addr ${RDMA_ADDR:?set RDMA_ADDR to the address of the RDMA interface}"
         else
             transport=tcp
         fi
+        if [ "$name" = kvstore-mc ]; then
+            listen="--port $((port + 1)) --memcached-port $port"
+        fi
         # shellcheck disable=SC2086
-        taskset -c "$cpus" "$bin" --transport $transport --port "$port" --capacity "${cap_mb}M" ${EXTRA_ARGS:-} \
-            >"/tmp/pace-$name.log" 2>&1 &
+        taskset -c "$cpus" "$bin" --transport $transport $listen --threads "$ncpu" --capacity "${cap_mb}M" \
+            ${EXTRA_ARGS:-} >"/tmp/pace-$name.log" 2>&1 &
         echo $! >"/tmp/pace-$name.pid"
         ;;
     *)
@@ -91,7 +97,7 @@ stop)
     stop_one "$name"
     ;;
 stop-all)
-    for n in valkey dragonfly memcached kvstore kvstore-rdma; do
+    for n in valkey dragonfly memcached kvstore kvstore-rdma kvstore-mc; do
         stop_one "$n"
     done
     ;;
@@ -100,7 +106,7 @@ pid)
     valkey) comm=valkey-server ;;
     dragonfly) comm=dragonfly ;;
     memcached) comm=memcached ;;
-    kvstore | kvstore-rdma)
+    kvstore | kvstore-rdma | kvstore-mc)
         cat "/tmp/pace-$name.pid"
         exit 0
         ;;

@@ -1,14 +1,14 @@
-Data: `benchmarks/data/2026-10-20-run1` (353 runs: 336 ok, 11 with operation errors, 0 failed, 6 skipped), commit `fc0dc39b5653`, summary digest `aaaad406e27486af`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-21-run2` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `46efd6447c6d`, summary digest `95813d0d095ed976`. Mean over repetitions; `cv` is the coefficient of variation.
 
 p99 round-trip time in microseconds. Loopback on one host.
 
 | Message bytes | TCP | Soft-RoCE, polling | Soft-RoCE, event-driven |
 |---|---|---|---|
-| 64 | 45.7 (cv 55.8%) | 9.4 (cv 11.3%) | 13.9 (cv 11.9%) |
-| 256 | 14.3 (cv 37.4%) | 9.1 (cv 21.3%) | 14.1 (cv 7.6%) |
-| 1024 | 15.5 (cv 21.0%) | 9.1 (cv 12.8%) | 14.8 (cv 38.9%) |
-| 4096 | 18.1 (cv 32.0%) | 14.5 (cv 9.1%) | 20.5 (cv 20.6%) |
-| 16384 | 19.8 (cv 28.7%) | 38.9 (cv 13.1%) | 45.5 (cv 13.8%) |
-| 65536 | 49.7 (cv 73.9%) | 153.2 (cv 16.5%) | 161.1 (cv 13.3%) |
-| 262144 | 76.6 (cv 34.2%) | 566.4 (cv 11.1%) | 668.3 (cv 13.0%) |
-| 1048576 | 356.1 (cv 45.5%) | 2,377.1 (cv 15.5%) | 2,827.6 (cv 2.2%) |
+| 64 | 22.5 (cv 39.0%) | 9.3 (cv 9.8%) | 13.1 (cv 10.4%) |
+| 256 | 9.3 (cv 2.2%) | 8.5 (cv 4.8%) | 12.6 (cv 7.5%) |
+| 1024 | 11.6 (cv 34.8%) | 8.7 (cv 5.7%) | 13.6 (cv 12.3%) |
+| 4096 | 12.8 (cv 38.5%) | 13.7 (cv 6.3%) | 18.8 (cv 3.9%) |
+| 16384 | 39.3 (cv 81.1%) | 37.1 (cv 9.2%) | 46.5 (cv 5.2%) |
+| 65536 | 64.1 (cv 55.9%) | 124.6 (cv 6.9%) | 146.5 (cv 11.8%) |
+| 262144 | 80.9 (cv 29.9%) | 485.3 (cv 2.0%) | 664.7 (cv 5.9%) |
+| 1048576 | 259.1 (cv 49.5%) | 2,215.1 (cv 14.1%) | 2,649.9 (cv 10.7%) |

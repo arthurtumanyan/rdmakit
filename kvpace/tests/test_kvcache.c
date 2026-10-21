@@ -3,13 +3,15 @@
  *
  * Verifies the request structure (hits up to the first miss, PUTs of the missing tail), hit rates with
  * ample and with tiny capacity, determinism for equal seeds, key sharing between conversations of one
- * group, key separation between groups and seeds, and detection of corrupted content.
+ * group, key separation between groups and seeds, and detection of corrupted content. A run of the
+ * scenario through pace_run() counts block operations as the operations of the result.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "kvcache.h"
+#include "runner.h"
 
 static int failures;
 
@@ -220,6 +222,29 @@ static void test_thread_independence(void) {
     pace_kvcache_destroy(s1);
 }
 
+/* One thread through the runner: the fake cache is not thread-safe. */
+static void test_runner_counts(void) {
+    cache_reset(4096);
+    pace_config cfg;
+    pace_config_default(&cfg);
+    cfg.driver = &fake;
+    cfg.threads = 1;
+    cfg.scenario = PACE_SCENARIO_KVCACHE;
+    cfg.kvcache = test_cfg();
+    cfg.kvcache.block_size = BLOCK;
+    cfg.preload = 0;
+    cfg.warmup_s = 0.05;
+    cfg.duration_s = 0.3;
+    static pace_result res;
+    EXPECT(pace_run(&cfg, &res) == 0, "kvcache run");
+    uint64_t ops = pace_result_ops(&res);
+    EXPECT(res.kvcache.requests > 0 && ops > 0 && ops == res.kvcache.block_gets + res.kvcache.block_puts &&
+               res.gets == res.kvcache.block_gets && res.puts == res.kvcache.block_puts,
+           "operations are block operations (%llu ops, %llu gets, %llu puts, %llu requests)",
+           (unsigned long long)ops, (unsigned long long)res.kvcache.block_gets,
+           (unsigned long long)res.kvcache.block_puts, (unsigned long long)res.kvcache.requests);
+}
+
 int main(void) {
     test_keys();
     test_large_cache();
@@ -227,6 +252,7 @@ int main(void) {
     test_determinism();
     test_corruption();
     test_thread_independence();
+    test_runner_counts();
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

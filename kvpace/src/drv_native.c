@@ -6,11 +6,13 @@
  *   wait        poll | event (default: event)
  *   max-msg     largest message in bytes (default: 65536)
  *   depth       send and receive buffers per connection (default: 8)
+ *   pipeline    requests in flight per connection, set by kvpace from --pipeline: raises depth to
+ *               pipeline + 1 (the client window is depth - 1, see akvclient.h) unless depth was given
  * Operations map to AKVP_PUT, AKVP_GET, AKVP_DEL, AKVP_INCRS (counters are created at 0) and AKVP_MGET; a
  * missing key is PACE_NOTFOUND. Transport errors and unexpected statuses map to PACE_ERR. Credentials
  * (driver.h) are sent with AKVP_AUTH after connecting. The asynchronous interface posts requests with
- * akvc_post() within the client's window and takes responses with akvc_next(..., 0); the endpoint's
- * rdmaduct descriptor drives the event loop.
+ * akvc_post() within the client's window, sends the staged requests with akvc_push() in io(), and takes
+ * responses with akvc_next(..., 0); the endpoint's rdmaduct descriptor drives the event loop.
  */
 #include <errno.h>
 #include <stdio.h>
@@ -23,6 +25,7 @@
 
 static struct duct_opts g_opts;
 static int g_opts_init;
+static int g_depth_given; /* depth set explicitly: pipeline does not change it */
 
 static void opts_init(void) {
     if (!g_opts_init) {
@@ -68,6 +71,15 @@ static int native_set_option(const char *key, const char *value) {
             return -1;
         }
         g_opts.recv_depth = g_opts.send_depth = (uint32_t)v;
+        g_depth_given = 1;
+    } else if (strcmp(key, "pipeline") == 0) {
+        long v = strtol(value, NULL, 10);
+        if (v < 1 || v > 4095) {
+            return -1;
+        }
+        if (!g_depth_given && (uint32_t)v + 1 > g_opts.send_depth) {
+            g_opts.recv_depth = g_opts.send_depth = (uint32_t)v + 1;
+        }
     } else {
         return -1;
     }
@@ -237,8 +249,7 @@ static int anative_submit(pace_aconn *a, const pace_req *r) {
 }
 
 static int anative_io(pace_aconn *a) {
-    (void)a;
-    return PACE_OK; /* requests are sent by akvc_post; responses are taken by next() */
+    return akvc_push(a->conn.c) == 0 ? PACE_OK : PACE_ERR; /* responses are taken by next() */
 }
 
 static int anative_next(pace_aconn *a, pace_reply *out) {

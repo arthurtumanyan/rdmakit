@@ -1,11 +1,11 @@
-Data: `benchmarks/data/2026-10-20-run1` (353 runs: 336 ok, 11 with operation errors, 0 failed, 6 skipped), commit `fc0dc39b5653`, summary digest `aaaad406e27486af`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-21-run2` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `46efd6447c6d`, summary digest `95813d0d095ed976`. Mean over repetitions; `cv` is the coefficient of variation.
 
 KV-cache scenario, requests per second by configured capacity.
 
 | System | 16 MB | 64 MB | 256 MB | 1 GB | 4 GB |
 |---|---|---|---|---|---|
-| arenakv (TCP) | 1,794 (cv 2.0%) | 1,625 (cv 2.5%) | 1,627 (cv 0.0%) | 1,613 (cv 0.3%) | 1,583 (cv 0.4%) |
-| Valkey | 1,936 (cv 0.5%) | 1,798 (cv 0.5%) | 1,721 (cv 1.2%) | 1,636 (cv 2.0%) | 1,587 (cv 0.6%) |
-| Dragonfly | n/a | n/a | 171 (cv 3.5%) | 540 (cv 3.2%) | 1,654 (cv 0.3%) |
-| Dragonfly (eviction flag raised) | n/a | n/a | 1,552 (cv 6.2%) | 1,551 (cv 3.7%) | 1,568 (cv 6.5%) |
-| memcached | 1,966 (cv 1.7%) | 1,809 (cv 4.1%) | 1,827 (cv 1.3%) | 1,835 (cv 0.7%) | 1,749 (cv 0.2%) |
+| arenakv (TCP) | 2,020 (cv 0.7%) | 1,787 (cv 0.8%) | 1,755 (cv 1.1%) | 1,760 (cv 0.1%) | 1,737 (cv 0.6%) |
+| Valkey | 1,930 (cv 0.3%) | 1,805 (cv 0.4%) | 1,734 (cv 0.3%) | 1,660 (cv 0.8%) | 1,609 (cv 0.2%) |
+| Dragonfly | n/a | n/a | 174 (cv 1.3%) | 529 (cv 1.6%) | 1,598 (cv 0.4%) |
+| Dragonfly (eviction flag raised) | n/a | n/a | 1,630 (cv 0.2%) | 1,617 (cv 1.0%) | 1,517 (cv 2.2%) |
+| memcached | 1,998 (cv 0.5%) | 1,864 (cv 1.1%) | 1,847 (cv 1.5%) | 1,837 (cv 1.4%) | 1,753 (cv 0.2%) |

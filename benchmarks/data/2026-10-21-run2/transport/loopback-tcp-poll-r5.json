@@ -1,0 +1,10 @@
+{"tool": "duct_bench", "transport": "tcp", "wait": "poll", "pingpong_max": 5000, "stream_max": 20000, "results": [
+  {"size": 64, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 8.71, "p50": 7.92, "p99": 17.26, "p999": 25.80, "min": 7.68, "max": 254.90}, "pingpong_mb_s": 14.65, "stream_msgs_per_s": 4973589, "stream_mb_s": 318.31},
+  {"size": 256, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 7.87, "p50": 7.78, "p99": 9.12, "p999": 10.25, "min": 7.62, "max": 14.13}, "pingpong_mb_s": 64.88, "stream_msgs_per_s": 4073027, "stream_mb_s": 1042.69},
+  {"size": 1024, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 8.16, "p50": 8.02, "p99": 9.49, "p999": 10.56, "min": 7.80, "max": 21.40}, "pingpong_mb_s": 250.49, "stream_msgs_per_s": 3398942, "stream_mb_s": 3480.52},
+  {"size": 4096, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 9.28, "p50": 9.08, "p99": 10.51, "p999": 12.04, "min": 8.39, "max": 14.18}, "pingpong_mb_s": 881.45, "stream_msgs_per_s": 1994997, "stream_mb_s": 8171.51},
+  {"size": 16384, "pingpong_count": 4096, "stream_count": 16384, "rtt_us": {"mean": 18.69, "p50": 15.47, "p99": 41.34, "p999": 105.74, "min": 11.33, "max": 120.37}, "pingpong_mb_s": 1751.11, "stream_msgs_per_s": 546158, "stream_mb_s": 8948.25},
+  {"size": 65536, "pingpong_count": 1024, "stream_count": 4096, "rtt_us": {"mean": 22.91, "p50": 22.84, "p99": 24.66, "p999": 25.36, "min": 21.89, "max": 27.63}, "pingpong_mb_s": 5717.82, "stream_msgs_per_s": 167101, "stream_mb_s": 10951.12},
+  {"size": 262144, "pingpong_count": 256, "stream_count": 1024, "rtt_us": {"mean": 50.55, "p50": 50.63, "p99": 53.25, "p999": 53.61, "min": 45.86, "max": 53.61}, "pingpong_mb_s": 10367.50, "stream_msgs_per_s": 24133, "stream_mb_s": 6326.33},
+  {"size": 1048576, "pingpong_count": 200, "stream_count": 256, "rtt_us": {"mean": 183.98, "p50": 184.17, "p99": 191.10, "p999": 200.05, "min": 177.96, "max": 200.05}, "pingpong_mb_s": 11396.69, "stream_msgs_per_s": 8083, "stream_mb_s": 8475.70}
+]}

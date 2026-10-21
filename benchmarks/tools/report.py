@@ -12,7 +12,8 @@ With --update-docs the generated tables are inserted into every Markdown file of
 `<!-- BEGIN GENERATED:name -->` and `<!-- END GENERATED:name -->` markers.
 
 Chart conventions: one hue per system in fixed order (blue, orange, aqua, yellow; validated for color-vision
-separation), the Soft-RoCE variant of the store is the same blue with a hatch, bars show the mean over
+separation), the Soft-RoCE variant of the store is the same blue with a diagonal hatch and the memcached-protocol
+variant the same blue with a dotted hatch (dashed lines with hollow markers in line charts), bars show the mean over
 repetitions with a whisker from the minimum to the maximum repetition, values are written at bar tips, the
 legend is always present, grid lines are hairlines.
 """
@@ -43,11 +44,17 @@ THEMES = {
 }
 
 # Fixed entity -> slot mapping (color follows the entity, never its rank).
-SYSTEM_SLOT = {"kvstore": 0, "valkey": 1, "dragonfly": 2, "memcached": 3, "kvstore-rdma": 0, "dragonfly-evict": 2}
+SYSTEM_SLOT = {"kvstore": 0, "valkey": 1, "dragonfly": 2, "memcached": 3, "kvstore-rdma": 0, "kvstore-mc": 0,
+               "dragonfly-evict": 2}
 SYSTEM_LABEL = {"kvstore": "arenakv (TCP)", "valkey": "Valkey", "dragonfly": "Dragonfly", "memcached": "memcached",
-                "kvstore-rdma": "arenakv (Soft-RoCE)", "dragonfly-evict": "Dragonfly (eviction flag raised)"}
-BAR_ORDER = ["kvstore", "kvstore-rdma", "valkey", "dragonfly", "memcached"]
+                "kvstore-rdma": "arenakv (Soft-RoCE)", "kvstore-mc": "arenakv (memcached protocol)",
+                "dragonfly-evict": "Dragonfly (eviction flag raised)"}
+HATCH = {"kvstore-rdma": "////", "kvstore-mc": "...."}
+# Variants drawn dashed with hollow markers in line charts.
+VARIANT = {"kvstore-mc", "dragonfly-evict"}
+BAR_ORDER = ["kvstore", "kvstore-rdma", "kvstore-mc", "valkey", "dragonfly", "memcached"]
 LINE_ORDER = ["kvstore", "valkey", "dragonfly", "memcached"]
+LOOP_ORDER = ["kvstore", "kvstore-mc", "valkey", "dragonfly", "memcached"]
 CAPACITY_ORDER = ["kvstore", "valkey", "dragonfly", "dragonfly-evict", "memcached"]
 WORKLOAD_TITLE = {"small": "64-byte values", "block": "16 KiB values", "kvcache": "KV-cache requests"}
 TRANSPORT_SLOT = {"rdma-poll": 0, "tcp-poll": 1, "rdma-event": 2}
@@ -86,7 +93,7 @@ def plain_axis(ax, axis="y", sizes=None):
     ax_.set_minor_formatter(matplotlib.ticker.NullFormatter())
 
 
-END_LABEL = {"dragonfly-evict": "Dragonfly (flag raised)"}
+END_LABEL = {"dragonfly-evict": "Dragonfly (flag raised)", "kvstore-mc": "arenakv (mc protocol)"}
 
 
 def end_labels(ax, theme, items):
@@ -145,14 +152,14 @@ def get(summary, section, key, metric):
 
 
 def bar_panel(ax, theme, series, values, ylabel, title, log=False):
-    """series: list of (system, hatch); values: list of stats dicts or None."""
+    """series: list of (system, hatch pattern or None); values: list of stats dicts or None."""
     t = THEMES[theme]
     n = len(series)
     for i, ((system, hatch), st) in enumerate(zip(series, values)):
         if st is None:
             continue
         color = t["series"][SYSTEM_SLOT[system]]
-        ax.bar(i, st["mean"], width=0.46, color=color, hatch="////" if hatch else None, edgecolor=t["surface"],
+        ax.bar(i, st["mean"], width=0.46, color=color, hatch=hatch, edgecolor=t["surface"],
                linewidth=0, zorder=3)
         ax.vlines(i, st["min"], st["max"], color=t["text2"], linewidth=1.0, zorder=4)
         ax.text(i, st["max"], compact(st["mean"]), ha="center", va="bottom", fontsize=6.5, color=t["text"],
@@ -173,7 +180,7 @@ def system_legend(fig, theme, entries, loc_y=0.0):
     t = THEMES[theme]
     handles = []
     for system, hatch in entries:
-        handles.append(Patch(facecolor=t["series"][SYSTEM_SLOT[system]], hatch="////" if hatch else None,
+        handles.append(Patch(facecolor=t["series"][SYSTEM_SLOT[system]], hatch=hatch,
                              edgecolor=t["surface"], linewidth=0, label=SYSTEM_LABEL[system]))
     fig.legend(handles=handles, loc="lower center", ncol=len(handles), bbox_to_anchor=(0.5, loc_y))
 
@@ -181,7 +188,7 @@ def system_legend(fig, theme, entries, loc_y=0.0):
 def fig_matrix(summary, theme, path, digest, metric, ylabel, title, subtitle):
     t = style(theme)
     fig, axes = plt.subplots(2, 3, figsize=(10.5, 6.2), gridspec_kw={"hspace": 0.38, "wspace": 0.32})
-    series = [(s, s == "kvstore-rdma") for s in BAR_ORDER]
+    series = [(s, HATCH.get(s)) for s in BAR_ORDER]
     for r, cpus in enumerate((1, 4)):
         for c, wl in enumerate(("small", "block", "kvcache")):
             vals = [get(summary, "matrix", "%s|%d|%s" % (s, cpus, wl), metric) for s, _ in series]
@@ -191,7 +198,7 @@ def fig_matrix(summary, theme, path, digest, metric, ylabel, title, subtitle):
             bar_panel(axes[r][c], theme, series, vals, unit if c == 0 else "",
                       "%d server CPU%s, %s" % (cpus, "" if cpus == 1 else "s", WORKLOAD_TITLE[wl]))
     system_legend(fig, theme, series, 0.0)
-    fig.subplots_adjust(top=0.86, bottom=0.1, left=0.07, right=0.99)
+    fig.subplots_adjust(top=0.86, bottom=0.11, left=0.07, right=0.99)
     finish(fig, path, theme, digest, title, subtitle)
 
 
@@ -437,6 +444,67 @@ def fig_engine(summary, theme, path, digest):
            "Points and bars: mean of repetitions; whiskers: minimum to maximum. Hash: consecutive calls are data-dependent (latency bound).")
 
 
+def line_series(ax, theme, system, xs, stats_list):
+    """One system's line with min-max whiskers; variants are dashed with hollow markers."""
+    t = THEMES[theme]
+    pts = [(x, st) for x, st in zip(xs, stats_list) if st]
+    if not pts:
+        return
+    color = t["series"][SYSTEM_SLOT[system]]
+    variant = system in VARIANT
+    ax.errorbar([x for x, _ in pts], [st["mean"] for _, st in pts],
+                yerr=[[max(0.0, st["mean"] - st["min"]) for _, st in pts], [max(0.0, st["max"] - st["mean"]) for _, st in pts]],
+                color=color, linewidth=2, linestyle=(0, (4, 2)) if variant else "-", marker="o", markersize=5,
+                markerfacecolor=t["surface"] if variant else color, markeredgecolor=color if variant else t["surface"],
+                markeredgewidth=1.5, ecolor=color, elinewidth=1, capsize=0, zorder=3)
+
+
+def line_legend(fig, theme, systems):
+    t = THEMES[theme]
+    handles = [Line2D([0], [0], color=t["series"][SYSTEM_SLOT[s]], linewidth=2,
+                      linestyle=(0, (4, 2)) if s in VARIANT else "-", marker="o", markersize=5,
+                      markerfacecolor=t["surface"] if s in VARIANT else t["series"][SYSTEM_SLOT[s]],
+                      markeredgecolor=t["series"][SYSTEM_SLOT[s]] if s in VARIANT else t["surface"],
+                      label=SYSTEM_LABEL[s]) for s in systems]
+    if handles:
+        fig.legend(handles=handles, loc="lower center", ncol=len(handles), bbox_to_anchor=(0.5, 0.0))
+
+
+def fig_concurrency(summary, theme, path, digest):
+    """Throughput versus pipeline depth and versus connection count, p99 versus connection count."""
+    t = style(theme)
+    fig, axes = plt.subplots(1, 3, figsize=(10.5, 4.3), gridspec_kw={"wspace": 0.3})
+    depths = sorted({int(k.split("|")[1]) for k in summary["pipeline"]})
+    conns = sorted({int(k.split("|")[1]) for k in summary["connections"]})
+    panels = ((axes[0], "pipeline", depths, "throughput", "operations / s", "requests in flight per connection",
+               "16 connections, pipelined", False),
+              (axes[1], "connections", conns, "throughput", "operations / s", "connections", "no pipelining", False),
+              (axes[2], "connections", conns, "p99_us", "GET p99 latency (us)", "connections", "no pipelining", True))
+    for ax, section, xs, metric, ylabel, xlabel, title, log in panels:
+        for system in LOOP_ORDER:
+            line_series(ax, theme, system, xs, [get(summary, section, "%s|%d" % (system, x), metric) for x in xs])
+        if xs:
+            ax.set_xscale("log", base=2)
+            ax.set_xticks(xs)
+            ax.set_xticklabels([str(x) for x in xs])
+            ax.minorticks_off()
+        if log and xs:
+            ax.set_yscale("log")
+            plain_axis(ax, "y")
+        else:
+            ax.set_ylim(0, None)
+            ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: compact(v)))
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, loc="left", color=t["text"])
+        ax.grid(True, zorder=0)
+        ax.spines["left"].set_visible(False)
+        ax.tick_params(length=0)
+    line_legend(fig, theme, [s for s in LOOP_ORDER if any(k.startswith(s + "|") for k in summary["connections"])])
+    fig.subplots_adjust(top=0.82, bottom=0.22, left=0.07, right=0.99)
+    finish(fig, path, theme, digest, "Pipelining and connection count, one server CPU, 64-byte values",
+           "Closed loop, 4 client threads, 90% GET. Points: mean of repetitions; whiskers: minimum to maximum.")
+
 # ---- tables ---------------------------------------------------------------------------------------------
 
 def fmt_stat(st, digits=0, unit=""):
@@ -565,18 +633,41 @@ def tables(summary, digest):
         rows.append(["Key hash, %s-byte key" % k.split("|")[1], fmt_stat(summary["engine"]["micro"][k]["ns_per_hash"], 2, " ns")])
     out["engine-micro"] = pv + "\n" + md_table(["Measurement", "Result"], rows)
 
+    for section, xname, xlabel, text in (
+            ("pipeline", "Depth", "requests in flight per connection",
+             "Closed loop, one server CPU, 64-byte values, 90% GET, 16 connections from 4 client threads, with the given number of requests in flight per connection."),
+            ("connections", "Connections", "connections",
+             "Closed loop, one server CPU, 64-byte values, 90% GET, connections spread over 4 client threads, one request in flight per connection.")):
+        xs = sorted({int(k.split("|")[1]) for k in summary[section]})
+        rows = []
+        for sname in LOOP_ORDER:
+            for x in xs:
+                k = "%s|%d" % (sname, x)
+                if k in summary[section]:
+                    rows.append([SYSTEM_LABEL[sname], "{:,}".format(x), fmt_stat(get(summary, section, k, "throughput"), 0),
+                                 fmt_stat(get(summary, section, k, "p50_us"), 0), fmt_stat(get(summary, section, k, "p99_us"), 0),
+                                 fmt_stat(get(summary, section, k, "server_cpu_us_per_op"), 2),
+                                 fmt_stat(get(summary, section, k, "server_rss_mib"), 0)])
+        out[section] = pv + "\n" + text + " Latencies are GET latencies in microseconds.\n\n" + md_table(
+            ["System", xname, "ops/s", "p50", "p99", "Server CPU µs/op", "Server RSS MiB"], rows)
+
     rows = []
-    for conns in (1, 16):
-        # The raw data identifies kvpace by its development name "kvbench".
-        kb = summary["validation"].get("kvbench|%d" % conns)
-        mt = summary["validation"].get("memtier|%d" % conns)
-        if kb and mt:
-            rows.append([conns, fmt_stat(kb["throughput"], 0), fmt_stat(mt["throughput"], 0),
-                         "%.2f" % (kb["throughput"]["mean"] / mt["throughput"]["mean"]),
-                         fmt_stat(kb["p50_us"], 1), fmt_stat(mt["p50_us"], 1),
-                         fmt_stat(kb["p99_us"], 0), fmt_stat(mt["p99_us"], 0)])
-    out["validation"] = pv + "\nValkey on one CPU, 64-byte values, 90% GET. Latencies are GET latencies in microseconds; memtier reports milliseconds with three decimals.\n\n" + md_table(
-        ["Connections", "kvpace ops/s", "memtier ops/s", "Ratio", "kvpace p50", "memtier p50", "kvpace p99", "memtier p99"], rows)
+    vlabel = {"valkey": "Valkey (RESP)", "kvstore-mc": "arenakv (memcached protocol)"}
+    for server in ("valkey", "kvstore-mc"):
+        for conns in (1, 16):
+            mt = summary["validation"].get("%s|memtier|%d" % (server, conns))
+            for tool in ("kvpace", "kvpace-threads"):
+                kb = summary["validation"].get("%s|%s|%d" % (server, tool, conns))
+                if not (kb and mt):
+                    continue
+                desc = "1 thread, 1 connection" if conns == 1 else (
+                    "4 threads x 4 connections" if tool == "kvpace" else "16 threads x 1 connection")
+                rows.append([vlabel[server], conns, desc, fmt_stat(kb["throughput"], 0), fmt_stat(mt["throughput"], 0),
+                             "%.2f" % (kb["throughput"]["mean"] / mt["throughput"]["mean"]),
+                             fmt_stat(kb["p50_us"], 1), fmt_stat(mt["p50_us"], 1),
+                             fmt_stat(kb["p99_us"], 0), fmt_stat(mt["p99_us"], 0)])
+    out["validation"] = pv + "\nOne server CPU, 64-byte values, 90% GET. memtier_benchmark runs `-t 1 -c 1` for one connection and `-t 4 -c 4` for 16. Latencies are GET latencies in microseconds; memtier reports milliseconds with three decimals.\n\n" + md_table(
+        ["Server", "Connections", "kvpace client model", "kvpace ops/s", "memtier ops/s", "Ratio", "kvpace p50", "memtier p50", "kvpace p99", "memtier p99"], rows)
 
     sizes = sorted({int(k.split("|")[2]) for k in summary["transport"]})
     for metric, digits, name, text in (("rtt_p50_us", 1, "transport-rtt", "Median round-trip time in microseconds (ping-pong, one message in flight)."),
@@ -596,11 +687,12 @@ def tables(summary, digest):
 FIGURES = {
     "throughput": lambda s, th, p, d: fig_matrix(s, th, p, d, "throughput", "operations / s",
                                                  "Throughput by system, workload and server CPUs",
-                                                 "Closed loop, 16 connections. Bars: mean of repetitions; whiskers: minimum to maximum. Hatched: arenakv over Soft-RoCE (software RDMA)."),
+                                                 "Closed loop, 16 connections. Bars: mean of repetitions; whiskers: minimum to maximum. Diagonal hatch: arenakv over Soft-RoCE (software RDMA); dotted: arenakv over the memcached protocol."),
     "cpu-per-op": lambda s, th, p, d: fig_matrix(s, th, p, d, "server_cpu_us_per_op", "server CPU (us / op)",
                                                  "Server CPU time per operation",
                                                  "Same runs as the throughput figure. KV-cache panels: per block GET or PUT. Whiskers: minimum to maximum."),
     "sweep": fig_sweep,
+    "concurrency": fig_concurrency,
     "coordinated-omission": fig_coordinated,
     "capacity": fig_capacity,
     "transport": fig_transport,

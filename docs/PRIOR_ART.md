@@ -93,11 +93,11 @@ protocol whose transport can be RDMA; it offers expiry, CAS, conditional stores,
 snapshots. The measurements in `benchmarks/` compare it with Valkey, Dragonfly and memcached on the
 same machine.
 
-What the measurements show so far (data and caveats in `benchmarks/README.md`; taken with the previous server
-version, before the event-loop server and the growing index): over TCP on the measured machine the
-store is in the same range as the three established servers. At four server CPUs it is faster than Valkey and Dragonfly
-[C2]; memcached has the highest throughput in most rows [C1]; at one server CPU the store is slower than all three
-on small values [C3]. Its design targets a transport without kernel TCP overhead, and that path has been exercised
+What the measurements show so far (data and caveats in `benchmarks/README.md`): over TCP on the measured machine
+the store serving the memcached protocol has the highest throughput in every row of the matrix [C1] and is faster than
+memcached at one server CPU [C3]; over its native protocol it is faster than Valkey and Dragonfly at four server CPUs
+[C2]. The margins range from 5% (over memcached, KV-cache requests, one CPU) to 59% (over Valkey, 64-byte values,
+four CPUs), measured on one host over loopback. Its design targets a transport without kernel TCP overhead, and that path has been exercised
 only on Soft-RoCE, a software implementation [C6], so no claim about RDMA hardware is made.
 
 What it does not do: replication, server-side clustering, per-user permissions, data structures beyond byte-string

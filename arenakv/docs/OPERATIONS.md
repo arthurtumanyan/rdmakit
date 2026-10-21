@@ -47,8 +47,9 @@ arenakvd --port off --resp-port 6379 --memcached-port 11211 --capacity 8G
 
 ## Threads and connections
 
-- `--threads N` worker threads (default: online CPUs) serve all connections from epoll loops; a connection stays
-  on one worker. Requests of a connection are executed in order and may be pipelined.
+- `--threads N` worker threads (default: the CPUs of the process's affinity mask, so `taskset` and container
+  CPU sets limit it) serve all connections from epoll loops; a connection stays on one worker. Requests of a
+  connection are executed in order and may be pipelined.
 - `--max-conns N` closes connections above the limit right after accepting them (`rejected_connections`).
 - `--idle-timeout SECONDS` closes connections without traffic.
 - RDMA: `--wait event` (default) sleeps on completion events; `--wait poll` spins and only pays off with a core per

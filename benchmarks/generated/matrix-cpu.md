@@ -1,12 +1,12 @@
-Data: `benchmarks/data/2026-10-20-run1` (353 runs: 336 ok, 11 with operation errors, 0 failed, 6 skipped), commit `fc0dc39b5653`, summary digest `aaaad406e27486af`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-21-run2` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `46efd6447c6d`, summary digest `95813d0d095ed976`. Mean over repetitions; `cv` is the coefficient of variation.
 
 Server CPU time per operation in microseconds (KV-cache rows: per block GET or PUT).
 
-| Workload | Server CPUs | arenakv (TCP) | arenakv (Soft-RoCE) | Valkey | Dragonfly | memcached |
-|---|---|---|---|---|---|---|
-| 64-byte values | 1 | 5.91 (cv 1.3%) | 5.26 (cv 2.7%) | 4.95 (cv 1.1%) | 4.96 (cv 1.1%) | 4.52 (cv 0.7%) |
-| 64-byte values | 4 | 6.59 (cv 0.9%) | 11.42 (cv 1.6%) | 7.68 (cv 3.7%) | 7.02 (cv 2.0%) | 5.29 (cv 3.3%) |
-| 16 KiB values | 1 | 7.86 (cv 0.6%) | 10.08 (cv 1.7%) | 7.38 (cv 1.3%) | 7.64 (cv 3.2%) | 7.15 (cv 1.8%) |
-| 16 KiB values | 4 | 8.81 (cv 2.7%) | 12.33 (cv 0.9%) | 11.36 (cv 4.9%) | 9.56 (cv 2.6%) | 7.77 (cv 4.8%) |
-| KV-cache requests | 1 | 8.19 (cv 1.8%) | 10.18 (cv 2.7%) | 7.93 (cv 4.9%) | 7.70 (cv 4.1%) | 7.53 (cv 5.1%) |
-| KV-cache requests | 4 | 9.26 (cv 2.8%) | 12.72 (cv 1.2%) | 11.64 (cv 1.4%) | 12.95 (cv 6.4%) | 8.29 (cv 3.1%) |
+| Workload | Server CPUs | arenakv (TCP) | arenakv (Soft-RoCE) | arenakv (memcached protocol) | Valkey | Dragonfly | memcached |
+|---|---|---|---|---|---|---|---|
+| 64-byte values | 1 | 4.51 (cv 0.4%) | 4.91 (cv 0.8%) | 3.99 (cv 1.1%) | 4.82 (cv 0.5%) | 4.89 (cv 0.6%) | 4.42 (cv 0.7%) |
+| 64-byte values | 4 | 5.31 (cv 0.7%) | 10.04 (cv 2.4%) | 4.69 (cv 0.7%) | 7.48 (cv 1.0%) | 6.91 (cv 1.4%) | 5.13 (cv 1.6%) |
+| 16 KiB values | 1 | 6.95 (cv 1.1%) | 8.91 (cv 2.3%) | 6.48 (cv 2.1%) | 7.11 (cv 0.3%) | 7.42 (cv 0.9%) | 6.90 (cv 0.4%) |
+| 16 KiB values | 4 | 7.75 (cv 1.2%) | 11.50 (cv 0.8%) | 7.09 (cv 1.9%) | 10.77 (cv 1.8%) | 9.39 (cv 2.0%) | 7.50 (cv 1.1%) |
+| KV-cache requests | 1 | 7.10 (cv 0.6%) | 9.37 (cv 0.9%) | 6.71 (cv 1.1%) | 7.53 (cv 0.5%) | 7.40 (cv 0.6%) | 7.07 (cv 1.1%) |
+| KV-cache requests | 4 | 8.37 (cv 1.4%) | 11.93 (cv 0.8%) | 7.87 (cv 1.9%) | 11.34 (cv 0.8%) | 11.74 (cv 5.6%) | 8.03 (cv 1.7%) |

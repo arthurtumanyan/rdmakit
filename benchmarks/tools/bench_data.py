@@ -64,7 +64,11 @@ def _metrics_kv(result):
         "p99_us": lat["p99"] / 1e3,
         "p999_us": lat["p999"] / 1e3,
         "errors": r["errors"],
-        "server_cpu_us_per_op": server.get("cpu_us_per_op"),
+        # KV-cache runs: server CPU per block GET or PUT, computed from the raw counters. kvpace up to commit
+        # 46efd64 (the build of run2) wrote 0 for cpu_us_per_op in this scenario.
+        "server_cpu_us_per_op": (server["cpu_seconds"] * 1e6 / (r["gets"] + r["puts"])
+                                 if kc and "cpu_seconds" in server and r["gets"] + r["puts"]
+                                 else server.get("cpu_us_per_op")),
         "server_rss_mib": server["rss_bytes"] / 1048576 if "rss_bytes" in server else None,
         "service_p99_us": r["service_time_ns"]["p99"] / 1e3,
         "max_lag_ms": r["max_lag_ns"] / 1e6,
@@ -108,8 +112,8 @@ def summarize(run_dir):
             "skipped": [m["params"] | {"reason": m.get("reason", "")} for m in manifest if m["status"] == "skipped"],
         },
         "inputs": {},
-        "matrix": {}, "sweep": {}, "capacity": {}, "engine": {"scale": {}, "micro": {}}, "transport": {},
-        "validation": {},
+        "matrix": {}, "sweep": {}, "pipeline": {}, "connections": {}, "capacity": {},
+        "engine": {"scale": {}, "micro": {}}, "transport": {}, "validation": {},
     }
     usable = [m for m in manifest if m["status"] in ("ok", "errors") and m.get("file")]
     for m in usable:
@@ -124,12 +128,20 @@ def summarize(run_dir):
         summary["matrix"]["%s|%d|%s" % key] = _agg([_metrics_kv(r) for _, r in grp])
     for key, grp in _group(entries("sweep"), lambda e: (e[0]["system"], e[0]["offered"])).items():
         summary["sweep"]["%s|%d" % key] = _agg([_metrics_kv(r) for _, r in grp])
+    for key, grp in _group(entries("pipeline"), lambda e: (e[0]["system"], e[0]["depth"])).items():
+        summary["pipeline"]["%s|%d" % key] = _agg([_metrics_kv(r) for _, r in grp])
+    for key, grp in _group(entries("connections"), lambda e: (e[0]["system"], e[0]["conns"])).items():
+        summary["connections"]["%s|%d" % key] = _agg([_metrics_kv(r) for _, r in grp])
     for key, grp in _group(entries("capacity"), lambda e: (e[0]["system"], e[0]["capacity"])).items():
         summary["capacity"]["%s|%s" % key] = _agg([_metrics_kv(r) for _, r in grp])
 
+    # Validation keys are server|tool|connections. Runs without a server parameter used Valkey; tool "kvbench"
+    # (the development name of kvpace) used one blocking thread per connection, the model now named
+    # "kvpace-threads".
     val = {}
     for params, r in entries("validation"):
-        if params["tool"] == "kvbench":
+        tool = "kvpace-threads" if params["tool"] == "kvbench" else params["tool"]
+        if tool != "memtier":
             m = _metrics_kv(r)
             row = {"throughput": m["throughput"], "p50_us": m["p50_us"], "p99_us": m["p99_us"]}
         else:
@@ -137,9 +149,9 @@ def summarize(run_dir):
             row = {"throughput": r["ALL STATS"]["Totals"]["Ops/sec"],
                    "p50_us": gets["Percentile Latencies"]["p50.00"] * 1e3,
                    "p99_us": gets["Percentile Latencies"]["p99.00"] * 1e3}
-        val.setdefault((params["tool"], params["conns"]), []).append(row)
-    for (tool, conns), rows in sorted(val.items()):
-        summary["validation"]["%s|%d" % (tool, conns)] = _agg(rows)
+        val.setdefault((params.get("server", "valkey"), tool, params["conns"]), []).append(row)
+    for (server, tool, conns), rows in sorted(val.items()):
+        summary["validation"]["%s|%s|%d" % (server, tool, conns)] = _agg(rows)
 
     scale = {}
     micro_match, micro_hash = [], {}

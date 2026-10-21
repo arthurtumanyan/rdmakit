@@ -4,7 +4,11 @@
  * Sockets are non-blocking; all waits use poll() with the caller's deadline.
  *
  * Receive path. A state machine reads frames as far as the socket allows and resumes at the same byte on
- * the next call, so a timeout inside a frame does not corrupt the stream. Data frames are read into
+ * the next call, so a timeout inside a frame does not corrupt the stream. Socket reads go through a
+ * per-endpoint input buffer of IBUF_SIZE bytes, so that one recv() delivers many small pipelined frames;
+ * a payload of at least IBUF_DIRECT bytes is read straight into its destination while the buffer is empty.
+ * Buffered bytes are consumed before the socket is read again, so they need no readiness event: a call
+ * that returns for lack of data has emptied the buffer. Data frames are read into
  * receive slots: 2 * recv_depth buffers of max_msg bytes, allocated on first use. At most recv_depth
  * delivered messages may be held by the application (as on RDMA, where the peer is limited by credits);
  * the other slots buffer frames that arrive while the application waits for a one-sided operation, so
@@ -54,6 +58,10 @@
 #define CTRL_PREFIX 12u
 #define CTRL_MAX_FIXED 44u
 #define CLOSE_FLUSH_MS 1000
+#define IBUF_SIZE 65536u
+#define IBUF_DIRECT 4096u
+/* iovec entries per sendmsg() of a batch: two per frame (header, payload); far below IOV_MAX (1024). */
+#define IOV_BATCH 64u
 
 enum ctrl_type {
     CT_READ_REQ = 1,
@@ -98,6 +106,11 @@ struct tcp_ep {
     uint32_t recv_depth;
     uint32_t send_depth;
     int broken; /* sticky error (negative code) */
+
+    /* input buffer: bytes read from the socket and not yet consumed by the state machine */
+    uint8_t *ib;
+    size_t ib_pos;
+    size_t ib_len;
 
     /* receive state machine */
     enum rx_state rxs;
@@ -234,12 +247,27 @@ static int write_full(int fd, const uint8_t *buf, size_t n, int64_t deadline) {
 }
 
 /*
- * Reads up to n bytes without blocking. Returns the byte count (> 0), 0 when the socket has no data,
- * or a negative error (DUCT_ECLOSED for an orderly or abortive close).
+ * Reads up to n bytes without blocking, from the input buffer first, otherwise from the socket. Returns the
+ * byte count (> 0), 0 when no data is available, or a negative error (DUCT_ECLOSED for an orderly or
+ * abortive close).
  */
 static ssize_t read_some(struct tcp_ep *e, uint8_t *buf, size_t n) {
+    if (e->ib_pos < e->ib_len) {
+        size_t take = e->ib_len - e->ib_pos < n ? e->ib_len - e->ib_pos : n;
+        memcpy(buf, e->ib + e->ib_pos, take);
+        e->ib_pos += take;
+        return (ssize_t)take;
+    }
+    int direct = n >= IBUF_DIRECT;
     for (;;) {
-        ssize_t r = recv(e->fd, buf, n, 0);
+        ssize_t r = recv(e->fd, direct ? buf : e->ib, direct ? n : IBUF_SIZE, 0);
+        if (r > 0 && !direct) {
+            size_t take = (size_t)r < n ? (size_t)r : n;
+            memcpy(buf, e->ib, take);
+            e->ib_pos = take;
+            e->ib_len = (size_t)r;
+            return (ssize_t)take;
+        }
         if (r > 0) {
             return r;
         }
@@ -320,17 +348,18 @@ static int q_flush(struct tcp_ep *e) {
 }
 
 /*
- * Writes a frame made of up to three parts. Parts the socket does not accept immediately are queued, so
- * the frame is always either completely written or completely queued after the call.
+ * Writes the bytes of iov[0..cnt) (cnt at most IOV_BATCH). Bytes the socket does not accept immediately
+ * are queued, so the data is always either written or queued after the call and frames stay whole.
  */
-static int emit(struct tcp_ep *e, const void *p0, size_t n0, const void *p1, size_t n1, const void *p2,
-                size_t n2) {
-    struct iovec iov[3] = {{(void *)p0, n0}, {(void *)p1, n1}, {(void *)p2, n2}};
-    size_t total = n0 + n1 + n2;
+static int emitv(struct tcp_ep *e, struct iovec *iov, int cnt) {
+    size_t total = 0;
+    for (int i = 0; i < cnt; i++) {
+        total += iov[i].iov_len;
+    }
     size_t written = 0;
     if (queued(e) == 0) {
         for (;;) {
-            struct msghdr mh = {.msg_iov = iov, .msg_iovlen = 3};
+            struct msghdr mh = {.msg_iov = iov, .msg_iovlen = (size_t)cnt};
             ssize_t w = sendmsg(e->fd, &mh, MSG_NOSIGNAL);
             if (w >= 0) {
                 written = (size_t)w;
@@ -348,7 +377,7 @@ static int emit(struct tcp_ep *e, const void *p0, size_t n0, const void *p1, siz
     if (written == total) {
         return 0;
     }
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < cnt; i++) {
         size_t n = iov[i].iov_len;
         if (written >= n) {
             written -= n;
@@ -362,6 +391,13 @@ static int emit(struct tcp_ep *e, const void *p0, size_t n0, const void *p1, siz
         written = 0;
     }
     return q_flush(e);
+}
+
+/* Writes a frame made of up to three parts (see emitv). */
+static int emit(struct tcp_ep *e, const void *p0, size_t n0, const void *p1, size_t n1, const void *p2,
+                size_t n2) {
+    struct iovec iov[3] = {{(void *)p0, n0}, {(void *)p1, n1}, {(void *)p2, n2}};
+    return emitv(e, iov, 3);
 }
 
 /* ---- receive slots --------------------------------------------------------------------------------- */
@@ -747,6 +783,7 @@ static void tcp_ep_free(struct tcp_ep *e) {
     free(e->ready);
     free(e->ops);
     free(e->q);
+    free(e->ib);
     free(e);
 }
 
@@ -785,9 +822,40 @@ static int tcp_send(duct_ep *base, const void *data, size_t len, int timeout_ms)
     return emit(e, h, sizeof(h), data, len, NULL, 0);
 }
 
+/*
+ * Sends the messages in groups of up to IOV_BATCH / 2 frames, each group with one sendmsg(), so that a
+ * batch of small messages costs one system call instead of one per message. Each group waits for send
+ * space like duct_send(); on -ETIMEDOUT the earlier groups have been sent.
+ */
 static int tcp_send_batch(duct_ep *base, const struct duct_msg *msgs, unsigned n, int timeout_ms) {
-    for (unsigned i = 0; i < n; i++) {
-        int rc = tcp_send(base, msgs[i].data, msgs[i].len, timeout_ms);
+    struct tcp_ep *e = (struct tcp_ep *)base;
+    int64_t deadline = duct_deadline(timeout_ms);
+    uint8_t hdr[IOV_BATCH / 2][FRAME_HEADER];
+    struct iovec iov[IOV_BATCH];
+    unsigned i = 0;
+    while (i < n) {
+        if (e->broken != 0) {
+            return e->broken;
+        }
+        int cnt = 0;
+        size_t bytes = 0;
+        unsigned first = i;
+        while (i < n && cnt < (int)IOV_BATCH) {
+            size_t frame = FRAME_HEADER + msgs[i].len;
+            /* a group never needs more than the queue limit, so that wait_send_space can succeed */
+            if (i > first && bytes + frame > e->qlimit) {
+                break;
+            }
+            put_le32(hdr[i - first], (uint32_t)msgs[i].len);
+            iov[cnt++] = (struct iovec){hdr[i - first], FRAME_HEADER};
+            iov[cnt++] = (struct iovec){(void *)msgs[i].data, msgs[i].len};
+            bytes += frame;
+            i++;
+        }
+        int rc = wait_send_space(e, bytes, deadline);
+        if (rc == 0) {
+            rc = emitv(e, iov, cnt);
+        }
         if (rc != 0) {
             return rc;
         }
@@ -1084,9 +1152,10 @@ static int tcp_ep_create(duct_ctx *ctx, int fd, int64_t deadline, duct_ep **out)
     e->slot_state = calloc(e->nslots, sizeof(*e->slot_state));
     e->ready = calloc(e->nslots, sizeof(*e->ready));
     e->ops = calloc(e->send_depth, sizeof(*e->ops));
+    e->ib = malloc(IBUF_SIZE);
     e->epfd = epoll_create1(EPOLL_CLOEXEC);
     if (e->slot_buf == NULL || e->slot_len == NULL || e->slot_state == NULL || e->ready == NULL ||
-        e->ops == NULL || e->epfd < 0) {
+        e->ops == NULL || e->ib == NULL || e->epfd < 0) {
         rc = e->epfd < 0 ? -errno : -ENOMEM;
         tcp_ep_free(e);
         return rc;

@@ -7,18 +7,22 @@ and a manifest of all runs.
     run.py --suite SUITE [--suite SUITE ...] --reps N [--out DIR] [--quick]
 
 Suites:
-    matrix     five systems x {1 CPU, 4 CPUs} x {small, block, kvcache} workloads (closed loop)
+    matrix     six systems x {1 CPU, 4 CPUs} x {small, block, kvcache} workloads (closed loop)
     sweep      open-loop latency versus offered load, one server CPU, small values
+    pipeline   closed loop, 4 threads x 4 connections, pipeline depth 1, 8 and 32, one server CPU, small values
+    connections closed loop, 16 to 1024 connections from 4 threads, one server CPU, small values
     capacity   KV-cache scenario: reuse rate versus configured cache capacity, one server CPU
     engine     in-process engine benchmarks: thread scaling and micro-benchmarks
     transport  rdmaduct ping-pong latency and streaming throughput (loopback)
-    validation kvpace against memtier_benchmark on one Valkey server (checks the load generator)
+    validation kvpace against memtier_benchmark on Valkey (RESP) and on arenakv (memcached text protocol), with
+               the client model of each tool (checks the load generator)
     capacity-evict  capacity suite for Dragonfly with a raised eviction flag (not part of `all`)
     all        every suite above
 
 Repetitions are interleaved: repetition 1 of every configuration runs before repetition 2 of any
 configuration, in a shuffled order, so that slow drift of the machine does not correlate with a
-configuration. Each run starts a fresh server. An existing output directory is extended: env.json is kept and
+configuration. Each run starts a fresh server. The address of the RDMA interface (RDMA_ADDR) is replaced by the
+documentation address 192.0.2.10 (RFC 5737) in every recorded command and result file. An existing output directory is extended: env.json is kept and
 new runs are appended to manifest.json. Output layout:
 
     DIR/env.json            machine, toolchain, software versions, git state
@@ -56,6 +60,8 @@ SYSTEMS = {
     # System ids "kvstore" and "kvstore-rdma" are the identifiers of arenakv in the raw data (its name during development).
     "kvstore": {"driver": "native", "host": "127.0.0.1", "opts": ["--driver-opt", "transport=tcp"], "tcp": True},
     "kvstore-rdma": {"driver": "native", "host": None, "opts": ["--driver-opt", "transport=rdma"], "tcp": False},
+    # arenakv serving the memcached text protocol: the same protocol and driver as the memcached rows.
+    "kvstore-mc": {"driver": "memcached", "host": "127.0.0.1", "opts": [], "tcp": True},
     # Dragonfly with one eviction flag raised: its default (100 evictions per heartbeat) rejects writes with
     # "Out of memory" under sustained 16 KiB writes at the configured capacities (see METHODOLOGY.md).
     "dragonfly-evict": {"driver": "resp", "host": "127.0.0.1", "opts": [], "tcp": True, "server": "dragonfly",
@@ -70,13 +76,20 @@ WORKLOADS = {
                 "--theta", "0.9"],
 }
 
-# arenakv sizes its hash index from the expected mean entry size.
-KVSTORE_AVG_ENTRY = {"small": "128", "block": "16384", "kvcache": "16384"}
+MATRIX_SYSTEMS = ["valkey", "dragonfly", "memcached", "kvstore", "kvstore-rdma", "kvstore-mc"]
+# Event-loop servers compared in the pipeline and connections suites (TCP only).
+LOOP_SYSTEMS = ["valkey", "dragonfly", "memcached", "kvstore", "kvstore-mc"]
+# memcached accepts 1024 connections by default (-c); the connections suite opens up to 1024 plus the preload.
+LOOP_EXTRA = {"memcached": "-c 4096"}
+DOC_ADDR = "192.0.2.10"
 
 
 def relative(text):
-    """text with every occurrence of the repository root prefix removed."""
-    return text.replace(str(ROOT) + "/", "")
+    """text with every occurrence of the repository root prefix removed and the RDMA interface address replaced
+    by the documentation address, so results record neither the checkout location nor the host address."""
+    text = text.replace(str(ROOT) + "/", "")
+    addr = os.environ.get("RDMA_ADDR")
+    return text.replace(addr, DOC_ADDR) if addr else text
 
 
 class Recorder:
@@ -95,8 +108,7 @@ class Recorder:
         return d / name
 
     def add(self, entry):
-        """Appends a manifest entry. Absolute paths below the repository root in the entry's command and in its
-        result file are rewritten relative to the root, so results do not record the checkout location."""
+        """Appends a manifest entry. The entry's command and its result file are rewritten by relative()."""
         entry["command"] = [relative(c) for c in entry.get("command", [])]
         f = self.out / entry["file"] if entry.get("file") else None
         if f is not None and f.exists():
@@ -151,14 +163,12 @@ def server_stop(name):
 
 
 def run_kvpace(rec, suite, name, params, system, cpus, workload_args, extra_args, duration, warmup,
-                capacity=None, threads=16):
+                capacity=None, threads=16, server_extra=None):
     """Starts a server, runs kvpace once, stops the server, records the outcome."""
     out = rec.path(suite, name + ".json")
     sysdef = SYSTEMS[system]
     host = sysdef["host"] or rdma_addr()
-    extra = sysdef.get("extra")
-    if system.startswith("kvstore"):
-        extra = "--avg-entry " + KVSTORE_AVG_ENTRY.get(params.get("workload", "small"), "128")
+    extra = server_extra or sysdef.get("extra")
     started = time.time()
     status, err = "ok", ""
     cmd = []
@@ -205,7 +215,7 @@ def interleave(configs, reps):
 
 def suite_matrix(rec, reps, quick):
     dur, warm = (3, 1) if quick else (8, 3)
-    configs = [(s, n, w) for s in SYSTEMS for n in SERVER_CPUS for w in WORKLOADS]
+    configs = [(s, n, w) for s in MATRIX_SYSTEMS for n in SERVER_CPUS for w in WORKLOADS]
     for rep, (system, n, wl) in interleave(configs, reps):
         run_kvpace(rec, "matrix", "%s-%scpu-%s-r%d" % (system, n, wl, rep),
                     {"system": system, "cpus": int(n), "workload": wl, "rep": rep}, system, SERVER_CPUS[n],
@@ -223,6 +233,32 @@ def suite_sweep(rec, reps, quick):
         run_kvpace(rec, "sweep", "%s-%d-r%d" % (system, rate, rep),
                     {"system": system, "offered": rate, "workload": "small", "cpus": 1, "rep": rep}, system,
                     SERVER_CPUS["1"], WORKLOADS["small"], ["--rate", str(rate), "--arrival", "constant"], dur, warm)
+
+
+def suite_pipeline(rec, reps, quick):
+    """Requests in flight per connection: 16 connections served by 4 client threads, one server CPU."""
+    dur, warm = (3, 1) if quick else (6, 2)
+    depths = [1, 32] if quick else [1, 8, 32]
+    configs = [(s, d) for s in LOOP_SYSTEMS for d in depths]
+    for rep, (system, depth) in interleave(configs, reps):
+        run_kvpace(rec, "pipeline", "%s-p%d-r%d" % (system, depth, rep),
+                    {"system": system, "depth": depth, "conns": 16, "workload": "small", "cpus": 1, "rep": rep},
+                    system, SERVER_CPUS["1"], WORKLOADS["small"],
+                    ["--conns-per-thread", "4", "--pipeline", str(depth)], dur, warm, threads=4,
+                    server_extra=LOOP_EXTRA.get(system))
+
+
+def suite_connections(rec, reps, quick):
+    """Connection count: 4 client threads with 4 to 256 connections each, no pipelining, one server CPU."""
+    dur, warm = (3, 1) if quick else (6, 2)
+    totals = [16, 1024] if quick else [16, 64, 256, 1024]
+    configs = [(s, n) for s in LOOP_SYSTEMS for n in totals]
+    for rep, (system, conns) in interleave(configs, reps):
+        run_kvpace(rec, "connections", "%s-c%d-r%d" % (system, conns, rep),
+                    {"system": system, "conns": conns, "workload": "small", "cpus": 1, "rep": rep},
+                    system, SERVER_CPUS["1"], WORKLOADS["small"],
+                    ["--conns-per-thread", str(conns // 4), "--pipeline", "1"], dur, warm, threads=4,
+                    server_extra=LOOP_EXTRA.get(system))
 
 
 def suite_capacity(rec, reps, quick):
@@ -304,28 +340,33 @@ def suite_transport(rec, reps, quick):
 
 
 MEMTIER_IMAGE = "redislabs/memtier_benchmark:latest"
+# Servers of the validation suite and the protocol memtier_benchmark speaks to each.
+VALIDATION_SERVERS = {"valkey": "redis", "kvstore-mc": "memcache_text"}
 
 
-def memtier_command(rec, conns, out_name=None):
+def memtier_command(rec, server, conns, out_name=None):
     """docker command line for memtier_benchmark with settings equivalent to kvpace's `small` workload."""
     threads, per_thread = (1, 1) if conns == 1 else (4, conns // 4)
     outdir = (rec.out / "validation").resolve()
     outdir.mkdir(exist_ok=True)
-    base = ["docker", "run", "--rm", "--network", "host", "--cpuset-cpus", CLIENT_CPUS, "-v", "%s:/out" % outdir,
-            MEMTIER_IMAGE, "-s", "127.0.0.1", "-p", str(PORT), "--protocol=redis", "-t", str(threads),
-            "-c", str(per_thread), "--data-size=64", "--key-minimum=1", "--key-maximum=100000", "--hide-histogram"]
+    # --user: the result file belongs to the invoking user, so Recorder.add can rewrite it.
+    base = ["docker", "run", "--rm", "--network", "host", "--user", "%d:%d" % (os.getuid(), os.getgid()),
+            "--cpuset-cpus", CLIENT_CPUS, "-v", "%s:/out" % outdir,
+            MEMTIER_IMAGE, "-s", "127.0.0.1", "-p", str(PORT), "--protocol=%s" % VALIDATION_SERVERS[server],
+            "-t", str(threads), "-c", str(per_thread), "--data-size=64", "--key-minimum=1", "--key-maximum=100000",
+            "--hide-histogram"]
     preload = base + ["--key-pattern=P:P", "--ratio=1:0", "-n", "allkeys"]
     measure = base + ["--key-pattern=R:R", "--ratio=1:9", "--test-time=8", "--print-percentiles=50,99,99.9",
                       "--json-out-file=/out/%s.json" % out_name]
     return preload, measure
 
 
-def run_memtier(rec, name, params, conns):
+def run_memtier(rec, name, params, server, conns):
     started = time.time()
     status, err = "ok", ""
-    preload, measure = memtier_command(rec, conns, name)
+    preload, measure = memtier_command(rec, server, conns, name)
     try:
-        server_start("valkey", SERVER_CPUS["1"])
+        server_start(server, SERVER_CPUS["1"])
         subprocess.run(preload, capture_output=True, text=True, timeout=300, check=True)
         p = subprocess.run(measure, capture_output=True, text=True, timeout=120)
         if p.returncode != 0:
@@ -333,7 +374,7 @@ def run_memtier(rec, name, params, conns):
     except Exception as e:  # noqa: BLE001
         status, err = "failed", repr(e)
     finally:
-        server_stop("valkey")
+        server_stop(server)
     if err:
         rec.path("validation", name + ".err").write_text(err)
     rec.add({"suite": "validation", "file": "validation/%s.json" % name, "status": status, "params": params,
@@ -342,24 +383,33 @@ def run_memtier(rec, name, params, conns):
 
 
 def suite_validation(rec, reps, quick):
-    """kvpace against memtier_benchmark on the same server settings; order alternates between repetitions."""
+    """kvpace against memtier_benchmark on the same server settings; order alternates between repetitions.
+
+    With 16 connections kvpace runs twice: with memtier's client model (4 threads x 4 connections, tool
+    "kvpace") and with one blocking thread per connection (tool "kvpace-threads", the model of earlier runs)."""
     dur, warm = (3, 1) if quick else (8, 3)
     for rep in range(1, reps + 1):
-        for conns in (1, 16):
-            order = ["kvpace", "memtier"] if rep % 2 else ["memtier", "kvpace"]
-            for tool in order:
-                name = "%s-%dc-r%d" % (tool, conns, rep)
-                params = {"tool": tool, "conns": conns, "rep": rep}
-                if tool == "kvpace":
-                    run_kvpace(rec, "validation", name, params, "valkey", SERVER_CPUS["1"], WORKLOADS["small"], [],
-                                dur, warm, threads=conns)
-                else:
-                    run_memtier(rec, name, params, conns)
+        for server in VALIDATION_SERVERS:
+            for conns in (1, 16):
+                tools = ["kvpace", "memtier"] if conns == 1 else ["kvpace", "kvpace-threads", "memtier"]
+                order = tools if rep % 2 else tools[::-1]
+                for tool in order:
+                    name = "%s-%s-%dc-r%d" % (server, tool, conns, rep)
+                    params = {"tool": tool, "server": server, "conns": conns, "rep": rep}
+                    if tool == "memtier":
+                        run_memtier(rec, name, params, server, conns)
+                        continue
+                    if tool == "kvpace" and conns > 1:
+                        threads, extra = 4, ["--conns-per-thread", str(conns // 4)]
+                    else:
+                        threads, extra = conns, []
+                    run_kvpace(rec, "validation", name, params, server, SERVER_CPUS["1"], WORKLOADS["small"], extra,
+                                dur, warm, threads=threads)
 
 
-SUITES = {"matrix": suite_matrix, "sweep": suite_sweep, "capacity": suite_capacity, "engine": suite_engine,
-          "transport": suite_transport, "validation": suite_validation,
-          "capacity-evict": suite_capacity_evict}
+SUITES = {"matrix": suite_matrix, "sweep": suite_sweep, "pipeline": suite_pipeline,
+          "connections": suite_connections, "capacity": suite_capacity, "engine": suite_engine,
+          "transport": suite_transport, "validation": suite_validation, "capacity-evict": suite_capacity_evict}
 
 
 def main():

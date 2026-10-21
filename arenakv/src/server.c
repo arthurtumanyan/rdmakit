@@ -8,10 +8,12 @@
  *   saver    periodic snapshots (save_interval_s); background snapshots run on their own thread
  *
  * Native connections (rdmaduct): the worker drains messages with duct_recv(..., 0), executes each
- * request and sends the response with duct_send(..., 0). A response that does not fit (no credit or send
- * space) is queued in conn.pend and the connection stops reading until the queue is empty, so a client
- * that does not read its responses cannot make the server buffer without bound. The connection is
- * armed with duct_ep_arm() before the worker waits.
+ * request into the worker's batch area and sends up to BATCH_MSGS responses with one duct_send_batch(),
+ * so pipelined requests cost one send call per batch instead of one per response (on TCP one sendmsg).
+ * The batch is limited to duct_ep_send_space(); responses that do not fit (no credit or send space) are
+ * queued in conn.pend and the connection stops reading until the queue is empty, so a client that does
+ * not read its responses cannot make the server buffer without bound. The connection is armed with
+ * duct_ep_arm() before the worker waits.
  *
  * Text connections (memcached, RESP): non-blocking sockets (optionally TLS). Input accumulates in
  * conn.in until the protocol module consumes complete commands; replies accumulate in conn.out. Reading
@@ -34,6 +36,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -55,7 +58,9 @@
 #include "srv.h"
 
 #define READ_CHUNK 65536u
-#define BURST 64 /* requests or reads per connection before other connections are served */
+#define BURST 64               /* requests or reads per connection before other connections are served */
+#define BATCH_MSGS 32          /* native responses sent with one duct_send_batch() */
+#define BATCH_BYTES (1u << 20) /* size of the native batch area, at least max_msg */
 
 enum conn_kind {
     CK_NATIVE = 0,
@@ -94,10 +99,12 @@ struct worker {
     int epfd;
     int evfd;
     pthread_mutex_t qlock;
-    struct conn *queue;  /* connections handed over by the accept thread */
-    struct conn *conns;  /* connections served */
-    uint8_t *resp;       /* native response buffer, max_msg bytes */
-    struct conn **ready; /* connections with work left after their turn */
+    struct conn *queue; /* connections handed over by the accept thread */
+    struct conn *conns; /* connections served */
+    uint8_t *resp;      /* native response batch area of resp_cap bytes, responses packed in order */
+    size_t resp_cap;    /* max(BATCH_BYTES, max_msg) */
+    struct duct_msg bmsg[BATCH_MSGS]; /* responses of the current batch, stored in resp */
+    struct conn **ready;              /* connections with work left after their turn */
     size_t nready;
     size_t ready_cap;
 };
@@ -876,6 +883,34 @@ static int native_flush(struct conn *c) {
     return 0;
 }
 
+/*
+ * Sends the responses w->bmsg[0..n), as many as the endpoint accepts now (duct_ep_send_space), and queues
+ * the rest in c->pend in order. Returns 0 (all sent), 1 (some queued), or a negative error.
+ */
+static int native_send_batch(struct worker *w, struct conn *c, unsigned n) {
+    unsigned i = 0;
+    while (i < n) {
+        unsigned space = duct_ep_send_space(c->ep);
+        if (space == 0) {
+            break;
+        }
+        unsigned k = n - i < space ? n - i : space;
+        int rc = duct_send_batch(c->ep, w->bmsg + i, k, 0); /* accepted in full: k <= send space */
+        if (rc != 0) {
+            return rc;
+        }
+        i += k;
+    }
+    for (unsigned j = i; j < n; j++) {
+        uint8_t len4[4];
+        akvp_put32(len4, (uint32_t)w->bmsg[j].len);
+        if (ob_add(&c->pend, len4, 4) != 0 || ob_add(&c->pend, w->bmsg[j].data, w->bmsg[j].len) != 0) {
+            return -ENOMEM;
+        }
+    }
+    return i < n ? 1 : 0;
+}
+
 /* Serves a native connection for one turn. Returns 0 (armed, waiting), 1 (work left), or -1 (closed). */
 static int native_serve(struct worker *w, struct conn *c) {
     akvd *d = w->d;
@@ -892,35 +927,43 @@ static int native_serve(struct worker *w, struct conn *c) {
         }
         int handled = 0;
         while (rc == 0 && handled < BURST) {
-            struct duct_rx rx;
-            int r = duct_recv(c->ep, &rx, 0);
-            if (r == -ETIMEDOUT) {
-                break;
-            }
-            if (r != 0) {
-                conn_free(c);
-                return -1;
-            }
-            c->last_active = mono_s();
-            size_t n = native_handle(d, c, rx.data, rx.len, w->resp, cap);
-            duct_rx_release(c->ep, &rx);
-            if (n == 0) {
-                conn_free(c);
-                return -1;
-            }
-            handled++;
-            int s = ob_pending(&c->pend) > 0 ? -ETIMEDOUT : duct_send(c->ep, w->resp, n, 0);
-            if (s == -ETIMEDOUT) {
-                uint8_t len4[4];
-                akvp_put32(len4, (uint32_t)n);
-                if (ob_add(&c->pend, len4, 4) != 0 || ob_add(&c->pend, w->resp, n) != 0) {
+            unsigned nb = 0;
+            size_t used = 0;
+            int more = 1;
+            /* Execute requests into the batch area until it is full (the next response may need cap
+             * bytes), the burst ends, or no message waits. */
+            while (nb < BATCH_MSGS && handled < BURST && used + cap <= w->resp_cap) {
+                struct duct_rx rx;
+                int r = duct_recv(c->ep, &rx, 0);
+                if (r == -ETIMEDOUT) {
+                    more = 0;
+                    break;
+                }
+                if (r != 0) {
                     conn_free(c);
                     return -1;
                 }
-                rc = 1; /* stop reading until the queue drains */
-            } else if (s != 0) {
-                conn_free(c);
-                return -1;
+                c->last_active = mono_s();
+                uint8_t *out = w->resp + used;
+                size_t n = native_handle(d, c, rx.data, rx.len, out, cap);
+                duct_rx_release(c->ep, &rx);
+                if (n == 0) {
+                    conn_free(c);
+                    return -1;
+                }
+                w->bmsg[nb++] = (struct duct_msg){.data = out, .len = n};
+                used += n;
+                handled++;
+            }
+            if (nb > 0) {
+                rc = native_send_batch(w, c, nb);
+                if (rc < 0) {
+                    conn_free(c);
+                    return -1;
+                }
+            }
+            if (!more) {
+                break;
             }
         }
         if (handled == BURST) {
@@ -1536,7 +1579,11 @@ akvd *akvd_start(const akvd_config *cfg, int *err) {
         d->cfg.send_depth = 16;
     }
     if (d->cfg.threads == 0) {
-        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        /* CPUs the process may run on (taskset, container cpuset), not all online CPUs: more workers than
+         * usable CPUs only add context switches. */
+        cpu_set_t set;
+        long n =
+            sched_getaffinity(0, sizeof(set), &set) == 0 ? CPU_COUNT(&set) : sysconf(_SC_NPROCESSORS_ONLN);
         d->cfg.threads = n > 0 ? (unsigned)n : 1;
     }
     d->nworkers = d->cfg.threads;
@@ -1623,7 +1670,8 @@ akvd *akvd_start(const akvd_config *cfg, int *err) {
         w->epfd = epoll_create1(EPOLL_CLOEXEC);
         w->evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
         pthread_mutex_init(&w->qlock, NULL);
-        w->resp = malloc(d->cfg.max_msg);
+        w->resp_cap = d->cfg.max_msg > BATCH_BYTES ? d->cfg.max_msg : BATCH_BYTES;
+        w->resp = malloc(w->resp_cap);
         struct epoll_event ev = {.events = EPOLLIN, .data.ptr = NULL};
         if (w->epfd < 0 || w->evfd < 0 || w->resp == NULL ||
             epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->evfd, &ev) != 0) {

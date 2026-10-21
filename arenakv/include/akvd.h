@@ -46,7 +46,7 @@ typedef struct akvd_config {
     const char *tls_cert;
     const char *tls_key;
     const char *tls_ca;      /* when set, clients must present a certificate signed by this CA */
-    unsigned threads;        /* worker threads; 0 selects the number of online CPUs */
+    unsigned threads;        /* worker threads; 0 selects the CPUs of the affinity mask */
     unsigned max_conns;      /* connections above this number are closed after accept; 0 = unlimited */
     unsigned idle_timeout_s; /* close connections idle for this many seconds; 0 = never */
     /*

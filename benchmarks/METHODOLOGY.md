@@ -10,8 +10,10 @@ a reader can disagree with a result for a specific reason and check that reason 
 2. **Everything needed to repeat a run is recorded.** `env.json` holds the CPU model, kernel, governor,
    compiler, container image digests, software versions and the git commit; `manifest.json` holds the command
    line, parameters, status and wall time of every run.
-   Run `2026-10-20-run1` was recorded during development: its `git_commit` refers to the development history, which
-   is not part of this repository, and its files use the development names `kvstore` (arenakv), `kvbench`
+   The `git_commit` of every run refers to the development history, which is not part of this repository; the
+   public commit that adds a run contains the sources it was built from. Run `2026-10-21-run2` writes relative paths
+   and the documentation address 192.0.2.10 (RFC 5737) for the RDMA interface at recording time.
+   Run `2026-10-20-run1` was recorded during development: its files use the development names `kvstore` (arenakv), `kvbench`
    (kvpace) and `rdmatp` (rdmaduct). Absolute paths below the source checkout in its command lines were rewritten
    relative to the repository root after the run, and the address of the RDMA interface (`--host` of the Soft-RoCE
    rows) was replaced by the documentation address 192.0.2.10 (RFC 5737); no measured value was changed.
@@ -51,13 +53,16 @@ performance-core cluster. The load generator uses CPUs 8,10,12,14. Hyper-thread 
 | Valkey | container, host network | `--io-threads` = number of CPUs, persistence off, `--maxmemory` with `allkeys-lru` |
 | Dragonfly | container, host network | `--proactor_threads` = number of CPUs, `--cache_mode=true`, `--maxmemory`; refuses to start below 256 MiB per thread |
 | memcached | container, host network | `-t` = number of CPUs, `-m` = capacity in megabytes |
-| arenakv | native process under `taskset` | one connection thread per client, event-driven waiting, `--capacity` |
+| arenakv | native process under `taskset` | `--threads` = number of CPUs (epoll workers), event-driven waiting, `--capacity` |
 | arenakv (Soft-RoCE) | same process, RDMA transport on the `rxe0` device | as above |
+| arenakv (memcached protocol) | same process, memcached text protocol on the benchmark port, driven by the memcached driver of kvpace | as above |
 | Dragonfly, eviction flag raised | as Dragonfly | additionally `--max_eviction_per_heartbeat=10000`; used only in the capacity suite, see below |
 
-Server arguments are set in `tools/run.py` (for arenakv: `--avg-entry` 128 for `small`, 16384 for `block` and `kvcache`;
-capacity 8 GiB unless the capacity suite sets one). The per-run manifest of the published run records the `kvpace`
-command line but not the server arguments; later runs record them under `server`. Container images are used as pulled; their digests are in `env.json`. Default settings were not tuned for any
+Server arguments are set in `tools/run.py` and `kvpace/scripts/servers.sh` (capacity 8 GiB unless the capacity suite
+sets one; memcached additionally `-c 4096` in the pipeline and connections suites, because the connections suite opens
+up to 1024 connections plus the preload). The manifest records them under `server` for every run. Run1 used arenakv
+with `--avg-entry` (128 for `small`, 16384 for `block` and `kvcache`) to size its index; the current index grows and
+takes no such hint. Container images are used as pulled; their digests are in `env.json`. Default settings were not tuned for any
 system. Tuning (for example kernel parameters, huge pages, per-system thread counts beyond the CPU count) might
 change the ranking and was not attempted.
 
@@ -89,6 +94,12 @@ Value contents are a deterministic function of the key; reads of the KV-cache sc
 
 - **Closed loop** (`matrix`, `capacity`): 16 connections (8 for `capacity`), one thread each, one request in
   flight per connection, 3 s warm-up (not recorded) and 8 s (matrix) or 10 s (capacity) measurement.
+- **Multiplexed closed loop** (`pipeline`, `connections`): 4 client threads, each serving its connections from one
+  epoll loop; `pipeline`: 16 connections with 1, 8 or 32 requests in flight each; `connections`: 16, 64, 256 or 1024
+  connections with one request in flight each; 2 s warm-up and 6 s measurement. The native driver raises the endpoint
+  depth to the pipeline depth plus one, so the client window does not limit the pipeline.
+- **Validation** (`validation`): kvpace and `memtier_benchmark` against Valkey (RESP) and arenakv (memcached text
+  protocol), see [`kvpace/docs/validation.md`](../kvpace/docs/validation.md).
 - **Open loop** (`sweep`): requests are issued at a fixed aggregate rate with constant inter-arrival times,
   split over 16 connections, 2 s warm-up and 6 s measurement. Latency is measured from the **intended** send time
   to completion. A connection that is behind schedule sends immediately, so waiting behind a slow response counts
@@ -142,9 +153,10 @@ overlap, or when the statement is a direct restatement of a table cell.
 - **Power management.** The CPU governor was `powersave`, which adds wake-up latency and frequency variation.
   Tail latencies (p99 and above) at low load are affected most; the `performance` governor would reduce this.
   Throughput of saturated runs is less sensitive.
-- **Client limits.** In run1 the load generator used one thread per connection with blocking I/O. In the four-CPU
-  configurations the generator may be the bottleneck; those rows show the order of systems under this client, not
-  the capacity of each server.
+- **Client limits.** The matrix uses one thread per connection with blocking I/O on four client CPUs. In the
+  four-CPU configurations the generator may be the bottleneck; those rows show the order of systems under this
+  client, not the capacity of each server. With pipelined requests the same four client CPUs drive more than
+  3 million operations per second (pipeline suite).
 - **Default configurations.** Each system runs with defaults plus the settings above. A system's maintainers might
   recommend different settings.
 - **Container overhead.** Valkey, Dragonfly and memcached run in containers on the host network; arenakv runs

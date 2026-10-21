@@ -212,8 +212,9 @@ static void echo_once(duct_ep *ep, size_t len, unsigned seed) {
  * Streaming stress test. One producer sends `count` sequence-numbered messages of varying size in
  * batches of random length; the consumer verifies order and content, sleeps at intervals, and keeps up
  * to STRESS_HOLD received messages unreleased, so the producer repeatedly exhausts its send credits.
+ * Batches of up to 80 messages span several RDMA doorbell chunks (16) and several TCP sendmsg groups (32).
  */
-#define STRESS_MAX_BATCH 20
+#define STRESS_MAX_BATCH 80
 #define STRESS_MAX_LEN 512
 #define STRESS_HOLD 3
 

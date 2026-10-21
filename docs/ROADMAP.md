@@ -15,9 +15,10 @@ developed further. Dates refer to the history of this repository.
 ## Gate for the store
 
 The store is developed further only if it shows a clear, repeatable advantage over the established systems under at
-least one KV-cache scenario, on hardware where the transport can show it. Over TCP on the measured machine it is in
-the same range as the established servers (see [`benchmarks/README.md`](../benchmarks/README.md), [C1] [C2] [C3]); an
-advantage was not expected there. The remaining candidates are a transport without kernel TCP overhead, server CPU per large block, and
+least one KV-cache scenario, on hardware where the transport can show it. Over TCP on the measured machine it leads
+the matrix over the memcached protocol by 5% to 11% over memcached at one server CPU and is ahead of Valkey and Dragonfly at four
+(see [`benchmarks/README.md`](../benchmarks/README.md), [C1] [C2] [C3]); the KV-cache rows differ by less than 15%
+between arenakv and memcached, which is not the clear advantage the gate asks for. The remaining candidates are a transport without kernel TCP overhead, server CPU per large block, and
 memory efficiency. They need RDMA hardware to be evaluated; Soft-RoCE results are not evidence.
 
 ## Next steps

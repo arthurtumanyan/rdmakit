@@ -50,7 +50,7 @@ def main():
 
     # repetition counts per configuration and suite
     counts = {}
-    for section in ("matrix", "sweep", "capacity"):
+    for section in ("matrix", "sweep", "pipeline", "connections", "capacity"):
         for key, row in summary[section].items():
             counts.setdefault(section, set()).add(row["throughput"]["n"])
     for section, ns in counts.items():

@@ -11,7 +11,8 @@ the same API and the same behavior on both.
   can share one epoll loop.
 - Credit-based flow control on RDMA: a sender never overruns the receiver's posted buffers.
 - Blocking calls with timeouts; polling or event-driven waiting for RDMA endpoints.
-- Batched sends (one doorbell per up to 16 messages) on RDMA.
+- Batched sends: one doorbell per up to 16 messages on RDMA, one `sendmsg()` per up to 32 messages on TCP; buffered
+  TCP reads, so pipelined small messages cost a fraction of a system call each.
 - Builds without RDMA libraries (`make RDMA=0`) for machines without RDMA hardware.
 - Tested for faults and malformed input (see [Testing](#testing)).
 
@@ -68,43 +69,44 @@ hardware). Tables are generated from the raw data in [`../benchmarks/data`](../b
 </picture>
 
 <!-- BEGIN GENERATED:transport-rtt -->
-Data: `benchmarks/data/2026-10-20-run1` (353 runs: 336 ok, 11 with operation errors, 0 failed, 6 skipped), commit `fc0dc39b5653`, summary digest `aaaad406e27486af`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-21-run2` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `46efd6447c6d`, summary digest `95813d0d095ed976`. Mean over repetitions; `cv` is the coefficient of variation.
 
 Median round-trip time in microseconds (ping-pong, one message in flight). Loopback on one host.
 
 | Message bytes | TCP | Soft-RoCE, polling | Soft-RoCE, event-driven |
 |---|---|---|---|
-| 64 | 10.2 (cv 30.7%) | 6.7 (cv 1.0%) | 10.0 (cv 3.3%) |
-| 256 | 8.5 (cv 5.6%) | 6.7 (cv 2.1%) | 10.2 (cv 1.0%) |
-| 1024 | 8.5 (cv 1.5%) | 7.2 (cv 5.5%) | 10.5 (cv 3.5%) |
-| 4096 | 10.3 (cv 15.2%) | 11.3 (cv 2.7%) | 15.1 (cv 3.4%) |
-| 16384 | 12.2 (cv 2.8%) | 30.4 (cv 1.5%) | 35.5 (cv 3.5%) |
-| 65536 | 23.8 (cv 4.4%) | 109.9 (cv 2.2%) | 113.6 (cv 3.8%) |
-| 262144 | 59.0 (cv 1.8%) | 446.2 (cv 1.6%) | 456.8 (cv 3.3%) |
-| 1048576 | 250.1 (cv 2.6%) | 1,901.0 (cv 1.2%) | 1,941.7 (cv 1.3%) |
+| 64 | 9.6 (cv 37.9%) | 6.8 (cv 2.7%) | 10.3 (cv 9.7%) |
+| 256 | 7.8 (cv 0.4%) | 6.7 (cv 3.4%) | 10.1 (cv 1.8%) |
+| 1024 | 8.1 (cv 2.0%) | 7.2 (cv 2.9%) | 10.7 (cv 3.6%) |
+| 4096 | 9.0 (cv 2.5%) | 11.2 (cv 1.8%) | 15.1 (cv 1.7%) |
+| 16384 | 16.2 (cv 45.4%) | 30.4 (cv 1.4%) | 35.3 (cv 2.0%) |
+| 65536 | 29.2 (cv 35.9%) | 106.5 (cv 0.9%) | 113.4 (cv 1.8%) |
+| 262144 | 50.6 (cv 2.3%) | 442.1 (cv 2.7%) | 459.6 (cv 1.9%) |
+| 1048576 | 185.7 (cv 1.7%) | 1,898.3 (cv 1.3%) | 1,938.9 (cv 1.1%) |
 <!-- END GENERATED:transport-rtt -->
 
 <!-- BEGIN GENERATED:transport-stream -->
-Data: `benchmarks/data/2026-10-20-run1` (353 runs: 336 ok, 11 with operation errors, 0 failed, 6 skipped), commit `fc0dc39b5653`, summary digest `aaaad406e27486af`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-21-run2` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `46efd6447c6d`, summary digest `95813d0d095ed976`. Mean over repetitions; `cv` is the coefficient of variation.
 
 One-way streaming throughput in MB/s (batched sends, 64 buffers per direction). Loopback on one host.
 
 | Message bytes | TCP | Soft-RoCE, polling | Soft-RoCE, event-driven |
 |---|---|---|---|
-| 64 | 28 (cv 12.9%) | 46 (cv 6.9%) | 46 (cv 10.3%) |
-| 256 | 103 (cv 0.8%) | 189 (cv 2.8%) | 184 (cv 7.5%) |
-| 1024 | 329 (cv 3.5%) | 722 (cv 5.8%) | 688 (cv 8.5%) |
-| 4096 | 1,228 (cv 3.9%) | 910 (cv 3.4%) | 962 (cv 1.6%) |
-| 16384 | 3,667 (cv 5.0%) | 1,135 (cv 3.4%) | 1,145 (cv 0.8%) |
-| 65536 | 6,963 (cv 5.3%) | 1,280 (cv 1.5%) | 1,239 (cv 2.7%) |
-| 262144 | 8,726 (cv 3.3%) | 1,174 (cv 3.3%) | 1,121 (cv 6.5%) |
-| 1048576 | 7,990 (cv 2.7%) | 1,106 (cv 3.1%) | 1,086 (cv 2.5%) |
+| 64 | 285 (cv 26.5%) | 46 (cv 6.8%) | 47 (cv 2.6%) |
+| 256 | 1,037 (cv 1.4%) | 188 (cv 2.7%) | 178 (cv 6.6%) |
+| 1024 | 3,287 (cv 12.7%) | 730 (cv 2.2%) | 715 (cv 2.2%) |
+| 4096 | 7,352 (cv 20.5%) | 915 (cv 0.5%) | 968 (cv 1.6%) |
+| 16384 | 10,546 (cv 9.1%) | 1,155 (cv 1.3%) | 1,137 (cv 0.9%) |
+| 65536 | 9,213 (cv 20.7%) | 1,279 (cv 3.0%) | 1,263 (cv 1.9%) |
+| 262144 | 5,757 (cv 10.3%) | 1,170 (cv 4.4%) | 1,158 (cv 1.9%) |
+| 1048576 | 6,329 (cv 43.2%) | 1,124 (cv 2.5%) | 1,087 (cv 2.4%) |
 <!-- END GENERATED:transport-stream -->
 
 - For messages up to 1 KiB the median round trip of Soft-RoCE with polling is lower than that of TCP; from 16 KiB TCP
   is lower than both Soft-RoCE modes [C19].
-- TCP loopback streaming is at least five times faster than Soft-RoCE for messages of 64 KiB and larger, and slower
-  than both Soft-RoCE modes up to 1 KiB [C20].
+- TCP loopback streaming is at least four times faster than both Soft-RoCE modes at every measured size [C20]. TCP
+  sends a batch with one `sendmsg()` and reads through a 64 KiB buffer, so small streamed messages cost a fraction of
+  a system call each.
 - These numbers describe the cost of a software RDMA implementation on one host. They say nothing about RDMA
   hardware, where the data path bypasses the kernel.
 

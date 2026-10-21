@@ -7,12 +7,18 @@
 #include "akvclient.h"
 #include "hash.h"
 
+/* Requests staged by akvc_post() before one duct_send_batch() (see akvc_push). */
+#define AKVC_BATCH 32
+
 struct akvc {
     duct_ctx *ctx;
     duct_ep *ep;
     uint32_t next_id;
-    uint8_t *req;
-    size_t req_cap;
+    uint8_t *req;   /* staging area of 2 * req_cap bytes; posted requests are packed in order */
+    size_t req_cap; /* largest request (max_msg) */
+    size_t staged_bytes;
+    unsigned nstaged;
+    struct duct_msg staged[AKVC_BATCH];
     struct duct_rx rx;
     int rx_held;
     unsigned outstanding;
@@ -29,7 +35,7 @@ int akvc_connect(akvc **out, const struct duct_opts *opts, const char *host, con
         rc = duct_connect(c->ctx, host, port, &c->ep);
     }
     c->req_cap = opts->max_msg;
-    c->req = malloc(c->req_cap);
+    c->req = malloc(2 * c->req_cap);
     if (rc == 0 && c->req == NULL) {
         rc = -ENOMEM;
     }
@@ -72,13 +78,24 @@ int akvc_fd(const akvc *c) {
     return duct_ep_fd(c->ep);
 }
 
-int akvc_arm(akvc *c) {
-    return duct_ep_arm(c->ep);
+int akvc_push(akvc *c) {
+    if (c->nstaged == 0) {
+        return 0;
+    }
+    int rc = duct_send_batch(c->ep, c->staged, c->nstaged, 10000);
+    c->nstaged = 0;
+    c->staged_bytes = 0;
+    return rc;
 }
 
-/* Builds a request in c->req and returns its length, or 0 when it does not fit. */
-static size_t build(akvc *c, uint8_t op, const void *key, size_t klen, const void *val, size_t vlen,
-                    const struct akvp_ext *ext) {
+int akvc_arm(akvc *c) {
+    int rc = akvc_push(c);
+    return rc != 0 ? rc : duct_ep_arm(c->ep);
+}
+
+/* Builds a request at dst (room for c->req_cap bytes) and returns its length, or 0 when it does not fit. */
+static size_t build(akvc *c, uint8_t *dst, uint8_t op, const void *key, size_t klen, const void *val,
+                    size_t vlen, const struct akvp_ext *ext) {
     size_t x = ext != NULL ? AKVP_EXT : 0;
     if (AKVP_REQ_HDR + x + klen + vlen > c->req_cap || klen > 0xffff || vlen > UINT32_MAX) {
         return 0;
@@ -88,15 +105,15 @@ static size_t build(akvc *c, uint8_t op, const void *key, size_t klen, const voi
                          .klen = (uint16_t)klen,
                          .reqid = c->next_id++,
                          .vlen = (uint32_t)vlen};
-    akvp_req_encode(c->req, &r);
+    akvp_req_encode(dst, &r);
     if (ext != NULL) {
-        akvp_ext_encode(c->req + AKVP_REQ_HDR, ext);
+        akvp_ext_encode(dst + AKVP_REQ_HDR, ext);
     }
     if (klen > 0) {
-        memcpy(c->req + AKVP_REQ_HDR + x, key, klen);
+        memcpy(dst + AKVP_REQ_HDR + x, key, klen);
     }
     if (vlen > 0) {
-        memcpy(c->req + AKVP_REQ_HDR + x + klen, val, vlen);
+        memcpy(dst + AKVP_REQ_HDR + x + klen, val, vlen);
     }
     return AKVP_REQ_HDR + x + klen + vlen;
 }
@@ -106,14 +123,20 @@ int akvc_post(akvc *c, uint8_t op, const void *key, size_t klen, const void *val
     if (c->outstanding >= c->window) {
         return -EBUSY;
     }
-    size_t n = build(c, op, key, klen, val, vlen, ext);
+    /* The staging area holds 2 * req_cap bytes: push first when the next request might not fit. */
+    if (c->nstaged == AKVC_BATCH || c->staged_bytes > c->req_cap) {
+        int rc = akvc_push(c);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    uint8_t *dst = c->req + c->staged_bytes;
+    size_t n = build(c, dst, op, key, klen, val, vlen, ext);
     if (n == 0) {
         return AKVP_TOOBIG;
     }
-    int rc = duct_send(c->ep, c->req, n, 10000);
-    if (rc != 0) {
-        return rc;
-    }
+    c->staged[c->nstaged++] = (struct duct_msg){.data = dst, .len = n};
+    c->staged_bytes += n;
     c->outstanding++;
     if (reqid != NULL) {
         *reqid = c->next_id - 1;
@@ -129,7 +152,11 @@ int akvc_next(akvc *c, struct akvc_resp *r, int timeout_ms) {
         duct_rx_release(c->ep, &c->rx);
         c->rx_held = 0;
     }
-    int rc = duct_recv(c->ep, &c->rx, timeout_ms);
+    int rc = akvc_push(c);
+    if (rc != 0) {
+        return rc;
+    }
+    rc = duct_recv(c->ep, &c->rx, timeout_ms);
     if (rc != 0) {
         return rc;
     }

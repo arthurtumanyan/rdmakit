@@ -473,6 +473,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "invalid numeric option\n");
         return 2;
     }
+    if (cfg.pipeline > 1 && cfg.driver->set_option != NULL) {
+        /* Drivers with a bounded window size it for the pipeline (native: option "pipeline"); a driver
+         * without that option ignores it. */
+        char depth[16];
+        snprintf(depth, sizeof(depth), "%u", cfg.pipeline);
+        cfg.driver->set_option("pipeline", depth);
+    }
     if (pace_tls_setup(&tls) != 0) {
         return 1;
     }

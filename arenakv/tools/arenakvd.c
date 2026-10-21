@@ -26,7 +26,7 @@
  *   --no-evict                  refuse stores when full instead of evicting
  *   --huge-pages                advise transparent huge pages for the cache memory
  * Server:
- *   --threads N                 worker threads (default: online CPUs)
+ *   --threads N                 worker threads (default: CPUs the process may run on)
  *   --max-conns N               connection limit (default: unlimited)
  *   --idle-timeout SECONDS      close idle connections (default: never)
  *   --auth-file FILE            credentials, "user:password" or a password per line

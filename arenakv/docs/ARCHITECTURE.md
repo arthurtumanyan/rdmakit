@@ -98,8 +98,9 @@ Threads (`src/server.c`):
   variants). New connections are counted, checked against `max_conns`, and queued round robin to a worker, whose
   eventfd wakes it.
 - **workers**: one epoll set each. Native connections are driven through `duct_ep_fd` / `duct_ep_arm`: the worker
-  drains requests with `duct_recv(..., 0)`, executes them and sends responses with `duct_send(..., 0)`. A response
-  that does not fit is queued and the connection stops reading until the queue is empty, so a client that does not
+  drains requests with `duct_recv(..., 0)`, executes them into a per-worker batch area (1 MiB, or `max_msg` if
+  larger) and sends up to 32 responses with one `duct_send_batch()`, limited to `duct_ep_send_space()`. Responses
+  that do not fit are queued and the connection stops reading until the queue is empty, so a client that does not
   read cannot make the server buffer without bound. Text connections use non-blocking sockets (or OpenSSL with
   non-blocking BIOs); input accumulates until the protocol module consumes complete commands, replies accumulate in an
   output buffer, and reading stops while more than 4 MiB of replies are pending.
@@ -122,6 +123,8 @@ lengths.
 - Synchronous calls are implemented as one `akvc_post` followed by `akvc_next`.
 - Pipelining: `akvc_post` refuses more than `akvc_window()` = `min(recv_depth, send_depth) - 1` outstanding requests,
   which keeps the client from blocking on credits while the server waits for the client to read responses.
+- Posted requests are packed into a staging area (2 x `max_msg`) and sent with one `duct_send_batch()` by
+  `akvc_push`, `akvc_next` or `akvc_arm`, or when 32 requests or `max_msg` bytes are staged.
 - `akvc_pool`: 160 points per server on a 64-bit ring (hash of `"host:port-i"` with a fixed seed), binary search for
   the first point at or after the key's hash. Removing a server moves only the keys it owned (tested).
 

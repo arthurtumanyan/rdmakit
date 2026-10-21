@@ -1,0 +1,10 @@
+{"tool": "duct_bench", "transport": "tcp", "wait": "poll", "pingpong_max": 5000, "stream_max": 20000, "results": [
+  {"size": 64, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 8.36, "p50": 7.85, "p99": 17.06, "p999": 29.34, "min": 7.67, "max": 46.39}, "pingpong_mb_s": 15.27, "stream_msgs_per_s": 5105968, "stream_mb_s": 326.78},
+  {"size": 256, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 7.84, "p50": 7.82, "p99": 9.30, "p999": 10.29, "min": 7.43, "max": 10.99}, "pingpong_mb_s": 65.15, "stream_msgs_per_s": 4058699, "stream_mb_s": 1039.03},
+  {"size": 1024, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 8.04, "p50": 7.96, "p99": 10.03, "p999": 10.91, "min": 7.57, "max": 21.87}, "pingpong_mb_s": 254.33, "stream_msgs_per_s": 3342701, "stream_mb_s": 3422.93},
+  {"size": 4096, "pingpong_count": 5000, "stream_count": 20000, "rtt_us": {"mean": 9.20, "p50": 9.01, "p99": 10.37, "p999": 11.78, "min": 8.39, "max": 11.97}, "pingpong_mb_s": 888.97, "stream_msgs_per_s": 1983932, "stream_mb_s": 8126.19},
+  {"size": 16384, "pingpong_count": 4096, "stream_count": 16384, "rtt_us": {"mean": 14.22, "p50": 12.98, "p99": 24.27, "p999": 124.37, "min": 10.08, "max": 132.73}, "pingpong_mb_s": 2300.81, "stream_msgs_per_s": 643505, "stream_mb_s": 10543.18},
+  {"size": 65536, "pingpong_count": 1024, "stream_count": 4096, "rtt_us": {"mean": 47.91, "p50": 47.43, "p99": 95.42, "p999": 97.35, "min": 22.86, "max": 106.22}, "pingpong_mb_s": 2734.03, "stream_msgs_per_s": 153940, "stream_mb_s": 10088.63},
+  {"size": 262144, "pingpong_count": 256, "stream_count": 1024, "rtt_us": {"mean": 53.33, "p50": 51.33, "p99": 95.20, "p999": 173.70, "min": 48.85, "max": 173.70}, "pingpong_mb_s": 9826.90, "stream_msgs_per_s": 23348, "stream_mb_s": 6120.52},
+  {"size": 1048576, "pingpong_count": 200, "stream_count": 256, "rtt_us": {"mean": 193.06, "p50": 187.76, "p99": 487.99, "p999": 544.42, "min": 180.49, "max": 544.42}, "pingpong_mb_s": 10860.70, "stream_msgs_per_s": 6144, "stream_mb_s": 6441.93}
+]}

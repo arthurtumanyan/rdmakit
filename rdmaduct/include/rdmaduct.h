@@ -195,7 +195,10 @@ int duct_ep_arm(duct_ep *ep);
  */
 int duct_progress(duct_ep *ep);
 
-/* Returns the number of messages that duct_send() can accept now without waiting. */
+/*
+ * Returns the number of messages that duct_send() can accept now without waiting. duct_send_batch() with
+ * at most this many messages and timeout 0 sends all of them (it does not return -ETIMEDOUT).
+ */
 unsigned duct_ep_send_space(duct_ep *ep);
 
 /* Returns a descriptor that becomes readable when duct_accept(l, 0, ...) may succeed. Owned by l. */

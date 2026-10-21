@@ -5,7 +5,9 @@
  * request and wait for its response. akvc_post() and akvc_next() pipeline requests: several requests are
  * sent before their responses are read, in order. At most akvc_window() requests may be outstanding;
  * akvc_post() returns -EBUSY beyond that, because the server stops reading requests while its responses
- * cannot be delivered.
+ * cannot be delivered. Posted requests are staged and sent together with one duct_send_batch() (one
+ * system call on TCP) by akvc_push(), akvc_next(), akvc_arm(), or when 32 requests or the message limit
+ * are staged; requests still staged when the client is closed are not sent.
  *
  * Return values: a non-negative akvp_status (AKVP_OK, AKVP_NOTFOUND, ...) when the server answered, or a
  * negative rdmaduct or -errno code when the transport failed (the client is then unusable and must be
@@ -94,12 +96,15 @@ struct akvc_resp {
 unsigned akvc_window(const akvc *c);
 
 /*
- * Sends a request without waiting for its response; *reqid (if not NULL) receives its identifier.
- * Returns 0, -EBUSY when akvc_window() requests are outstanding, AKVP_TOOBIG when the request exceeds the
- * message limit, or a transport error.
+ * Posts a request without waiting for its response; *reqid (if not NULL) receives its identifier. The
+ * request is staged (see the file comment). Returns 0, -EBUSY when akvc_window() requests are
+ * outstanding, AKVP_TOOBIG when the request exceeds the message limit, or a transport error.
  */
 int akvc_post(akvc *c, uint8_t op, const void *key, size_t klen, const void *val, size_t vlen,
               const struct akvp_ext *ext, uint32_t *reqid);
+
+/* Sends the staged requests (waiting up to 10 s for send space). Returns 0 or a transport error. */
+int akvc_push(akvc *c);
 
 /*
  * Waits for the oldest outstanding response. Returns 0, -EINVAL when none is outstanding, -ETIMEDOUT

@@ -11,6 +11,8 @@
  *   - TLS (build with TLS=1): RESP over TLS with a certificate that the test creates
  *   - native protocol revision 2 through the client library: store modes, CAS, metadata, increments,
  *     touch, flush, MGET, authentication, pipelining within the window, consistent hashing over servers
+ *   - native batching: a window of 100 requests with values of 1 to 40,000 bytes, so that client staging
+ *     is sent by count and by size, and server responses are batched, limited by send space and queued
  */
 #include <errno.h>
 #include <netinet/in.h>
@@ -598,6 +600,60 @@ static void test_native(akvd *d) {
     akvc_close(c);
 }
 
+/* Value of request i in round r: length and bytes derived from (r, i). */
+static size_t batch_value(unsigned r, unsigned i, uint8_t *out) {
+    size_t len = i % 5 == 0 ? 40000 : 1 + (i * 37 + r) % 200;
+    for (size_t k = 0; k < len; k++) {
+        out[k] = (uint8_t)(r * 131 + i * 7 + k);
+    }
+    return len;
+}
+
+static void test_native_batches(akvd *d) {
+    struct duct_opts o = client_opts();
+    o.recv_depth = 101;
+    o.send_depth = 101;
+    char port[16];
+    snprintf(port, sizeof(port), "%d", akvd_port(d));
+    akvc *c = NULL;
+    EXPECT(akvc_connect(&c, &o, "127.0.0.1", port) == 0, "batch connect");
+    if (c == NULL) {
+        return;
+    }
+    unsigned win = akvc_window(c);
+    EXPECT(win == 100, "window %u", win);
+    static uint8_t val[40000];
+    static uint8_t want[40000];
+    for (unsigned r = 0; r < 3; r++) {
+        uint32_t ids[100];
+        for (unsigned i = 0; i < win; i++) {
+            char k[16];
+            int kl = snprintf(k, sizeof(k), "nb%u", i);
+            size_t vl = batch_value(r, i, val);
+            EXPECT(akvc_post(c, AKVP_PUT, k, (size_t)kl, val, vl, NULL, &ids[i]) == 0, "batch put %u", i);
+        }
+        for (unsigned i = 0; i < win; i++) {
+            struct akvc_resp rr;
+            EXPECT(akvc_next(c, &rr, 5000) == 0 && rr.reqid == ids[i] && rr.status == AKVP_OK, "put reply %u",
+                   i);
+        }
+        for (unsigned i = 0; i < win; i++) {
+            char k[16];
+            int kl = snprintf(k, sizeof(k), "nb%u", i);
+            EXPECT(akvc_post(c, AKVP_GET, k, (size_t)kl, NULL, 0, NULL, &ids[i]) == 0, "batch get %u", i);
+        }
+        EXPECT(akvc_push(c) == 0, "push");
+        for (unsigned i = 0; i < win; i++) {
+            struct akvc_resp rr;
+            size_t wl = batch_value(r, i, want);
+            int ok = akvc_next(c, &rr, 5000) == 0 && rr.reqid == ids[i] && rr.status == AKVP_OK &&
+                     rr.len == wl && memcmp(rr.payload, want, wl) == 0;
+            EXPECT(ok, "get reply %u of round %u", i, r);
+        }
+    }
+    akvc_close(c);
+}
+
 static void test_native_auth(void) {
     char path[] = "/tmp/akv-test-cred-XXXXXX";
     int fd = mkstemp(path);
@@ -692,6 +748,7 @@ int main(void) {
         test_pipeline(d);
         test_concurrent(d);
         test_native(d);
+        test_native_batches(d);
         akvd_stop(d);
     }
     test_limits();

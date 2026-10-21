@@ -814,6 +814,9 @@ int pace_run(pace_config *cfg, pace_result *res) {
     res->gets = res->ops_of[PACE_OP_GET] + res->ops_of[PACE_OP_RMW];
     res->puts = res->ops_of[PACE_OP_SET] + res->ops_of[PACE_OP_INSERT] + res->ops_of[PACE_OP_RMW];
     if (cfg->scenario == PACE_SCENARIO_KVCACHE) {
+        /* Operations of the KV-cache scenario are block operations (ops, ops_per_sec, CPU per operation). */
+        res->ops_of[PACE_OP_GET] = res->kvcache.block_gets;
+        res->ops_of[PACE_OP_SET] = res->kvcache.block_puts;
         res->gets = res->kvcache.block_gets;
         res->puts = res->kvcache.block_puts;
         res->misses = res->kvcache.block_gets - res->kvcache.block_hits;

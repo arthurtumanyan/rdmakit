@@ -1,4 +1,4 @@
-Data: `benchmarks/data/2026-10-20-run1` (353 runs: 336 ok, 11 with operation errors, 0 failed, 6 skipped), commit `fc0dc39b5653`, summary digest `aaaad406e27486af`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-21-run2` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `46efd6447c6d`, summary digest `95813d0d095ed976`. Mean over repetitions; `cv` is the coefficient of variation.
 
 Share of KV-cache requests that failed (an operation was rejected by the server, for example with an out-of-memory error), by configured capacity.
 
@@ -6,6 +6,6 @@ Share of KV-cache requests that failed (an operation was rejected by the server,
 |---|---|---|---|---|---|
 | arenakv (TCP) | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% |
 | Valkey | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% |
-| Dragonfly | n/a | n/a | 96.19% | 84.24% | 0.00% |
+| Dragonfly | n/a | n/a | 96.13% | 84.71% | 0.00% |
 | Dragonfly (eviction flag raised) | n/a | n/a | 0.00% | 0.00% | 0.00% |
-| memcached | 0.03% | 0.00% | 0.00% | 0.00% | 0.00% |
+| memcached | 0.02% | 0.00% | 0.00% | 0.00% | 0.00% |
