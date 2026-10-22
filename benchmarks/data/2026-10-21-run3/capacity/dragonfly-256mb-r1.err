@@ -1,6 +1,0 @@
-driver=resp threads=8 conns/thread=1 pipeline=1 value=64B keys=100000 dist=uniform
-ops=137897 (gets=57188 puts=80709 misses=1697 errors=43367) in 10.00 s -> 13790 ops/s
-kvcache: 1697 requests, reuse 40.7% of needed blocks, probe hit rate 97.0% (55491 of 57188), 80709 blocks recomputed and written, read 90.9 MB/s, write 132.2 MB/s, corrupt 0
-server: 9.990 CPU s during run (72.45 us/op), RSS 290.3 MiB
-service latency us: mean 4480.2  p50 4063.2  p90 7307.3  p99 8978.4  p99.9 10373.6  p99.99 10373.6  max 10373.6
-request latency us: mean 4480.2  p50 4063.2  p90 7307.3  p99 8978.4  p99.9 10373.6  p99.99 10373.6  max 10373.6
