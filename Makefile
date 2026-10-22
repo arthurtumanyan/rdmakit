@@ -9,6 +9,8 @@
 #   make verify       check benchmark figures, tables and claims against the raw data of the latest run
 #   make clean        remove build output
 PROJECTS := rdmaduct arenakv kvpace
+# The lab's suite (steps 7 to 12 on rdmaduct) runs after the projects'.
+TESTED := $(PROJECTS) lab
 LATEST := $(shell cat benchmarks/LATEST 2>/dev/null)
 
 all:
@@ -20,15 +22,15 @@ all:
 # Every project is built before any suite runs: arenakv's cluster test drives the kvpace of the same build.
 test:
 	for p in $(PROJECTS); do $(MAKE) -C $$p || exit 1; done
-	for p in $(PROJECTS); do $(MAKE) -C $$p test || exit 1; done
+	for p in $(TESTED); do $(MAKE) -C $$p test || exit 1; done
 
 test-tcp:
 	for p in $(PROJECTS); do $(MAKE) -C $$p RDMA=0 || exit 1; done
-	for p in $(PROJECTS); do $(MAKE) -C $$p RDMA=0 test || exit 1; done
+	for p in $(TESTED); do $(MAKE) -C $$p RDMA=0 test || exit 1; done
 
 sanitize:
 	for p in $(PROJECTS); do $(MAKE) -C $$p SAN=1 || exit 1; done
-	for p in $(PROJECTS); do $(MAKE) -C $$p SAN=1 test || exit 1; done
+	for p in $(TESTED); do $(MAKE) -C $$p SAN=1 test || exit 1; done
 
 format:
 	for p in $(PROJECTS) lab; do clang-format -i $$(git ls-files "$$p/*.c" "$$p/*.h"); done
