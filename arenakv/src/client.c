@@ -35,7 +35,11 @@ int akvc_connect(akvc **out, const struct duct_opts *opts, const char *host, con
     if (rc == 0) {
         rc = duct_connect(c->ctx, host, port, &c->ep);
     }
+    /* Requests are bounded by what the server accepts (less the encryption overhead on encrypted endpoints). */
     c->req_cap = opts->max_msg;
+    if (rc == 0 && duct_ep_peer_max_msg(c->ep) < c->req_cap) {
+        c->req_cap = duct_ep_peer_max_msg(c->ep);
+    }
     c->req = malloc(2 * c->req_cap);
     if (rc == 0 && c->req == NULL) {
         rc = -ENOMEM;

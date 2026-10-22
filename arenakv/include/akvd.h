@@ -49,7 +49,13 @@ typedef struct akvd_config {
     const char *tls_resp_port;
     const char *tls_cert;
     const char *tls_key;
-    const char *tls_ca;      /* when set, clients must present a certificate signed by this CA */
+    const char *tls_ca; /* when set, clients must present a certificate signed by this CA */
+    /*
+     * Encrypted native listener and replication links (rdmaduct tls, needs TLS=1): the listener uses tls_cert
+     * and tls_key and, with tls_ca, requires client certificates signed by it; a replica's link presents
+     * tls_cert and verifies the primary's certificate against tls_ca and the primary's host name or address.
+     */
+    int native_tls;
     unsigned threads;        /* worker threads; 0 selects the CPUs of the affinity mask */
     unsigned max_conns;      /* connections above this number are closed after accept; 0 = unlimited */
     unsigned idle_timeout_s; /* close connections idle for this many seconds; 0 = never */

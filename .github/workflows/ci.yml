@@ -39,6 +39,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev
+      - name: rdmaduct encrypted endpoints, plain and under the sanitizers
+        run: make -C rdmaduct RDMA=0 TLS=1 test && make -C rdmaduct RDMA=0 TLS=1 SAN=1 test
       - name: arenakv with TLS listeners, plain and under the sanitizers
         run: make -C arenakv RDMA=0 TLS=1 test && make -C arenakv RDMA=0 TLS=1 SAN=1 test
       - name: kvpace with TLS for the text drivers, plain and under the sanitizers
@@ -56,7 +58,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y clang cppcheck libibverbs-dev librdmacm-dev
+      - run: sudo apt-get update && sudo apt-get install -y clang cppcheck libibverbs-dev librdmacm-dev libssl-dev
       - name: clang static analyzer and cppcheck, no findings allowed
         run: make analyze
 
@@ -64,7 +66,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y clang
+      - run: sudo apt-get update && sudo apt-get install -y clang libssl-dev
       - name: Every libFuzzer harness for 60 seconds under AddressSanitizer and UndefinedBehaviorSanitizer
         run: make fuzz FUZZ_TIME=60
       - name: Keep the inputs of a failing harness

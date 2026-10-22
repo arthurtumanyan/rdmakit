@@ -557,6 +557,10 @@ int repl_follow(struct repl *r, const char *host, const char *port) {
         struct duct_opts o;
         akvd_duct_opts(d, &o);
         rc = duct_ctx_create(&o, &r->ctx);
+        if (rc == 0 && o.tls && o.tls_ca == NULL) {
+            akvd_log(d, AKVD_LOG_WARN,
+                     "replication: encrypted link without --tls-ca; the primary is not verified");
+        }
     }
     if (rc == 0) {
         r->replica = 1;

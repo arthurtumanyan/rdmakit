@@ -12,6 +12,11 @@ void duct_opts_default(struct duct_opts *o) {
     o->send_depth = 32;
     o->connect_timeout_ms = 10000;
     o->wait = DUCT_WAIT_POLL;
+    o->tls = 0;
+    o->tls_cert = NULL;
+    o->tls_key = NULL;
+    o->tls_ca = NULL;
+    o->tls_server_name = NULL;
 }
 
 const char *duct_strerror(int err) {
@@ -34,6 +39,11 @@ const char *duct_strerror(int err) {
 }
 
 int duct_ctx_create(const struct duct_opts *o, duct_ctx **out) {
+#ifndef DUCT_HAVE_TLS
+    if (o->tls) {
+        return -ENOTSUP;
+    }
+#endif
     if (o->max_msg == 0 || o->max_msg > DUCT_LIMIT_MAX_MSG || o->recv_depth == 0 ||
         o->recv_depth > DUCT_LIMIT_DEPTH || o->send_depth == 0 || o->send_depth > DUCT_LIMIT_DEPTH) {
         return -EINVAL;
@@ -73,6 +83,20 @@ int duct_ctx_create(const struct duct_opts *o, duct_ctx **out) {
         return DUCT_ENODEV;
     }
 #endif
+#ifdef DUCT_HAVE_TLS
+    if (o->tls) {
+        int rc = duct_tls_ctx_init(ctx, o);
+        if (rc != 0) {
+            duct_ctx_destroy(ctx);
+            return rc;
+        }
+    }
+#endif
+    /* The strings are not kept: they may point to storage the caller releases (tls.c copies the name). */
+    ctx->opts.tls_cert = NULL;
+    ctx->opts.tls_key = NULL;
+    ctx->opts.tls_ca = NULL;
+    ctx->opts.tls_server_name = NULL;
     *out = ctx;
     return 0;
 }
@@ -81,6 +105,9 @@ void duct_ctx_destroy(duct_ctx *ctx) {
     if (ctx == NULL) {
         return;
     }
+#ifdef DUCT_HAVE_TLS
+    duct_tls_ctx_fini(ctx);
+#endif
 #ifdef DUCT_HAVE_RDMA
     if (ctx->transport == DUCT_TRANSPORT_RDMA) {
         duct_rdma_ctx_fini(ctx);
@@ -95,6 +122,9 @@ enum duct_transport duct_ctx_transport(const duct_ctx *ctx) {
 }
 
 int duct_listen(duct_ctx *ctx, const char *addr, const char *port, duct_listener **out) {
+    if (ctx->opts.tls && ctx->tls_server == NULL) {
+        return -EINVAL; /* an encrypted listener needs a certificate */
+    }
 #ifdef DUCT_HAVE_RDMA
     if (ctx->transport == DUCT_TRANSPORT_RDMA) {
         return duct_rdma_listen(ctx, addr, port, out);
@@ -104,12 +134,26 @@ int duct_listen(duct_ctx *ctx, const char *addr, const char *port, duct_listener
 }
 
 int duct_connect(duct_ctx *ctx, const char *addr, const char *port, duct_ep **out) {
+    duct_ep *ep;
+    int rc;
 #ifdef DUCT_HAVE_RDMA
     if (ctx->transport == DUCT_TRANSPORT_RDMA) {
-        return duct_rdma_connect(ctx, addr, port, out);
+        rc = duct_rdma_connect(ctx, addr, port, &ep);
+    } else
+#endif
+    {
+        rc = duct_tcp_connect(ctx, addr, port, &ep);
+    }
+    if (rc != 0) {
+        return rc;
+    }
+#ifdef DUCT_HAVE_TLS
+    if (ctx->opts.tls) {
+        return duct_tls_client(ctx, ep, addr, out);
     }
 #endif
-    return duct_tcp_connect(ctx, addr, port, out);
+    *out = ep;
+    return 0;
 }
 
 int duct_listener_port(const duct_listener *l) {
@@ -117,6 +161,13 @@ int duct_listener_port(const duct_listener *l) {
 }
 
 int duct_accept(duct_listener *l, int timeout_ms, duct_ep **out) {
+#ifdef DUCT_HAVE_TLS
+    if (l->ctx->opts.tls) {
+        duct_ep *ep;
+        int rc = l->ops->accept(l, timeout_ms, &ep);
+        return rc != 0 ? rc : duct_tls_server(l->ctx, ep, out);
+    }
+#endif
     return l->ops->accept(l, timeout_ms, out);
 }
 

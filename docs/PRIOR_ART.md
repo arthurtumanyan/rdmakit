@@ -41,7 +41,9 @@ depends only on libc for the TCP transport and additionally on libibverbs and li
 therefore be developed on a laptop without RDMA hardware (TCP, or Soft-RoCE), and the transport is tested
 for faults and malformed input (see `rdmaduct/docs/ARCHITECTURE.md`).
 
-What it does not do: multiple NICs or rails, GPU memory, tag matching, collectives, encryption or authentication.
+What it does not do: multiple NICs or rails, GPU memory, tag matching, collectives. Encryption is optional
+(`TLS=1`) and covers two-sided messages only; one-sided operations are not available on encrypted endpoints,
+because the peer CPU does not take part in them.
 On TCP, one-sided operations progress only while the target application calls into the library.
 
 ## kvpace: key-value benchmark

@@ -32,6 +32,7 @@
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 #endif
 
 #include "akvclient.h"
@@ -439,6 +440,16 @@ static int make_cert(const char *cert_path, const char *key_path) {
     X509_NAME *name = X509_get_subject_name(x);
     X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char *)"127.0.0.1", -1, -1, 0);
     X509_set_issuer_name(x, name);
+    /* Address verification (RFC 6125, section 6.2) matches subjectAltName IP entries, not the common name. */
+    X509_set_version(x, 2);
+    X509V3_CTX v3;
+    X509V3_set_ctx_nodb(&v3);
+    X509V3_set_ctx(&v3, x, x, NULL, NULL, 0);
+    X509_EXTENSION *san = X509V3_EXT_conf_nid(NULL, &v3, NID_subject_alt_name, "IP:127.0.0.1");
+    if (san != NULL) {
+        X509_add_ext(x, san, -1);
+        X509_EXTENSION_free(san);
+    }
     X509_sign(x, pk, EVP_sha256());
     FILE *cf = fopen(cert_path, "w");
     FILE *kf = fopen(key_path, "w");
@@ -831,6 +842,81 @@ static void test_pool_failover(void) {
     akvd_stop(replica);
 }
 
+#ifdef AKV_HAVE_TLS
+/*
+ * Encrypted native listener and replication link: an encrypted client verified against the certificate, an
+ * unencrypted client refused, and a replica that verifies its primary and requires client certificates.
+ */
+static void test_native_tls(void) {
+    char cert[] = "/tmp/akv-test-ncert-XXXXXX";
+    char key[] = "/tmp/akv-test-nkey-XXXXXX";
+    close(mkstemp(cert));
+    close(mkstemp(key));
+    EXPECT(make_cert(cert, key) == 0, "certificate generation");
+    akvd_config cfg;
+    base_config(&cfg);
+    cfg.memcached_port = NULL;
+    cfg.resp_port = NULL;
+    cfg.native_tls = 1;
+    cfg.tls_cert = cert;
+    cfg.tls_key = key;
+    int err;
+    akvd *primary = akvd_start(&cfg, &err);
+    EXPECT(primary != NULL, "encrypted primary: %d", err);
+    if (primary == NULL) {
+        return;
+    }
+    char pport[16];
+    snprintf(pport, sizeof(pport), "%d", akvd_port(primary));
+    cfg.replicaof_host = "127.0.0.1";
+    cfg.replicaof_port = pport;
+    cfg.tls_ca = cert;
+    akvd *replica = akvd_start(&cfg, &err);
+    EXPECT(replica != NULL, "encrypted replica: %d", err);
+
+    struct duct_opts o = client_opts();
+    o.tls = 1;
+    o.tls_ca = cert;
+    akvc *c = NULL;
+    EXPECT(akvc_connect(&c, &o, "127.0.0.1", pport) == 0, "encrypted client verifies the primary");
+    if (c != NULL) {
+        char big[60000];
+        memset(big, 'b', sizeof(big));
+        EXPECT(akvc_put(c, "k", 1, "secret", 6) == AKVP_OK, "write over the encrypted endpoint");
+        EXPECT(akvc_put(c, "big", 3, big, sizeof(big)) == AKVP_OK, "60000-byte value");
+        EXPECT(read_until(c, "k", "secret"), "read over the encrypted endpoint");
+        akvc_close(c);
+    }
+    struct duct_opts plain = client_opts();
+    akvc *p = NULL;
+    if (akvc_connect(&p, &plain, "127.0.0.1", pport) == 0) {
+        EXPECT(akvc_put(p, "x", 1, "v", 1) < 0, "unencrypted client refused");
+        akvc_close(p);
+    }
+    if (replica != NULL) {
+        char rport[16];
+        snprintf(rport, sizeof(rport), "%d", akvd_port(replica));
+        akvc *r = NULL;
+        if (akvc_connect(&r, &o, "127.0.0.1", rport) == 0) {
+            EXPECT(akvc_put(r, "x", 1, "v", 1) < 0, "replica refuses a client without a certificate");
+            akvc_close(r);
+        }
+        o.tls_cert = cert;
+        o.tls_key = key;
+        r = NULL;
+        EXPECT(akvc_connect(&r, &o, "127.0.0.1", rport) == 0, "client certificate accepted by the replica");
+        if (r != NULL) {
+            EXPECT(read_until(r, "k", "secret"), "the replica received the write over the encrypted link");
+            akvc_close(r);
+        }
+        akvd_stop(replica);
+    }
+    akvd_stop(primary);
+    unlink(cert);
+    unlink(key);
+}
+#endif
+
 int main(void) {
     akvd_config cfg;
     base_config(&cfg);
@@ -851,6 +937,7 @@ int main(void) {
     test_pool_failover();
 #ifdef AKV_HAVE_TLS
     test_tls();
+    test_native_tls();
 #else
     puts("test_net: TLS cases skipped (build with TLS=1)");
 #endif

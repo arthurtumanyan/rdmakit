@@ -13,6 +13,9 @@
  * (driver.h) are sent with AKVP_AUTH after connecting. The asynchronous interface posts requests with
  * akvc_post() within the client's window, sends the staged requests with akvc_push() in io(), and takes
  * responses with akvc_next(..., 0); the endpoint's rdmaduct descriptor drives the event loop.
+ * With --tls (kvpace, arenakv and rdmaduct built with TLS=1) connections are encrypted rdmaduct endpoints
+ * (server started with --native-tls): --cacert verifies the server (required unless --tls-skip-verify),
+ * --cert and --key send a client certificate, --sni names the expected server name.
  */
 #include <errno.h>
 #include <stdio.h>
@@ -20,8 +23,9 @@
 #include <string.h>
 #include <sys/epoll.h>
 
-#include "driver.h"
 #include "akvclient.h"
+#include "driver.h"
+#include "sock.h"
 
 static struct duct_opts g_opts;
 static int g_opts_init;
@@ -90,8 +94,36 @@ struct pace_conn {
     akvc *c;
 };
 
+/* Takes the encryption settings of the global TLS configuration (main.c) once. Returns 0 or -1. */
+static int tls_opts(void) {
+    static int done;
+    static int result;
+    if (done) {
+        return result;
+    }
+    done = 1;
+    const pace_tls_cfg *t = pace_tls_config();
+    if (!pace_tls_enabled()) {
+        return 0;
+    }
+    if (t->cacert == NULL && !t->skip_verify) {
+        fprintf(stderr, "native driver: --tls needs --cacert (or --tls-skip-verify)\n");
+        result = -1;
+        return result;
+    }
+    g_opts.tls = 1;
+    g_opts.tls_ca = t->skip_verify ? NULL : t->cacert;
+    g_opts.tls_cert = t->cert;
+    g_opts.tls_key = t->key;
+    g_opts.tls_server_name = t->sni;
+    return 0;
+}
+
 static pace_conn *native_connect(const char *host, const char *port) {
     opts_init();
+    if (tls_opts() != 0) {
+        return NULL;
+    }
     pace_conn *conn = malloc(sizeof(*conn));
     if (conn == NULL) {
         return NULL;

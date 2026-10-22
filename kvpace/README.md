@@ -273,10 +273,10 @@ The benchmark suite in [`../benchmarks`](../benchmarks) orchestrates these for t
 
 ## Limitations
 
-- No cluster-aware clients (Redis Cluster, consistent hashing over several servers) and no memcached binary
-  protocol.
+- The Redis Cluster driver (`resp-cluster`) is synchronous (one connection per thread); there is no consistent
+  hashing over several servers and no memcached binary protocol.
 - The KV-cache scenario uses the synchronous model (one connection per thread).
-- The native driver has no TLS; its RDMA transport is not encrypted.
+- The native driver encrypts with `--tls` only in `TLS=1` builds, and needs `--cacert` or `--tls-skip-verify`.
 - Keys are the prefix followed by 15 digits; the prefix is at most 32 bytes.
 - `kvpace merge` adds throughput and merges histograms; it does not check that the inputs ran at the same time.
 - Server CPU sampling has the 10 ms granularity of `/proc` and needs the server's host PID.

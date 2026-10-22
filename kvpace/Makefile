@@ -41,11 +41,11 @@ DUCT_DIR ?= ../rdmaduct
 NATIVE ?= $(if $(wildcard $(AKV_DIR)/include/akvclient.h),1,0)
 HAVE_RDMA_HEADERS := $(shell test -f /usr/include/infiniband/verbs.h && test -f /usr/include/rdma/rdma_cma.h && echo 1)
 # RDMA=0 links the native driver against the TCP-only builds of arenakv and rdmaduct, in separate directories.
-# DEP_OUT matches the output directories of both makefiles, which receive SAN through the command line. TLS=0
-# overrides a TLS=1 inherited through MAKEFLAGS: the native driver links the libraries built without TLS.
+# DEP_OUT matches the output directories of both makefiles, which receive SAN through the command line. With
+# TLS=1 the native driver links the TLS builds of both libraries (encrypted native connections with --tls).
 RDMA ?= $(if $(HAVE_RDMA_HEADERS),1,0)
-DEP_OUT := build/$(ARCH)$(if $(SAN),-san)$(if $(filter 0,$(RDMA)),-tcp)
-DEP_ARGS := TLS=0 $(if $(filter 0,$(RDMA)),RDMA=0)
+DEP_OUT := build/$(ARCH)$(if $(SAN),-san)$(if $(filter 0,$(RDMA)),-tcp)$(if $(filter 1,$(TLS)),-tls)
+DEP_ARGS := TLS=$(if $(filter 1,$(TLS)),1,0) $(if $(filter 0,$(RDMA)),RDMA=0)
 OUT := build/$(ARCH)$(if $(SAN),-san)$(if $(filter 0,$(RDMA)),-tcp)$(if $(filter 1,$(TLS)),-tls)
 ifeq ($(NATIVE),1)
 CFLAGS += -DPACE_HAVE_NATIVE -I$(AKV_DIR)/include -I$(DUCT_DIR)/include

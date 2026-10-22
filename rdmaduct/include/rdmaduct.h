@@ -86,6 +86,27 @@ struct duct_opts {
     int connect_timeout_ms;
     /* Waiting strategy of RDMA endpoints. */
     enum duct_wait wait;
+    /*
+     * Encryption (libraries built with TLS=1; otherwise duct_ctx_create() returns -ENOTSUP when tls is 1).
+     * With tls = 1 every endpoint of the context runs a TLS 1.3 handshake inside its first messages and
+     * then encrypts each message with AES-256-GCM (17 bytes of overhead per message, so
+     * duct_ep_peer_max_msg() is 17 bytes less than without encryption). Both sides must set tls.
+     * duct_send_mr(), one-sided operations and duct_wait() return -ENOTSUP on encrypted endpoints.
+     *   tls_cert, tls_key  PEM certificate chain and private key; required for duct_listen(), and sent as a
+     *                      client certificate by duct_connect() when set
+     *   tls_ca             PEM CA bundle. Connecting side: the server certificate must chain to it and match
+     *                      tls_server_name (or the address passed to duct_connect()). Listening side: clients
+     *                      must present a certificate that chains to it. NULL: the peer is not verified, which
+     *                      leaves the connection open to an active man in the middle.
+     *   tls_server_name    host name or address the server certificate must match; NULL uses the address
+     *                      passed to duct_connect()
+     * The paths are read by duct_ctx_create() and need not stay valid afterwards.
+     */
+    int tls;
+    const char *tls_cert;
+    const char *tls_key;
+    const char *tls_ca;
+    const char *tls_server_name;
 };
 
 /* One message of a batch for duct_send_batch(). */
@@ -102,7 +123,10 @@ struct duct_rx {
     uint64_t token;
 };
 
-/* Fills o with defaults: AUTO transport, 64 KiB messages, 32 receive and 32 send buffers, 10 s connect timeout, polling wait. */
+/*
+ * Fills o with defaults: AUTO transport, 64 KiB messages, 32 receive and 32 send buffers, 10 s connect timeout,
+ * polling wait, no encryption.
+ */
 void duct_opts_default(struct duct_opts *o);
 
 /* Returns a static description of an error code returned by this library. */
@@ -126,13 +150,18 @@ int duct_listen(duct_ctx *ctx, const char *addr, const char *port, duct_listener
 /* Returns the bound port of a listener. */
 int duct_listener_port(const duct_listener *l);
 
-/* Waits for and completes one incoming connection. timeout_ms: -1 infinite, 0 poll. Returns -ETIMEDOUT on timeout. */
+/*
+ * Waits for and completes one incoming connection. timeout_ms: -1 infinite, 0 poll. Returns -ETIMEDOUT on timeout.
+ * On an encrypted context the endpoint is returned before its TLS handshake has finished; the handshake
+ * advances inside duct_recv(), duct_progress() and duct_ep_arm(), delivers no message until it completes, and
+ * fails with DUCT_EPROTO when it does not complete within connect_timeout_ms or the peer is not accepted.
+ */
 int duct_accept(duct_listener *l, int timeout_ms, duct_ep **out);
 
 /* Closes a listener. */
 void duct_listener_close(duct_listener *l);
 
-/* Connects to a listener. */
+/* Connects to a listener. On an encrypted context the TLS handshake completes before the call returns. */
 int duct_connect(duct_ctx *ctx, const char *addr, const char *port, duct_ep **out);
 
 /* Closes an endpoint; the peer observes DUCT_ECLOSED. Safe to call with NULL. */

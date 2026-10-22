@@ -16,8 +16,8 @@ OUT := build/$(ARCH)$(if $(SAN),-san)$(if $(TSAN),-tsan)$(if $(filter 0,$(RDMA))
 CFLAGS += -std=gnu2x -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude -Isrc -I$(DUCT_DIR)/include
 LDLIBS += -lpthread
 # Must match the output directory of the rdmaduct makefile, which receives SAN through the command line.
-DUCT_BUILD := $(DUCT_DIR)/build/$(ARCH)$(if $(SAN),-san)$(if $(filter 0,$(RDMA)),-tcp)
-DUCT_MAKE_ARGS := $(if $(filter 0,$(RDMA)),RDMA=0)
+DUCT_BUILD := $(DUCT_DIR)/build/$(ARCH)$(if $(SAN),-san)$(if $(filter 0,$(RDMA)),-tcp)$(if $(filter 1,$(TLS)),-tls)
+DUCT_MAKE_ARGS := $(if $(filter 0,$(RDMA)),RDMA=0) $(if $(filter 1,$(TLS)),TLS=1)
 DUCT_LIB := $(DUCT_BUILD)/librdmaduct.a
 ifeq ($(RDMA),1)
 LDLIBS += -lrdmacm -libverbs

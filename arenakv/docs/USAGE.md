@@ -117,6 +117,7 @@ that names the option and the accepted range.
 | `--tls-memcached-port`, `--tls-resp-port` | off | TLS listeners; need `--tls-cert` and `--tls-key` and a `TLS=1` build |
 | `--tls-cert FILE`, `--tls-key FILE` | | server certificate chain and private key, PEM |
 | `--tls-ca FILE` | | require client certificates signed by a CA in FILE |
+| `--native-tls` | off | encrypt the native listener and replication links with the same files ([OPERATIONS](OPERATIONS.md#encrypted-native-protocol)) |
 | `--capacity SIZE` | 256M | cache memory; at least 4 KiB per shard |
 | `--shards N` | 64 | power of two from 1 to 1024 |
 | `--max-entry SIZE` | 1M | largest key + value; also limited to half of a shard's memory (`capacity / shards / 2`) |
@@ -467,6 +468,11 @@ hello world
 | `--auth CREDENTIALS` | | `user:password`, or a password of the user `default` |
 | `--ttl SECONDS`, `--flags N` | none, 0 | expiry and client flags for `set`, `add`, `replace` |
 | `--max-msg BYTES` | 1048640 | message limit of the client; the smaller of client and server limit applies |
+| `--tls` | off | encrypted connection to a server with `--native-tls` (`TLS=1` build) |
+| `--cacert FILE` | | CA bundle the server certificate must chain to; required with `--tls` unless `--insecure` |
+| `--cert FILE`, `--key FILE` | | client certificate and key, for servers started with `--tls-ca` |
+| `--sni NAME` | `--host` | name or address the server certificate must match |
+| `--insecure` | | do not verify the server certificate |
 
 | Command | Output | Exit status |
 |---|---|---|

@@ -22,6 +22,7 @@ Non-goals: multiple NICs, security, GPU memory, collectives. Each would change t
 | `src/tcp.c` | TCP transport |
 | `src/rdma.c` | RDMA transport (compiled only with `DUCT_HAVE_RDMA`) |
 | `src/hello.c` | encoding and validation of the connection handshake and of region descriptors |
+| `src/tls.c` | encrypted endpoints, layered over a TCP or RDMA endpoint (compiled with `DUCT_HAVE_TLS`, `TLS=1`) |
 | `tools/duct_echo.c`, `tools/duct_bench.c` | manual test tool, benchmark |
 | `tests/` | suites; `suite.h` holds the transport-independent echo and stress tests |
 
@@ -104,6 +105,33 @@ The local `released_total` reaches the peer in two ways: as the immediate data o
 
 Verification (flow control): `tests/suite.h` streams sequence-numbered messages of random sizes in random batch sizes to a consumer that sleeps and keeps three messages unreleased; `tests/test_rdma.c` asserts that the device counters `send_rnr_err` and `rcvd_rnr_err` do not change during the run.
 
+## Encrypted endpoints
+
+`src/tls.c` wraps an endpoint of either transport in an endpoint with the same operation table, so the transports
+are unchanged. Every message of the inner endpoint starts with a type byte:
+
+| Type | Content |
+|---|---|
+| 1, handshake | TLS records written by OpenSSL into a memory BIO (one message per flight) |
+| 2, data | the ciphertext of one application message, then the 16-byte GCM tag |
+
+Keys: after the handshake both sides take 88 bytes from the TLS exporter (RFC 8446, section 7.5; label
+`EXPORTER-rdmaduct-message-keys`, no context): client-to-server key (32 bytes) and IV (12), then server-to-client
+key and IV. The nonce of message number n of a direction is the IV with n XORed into its last 8 bytes
+(big-endian), as TLS 1.3 forms record nonces (RFC 8446, section 5.3); both sides count the same n because the inner
+transport is reliable and ordered. The type byte is the additional authenticated data. After 2^24 messages of a
+direction (RFC 8446, section 5.5 limits AES-GCM to 2^24.5 full-size records per key) both sides replace its key
+and IV with HMAC-SHA256 of the old key over a fixed label and the generation number. Session tickets are disabled,
+so that no handshake record follows the first data message; a handshake message after it, or an unknown type,
+breaks the endpoint.
+
+Batches: the message numbers must match the messages the peer receives, but a timed-out batch of the inner
+transport does not report how many messages it sent. An encrypted batch is therefore sealed in full into a staging
+buffer and sent with `send_some`; when nothing is accepted, one blocking `send` of the next message waits for
+space. The transmit state advances only by the messages accepted.
+
+Not supported: registered-memory sends, one-sided operations and `wait` return `-ENOTSUP`.
+
 ## Error model
 Negative return values: `-errno` or `DUCT_E*`. `-ETIMEDOUT` leaves the endpoint usable. Any other transport error is sticky: every later call on the endpoint returns the same code.
 
@@ -117,6 +145,7 @@ Negative return values: `-errno` or `DUCT_E*`. `-ETIMEDOUT` leaves the endpoint 
 | `test_mr` | registered regions, zero-copy send, read/write up to 256 KiB, pipelined operations, atomics, local validation, remote violations | TCP; RDMA in both wait modes when `DUCT_TEST_ADDR` is set |
 | `test_rdma` | the same echo suite and stream stress in both waiting modes, device receiver-not-ready counters unchanged, idle CPU use of both modes | needs an RDMA device; the counter check is only meaningful when no other process uses the device |
 | `test_faults` | raw-socket attacks on TCP framing and handshake, 1500 random streams, 1500 random control frames, refused connections, abrupt close in both waiting modes, asymmetric limits, connect/disconnect cycles with a descriptor-leak check | `DUCT_CYCLES` sets the cycle count (default 300) |
+| `test_tls` | encrypted endpoints: every message size, batches, poll-driven server, certificate checks (address, name, wrong CA, client certificates), unencrypted peers, a changed ciphertext byte through a relay, handshake timeout, key updates every five messages, refused operations | `TLS=1`; TCP, and RDMA in both wait modes when `DUCT_TEST_ADDR` is set |
 | examples | `hello_server`/`hello_client` over TCP and RDMA | `tests/run_examples.sh` |
 
 Run under sanitizers with `make SAN=1 test`. A long streaming stress: `DUCT_STRESS_COUNT=100000000 make test-rdma`.

@@ -20,7 +20,7 @@ code as it is; it is not the result of an external review. Reporting: [`../SECUR
 |---|---|---|---|
 | RESP listener (`--resp-port`) | any host that can open a TCP connection to it | RESP2 commands | authentication and per-user rights when an ACL or credentials file is configured; TLS with `TLS=1`; `--text-addr` limits the bound address |
 | memcached listener (`--memcached-port`) | as above | text and meta commands | as above |
-| native listener (`--port`) | as above, over TCP or RDMA (RoCE or InfiniBand) | the binary protocol of `akvproto.h` | authentication and per-user rights; no encryption |
+| native listener (`--port`) | as above, over TCP or RDMA (RoCE or InfiniBand) | the binary protocol of `akvproto.h` | authentication and per-user rights; encryption and optional client certificates with `--native-tls` (`TLS=1`) |
 | configuration, ACL and credentials files | local users with write access to them | options, users and rules | file permissions only; the server reads them at start (`ACL LOAD` rereads the ACL file) |
 | snapshot, append-only log, warm-restart file | local users with access to the files or directories | the server's own formats | CRC32C per block, magic numbers, length and position checks; file permissions (0600 / 0700 for files the server creates) |
 
@@ -34,8 +34,8 @@ on a server without access control is trusted with everything.
 | reading or changing data without permission | network | `--aclfile`: commands, categories and key patterns per user; `connection` commands are the only ones open before authentication | without `--aclfile` or `--auth-file` every client has full access; `KEYS` and `SCAN` reveal key names to users who may run them, whatever their key patterns |
 | password guessing | network | wrong passwords are counted (`auth_errors`) | no rate limiting or lockout; passwords are compared as SHA-256 hashes, so weak passwords are as weak as their entropy |
 | stealing a password from a file | local | ACL files may hold only hashes (`#hash`) | SHA-256 without salt is fast to brute-force for short passwords; credentials files of earlier versions hold passwords in clear text |
-| eavesdropping, tampering in transit | network | TLS 1.2 or newer on the text listeners (`TLS=1`), with optional client certificates | the native protocol is not encrypted on either transport; passwords sent over it are visible |
-| malformed input crashing or corrupting the server | network | bounds checks in every parser; the memcached, RESP and native parsers, the snapshot and log loaders, the ACL parser, and the rdmaduct handshake and TCP framing are fuzzed with libFuzzer under AddressSanitizer and UBSan (`make fuzz`), and the test suites run under AddressSanitizer, UBSan and ThreadSanitizer | fuzzing finds what its harnesses reach; it is not a proof |
+| eavesdropping, tampering in transit | network | TLS 1.2 or newer on the text listeners (`TLS=1`), with optional client certificates; with `--native-tls` the native protocol and replication links over TCP and RDMA use a TLS 1.3 handshake and AES-256-GCM per message, and a changed message breaks the connection | without `--native-tls` the native protocol is not encrypted and passwords sent over it are visible; a client without a CA (`akv_cli --insecure`) or a replica without `--tls-ca` does not verify the server; the record layer in `rdmaduct/src/tls.c` is not a standard protocol and has had no outside review |
+| malformed input crashing or corrupting the server | network | bounds checks in every parser; the memcached, RESP and native parsers, the snapshot and log loaders, the ACL parser, and the rdmaduct handshake, TCP framing and encrypted records are fuzzed with libFuzzer under AddressSanitizer and UBSan (`make fuzz`), and the test suites run under AddressSanitizer, UBSan and ThreadSanitizer | fuzzing finds what its harnesses reach; it is not a proof |
 | memory exhaustion | network | the cache has a fixed capacity; text connections buffer at most `2 * max-entry + 1 MiB` of input and stop reading above 4 MiB of pending replies; native connections have fixed buffers; `--max-conns` and `--idle-timeout` | every connection costs memory up to these bounds; there is no per-user quota |
 | CPU exhaustion | network | key patterns are matched in O(pattern x key) time; requests are served in bounded turns per connection | expensive commands (`KEYS`, `FLUSHALL`, large `MGET`) are limited only by ACL categories |
 | hash flooding | network | the key hash is seeded randomly when the engine is created (the server has no option to fix it); a warm restart keeps the seed in the warm-restart file | a local user who can read that file learns the seed |
@@ -55,7 +55,8 @@ on a server without access control is trusted with everything.
 - Configure `--aclfile` with a user per application, `user default off`, and no `@dangerous` or `@admin` rights for
   applications.
 - Bind listeners to internal addresses (`--addr`, `--text-addr`) and filter the ports.
-- Use the TLS listeners when the network is not trusted; do not expose the native listener there.
+- Use the TLS listeners and `--native-tls` when the network is not trusted; never expose an unencrypted native
+  listener there.
 - Keep the configuration, ACL file, snapshots and log readable by the server's user only.
 - Keep the warm-restart file (it holds the cache contents and the hash seed) readable by the server's user only;
   the server creates it with mode 0600.

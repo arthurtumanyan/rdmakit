@@ -4,12 +4,14 @@ The software in this repository is experimental and is meant for trusted network
 
 ## Known properties
 
-- **Authentication and encryption.** `rdmaduct` does not authenticate peers or encrypt traffic on either transport.
+- **Authentication and encryption.** `rdmaduct` encrypts and authenticates peers only on contexts created with
+  `tls` (`TLS=1` builds: a TLS 1.3 handshake, certificates, then AES-256-GCM per message, on TCP and RDMA); without
+  it, nothing is encrypted or authenticated.
   `arenakvd` authenticates clients of every protocol when started with `--aclfile` (users with SHA-256 password
   hashes and per-user rights over commands, categories and key patterns) or `--auth-file` (credentials of earlier
   versions; every user has all rights), and encrypts the memcached and RESP listeners with TLS 1.2 or newer in builds
-  with `TLS=1`. The native protocol over rdmaduct is not encrypted. Without either file any client that can connect
-  has full access.
+  with `TLS=1`. With `--native-tls` the native protocol and the replication links use encrypted rdmaduct endpoints;
+  otherwise they are not encrypted. Without either file any client that can connect has full access.
 - **Remote memory access.** Over RDMA, each connection exposes a 4 KiB page of the endpoint (the flow-control
   credit word) to the peer with remote-write access. Data buffers are registered for local access only. Remote keys
   of some RDMA hardware have been shown to be predictable in the literature (for example the ReDMArk study);

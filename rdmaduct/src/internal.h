@@ -70,6 +70,12 @@ struct duct_ctx {
     pthread_mutex_t mr_lock;
     struct duct_mr *mrs;
     uint32_t next_key;
+    /* TLS=1 builds: OpenSSL SSL_CTX of each role (tls.c); NULL when the context is not encrypted. */
+    void *tls_client;
+    void *tls_server;
+    /* Peer verification configured (a CA was given), and the copied tls_server_name (or NULL). */
+    int tls_verify;
+    char *tls_name;
 };
 
 struct duct_mr {
@@ -188,6 +194,15 @@ static inline int duct_remaining_ms(int64_t deadline) {
     int64_t left = deadline - duct_now_ms();
     return left > 0 ? (int)left : 0;
 }
+
+#ifdef DUCT_HAVE_TLS
+/* Encrypted endpoints (tls.c). The wrapping functions take ownership of inner, also on failure. */
+int duct_tls_ctx_init(duct_ctx *ctx, const struct duct_opts *o);
+void duct_tls_ctx_fini(duct_ctx *ctx);
+int duct_tls_client(duct_ctx *ctx, duct_ep *inner, const char *name, duct_ep **out);
+int duct_tls_server(duct_ctx *ctx, duct_ep *inner, duct_ep **out);
+void duct_tls_set_rekey_interval(uint64_t n);
+#endif
 
 /* Transport entry points. */
 int duct_tcp_listen(duct_ctx *ctx, const char *addr, const char *port, duct_listener **out);

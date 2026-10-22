@@ -9,6 +9,12 @@
  *   --ttl SECONDS          expiry for set, add, replace (default: none)
  *   --flags N              client flags for set, add, replace (default: 0)
  *   --max-msg BYTES        message size limit, bounds key + value + 36 (default: 1 MiB + 64)
+ *   --tls                  encrypted connection (server started with --native-tls; build with TLS=1)
+ *   --cacert FILE          CA bundle that the server certificate must chain to (required with --tls
+ *                          unless --insecure is given)
+ *   --cert FILE, --key FILE  client certificate and key, for servers that require one
+ *   --sni NAME             name the server certificate must match (default: --host)
+ *   --insecure             do not verify the server certificate
  * Commands:
  *   get KEY                 print the value (raw bytes, no newline added)
  *   meta KEY                print flags, CAS version and remaining time to live
@@ -38,6 +44,11 @@ static const char usage[] =
     "  --ttl SECONDS          expiry for set, add, replace (default: none)\n"
     "  --flags N              client flags for set, add, replace (default: 0)\n"
     "  --max-msg BYTES        message size limit, bounds key + value + 36 (default: 1048640)\n"
+    "  --tls                  encrypted connection (server with --native-tls)\n"
+    "  --cacert FILE          CA bundle for the server certificate (required with --tls)\n"
+    "  --cert FILE, --key FILE  client certificate and key\n"
+    "  --sni NAME             name the server certificate must match (default: --host)\n"
+    "  --insecure             do not verify the server certificate\n"
     "Commands:\n"
     "  get KEY                print the value (raw bytes)\n"
     "  meta KEY               print flags, CAS version and remaining time to live\n"
@@ -145,6 +156,7 @@ int main(int argc, char **argv) {
     int64_t ttl_s = 0;
     int64_t uflags = 0;
     int64_t max_msg = DEFAULT_MAX_MSG;
+    int insecure = 0;
     struct duct_opts opts;
     duct_opts_default(&opts);
     opts.transport = DUCT_TRANSPORT_TCP;
@@ -156,6 +168,12 @@ int main(int argc, char **argv) {
         {"ttl", required_argument, NULL, 'T'},
         {"flags", required_argument, NULL, 'f'},
         {"max-msg", required_argument, NULL, 'm'},
+        {"tls", no_argument, NULL, 1},
+        {"cacert", required_argument, NULL, 2},
+        {"cert", required_argument, NULL, 3},
+        {"key", required_argument, NULL, 4},
+        {"sni", required_argument, NULL, 5},
+        {"insecure", no_argument, NULL, 6},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -201,6 +219,24 @@ int main(int argc, char **argv) {
                 return 2;
             }
             break;
+        case 1:
+            opts.tls = 1;
+            break;
+        case 2:
+            opts.tls_ca = optarg;
+            break;
+        case 3:
+            opts.tls_cert = optarg;
+            break;
+        case 4:
+            opts.tls_key = optarg;
+            break;
+        case 5:
+            opts.tls_server_name = optarg;
+            break;
+        case 6:
+            insecure = 1;
+            break;
         case 'h':
             fputs(usage, stdout);
             return 0;
@@ -211,6 +247,18 @@ int main(int argc, char **argv) {
     }
     if (optind >= argc) {
         fputs(usage, stderr);
+        return 2;
+    }
+    if (opts.tls && opts.tls_ca == NULL && !insecure) {
+        fprintf(stderr, "akv_cli: --tls needs --cacert FILE (or --insecure to skip verification)\n");
+        return 2;
+    }
+    if (!opts.tls && (opts.tls_ca != NULL || opts.tls_cert != NULL || insecure)) {
+        fprintf(stderr, "akv_cli: --cacert, --cert and --insecure need --tls\n");
+        return 2;
+    }
+    if ((opts.tls_cert == NULL) != (opts.tls_key == NULL)) {
+        fprintf(stderr, "akv_cli: --cert and --key are used together\n");
         return 2;
     }
     const char *cmd = argv[optind];

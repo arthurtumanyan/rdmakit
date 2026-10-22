@@ -14,7 +14,7 @@ instructions, and evicts with a second chance.
   pollable descriptors.
 - Access control for all protocols: users with passwords and per-user rights over commands, categories and key
   patterns, in a subset of the Valkey ACL file syntax (`ACL LIST`, `ACL DRYRUN`, `ACL LOAD`); TLS for the text
-  protocols (optional OpenSSL build); configuration file, log rotation, systemd unit and container image.
+  protocols and encryption of the native protocol and replication links over TCP and RDMA (optional OpenSSL build); configuration file, log rotation, systemd unit and container image.
 - Persistence: snapshots, an append-only log of every change with the fsync policies of Valkey (`always`,
   `everysec`, `no`) and background rewrites, and warm restart (the cache memory survives a restart of the process).
   Every file block is CRC-checked.
@@ -56,7 +56,7 @@ below show where `arenakv` is in the same range, where it is better, and where i
 | Target values | large, mostly immutable blocks | small to medium objects | data structures | data structures |
 | Memory layout | log-structured arena per shard | slab allocator | per-object allocation (jemalloc) | per-object allocation (mimalloc) |
 | Eviction | second chance in write order | segmented LRU | approximate LRU / LFU policies | cache mode (2Q-based) |
-| Network transport | TCP, TLS, RDMA reliable connections | TCP, UDP, Unix sockets, TLS | TCP, Unix sockets, TLS | TCP, Unix sockets, TLS |
+| Network transport | TCP, TLS, RDMA reliable connections (encrypted with `--native-tls`) | TCP, UDP, Unix sockets, TLS | TCP, Unix sockets, TLS | TCP, Unix sockets, TLS |
 | Protocols | memcached text and meta, RESP2 and RESP3, native binary ([PROTOCOL.md](docs/PROTOCOL.md)) | text, meta, binary | RESP2, RESP3 | RESP2, RESP3, memcached text |
 | Expiry, CAS, conditional stores, increments | yes | yes | yes | yes |
 | Transactions, pub/sub | MULTI/EXEC/WATCH, SUBSCRIBE/PSUBSCRIBE/PUBLISH (RESP) | no | yes | yes |
@@ -242,7 +242,7 @@ and clang on x86-64 and arm64.
 | `test_proto` | memcached and RESP commands with exact replies, also fed one byte at a time; framing errors; authentication; per-user rights in all three protocols, the ACL commands and `ACL LOAD`; extreme expiry values; one million fuzzed inputs |
 | `test_acl` | SHA-256 against the FIPS 180-4 vectors, glob patterns, every ACL rule and the order of rules, error messages with line numbers, logins, credentials files of earlier versions |
 | `tests/fuzz` | libFuzzer harnesses for the RESP, memcached and native protocols, the snapshot and log loaders, the ACL parser and glob matching (`make fuzz`) |
-| `test_net` | pipelining, large values and backpressure on real sockets, 16 concurrent clients, connection limit, idle timeout, snapshots (round trip, expiry across downtime, corruption, truncation), TLS, native revision 2, consistent hashing |
+| `test_net` | pipelining, large values and backpressure on real sockets, 16 concurrent clients, connection limit, idle timeout, snapshots (round trip, expiry across downtime, corruption, truncation), TLS, native revision 2, consistent hashing; with `TLS=1` an encrypted native client, an unencrypted client refused, a replica that verifies its primary and requires client certificates |
 | `test_feed` | change feed replayed into a second engine gives the identical state (with eviction, expiry, flush, index-window drops); transaction ids; lock sets under concurrency; warm restart round trip, expiry across the downtime, changed configuration, missing detach, damaged header |
 | `test_aof` | append-only log round trip, rewrites while four threads write, automatic rewrites, torn and zero-filled tails, damage before the end, incomplete transactions, durable sequence numbers |
 | `durability.py` | `SIGKILL` of a writing server with `always` (no acknowledged write lost) and `everysec` (losses only from the last 2 s), `SIGKILL` during a rewrite, warm restart with identical contents |
@@ -279,6 +279,7 @@ END
 | `--port PORT\|off`, `--addr`, `--transport tcp\|rdma\|auto`, `--wait poll\|event` | 7600, all, auto, event | native listener over rdmaduct |
 | `--memcached-port`, `--resp-port`, `--text-addr` | off, off, all | text protocol listeners |
 | `--tls-memcached-port`, `--tls-resp-port`, `--tls-cert`, `--tls-key`, `--tls-ca` | off | TLS listeners (TLS builds) |
+| `--native-tls` | off | encrypt the native listener and replication links (TLS builds) |
 | `--capacity SIZE` | 256M | cache memory (suffix K, M, G) |
 | `--max-entry SIZE` | 1M | largest key + value |
 | `--shards N` | 64 | engine shards, power of two |

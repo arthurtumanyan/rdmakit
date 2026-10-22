@@ -91,6 +91,13 @@ every operation other than AUTH and NOOP answers `AKVP_NOAUTH` until AUTH succee
 - The message size limit is negotiated by `rdmaduct` (the smaller of the two `max_msg` values) and bounds requests
   and responses; GET and MGET answer `AKVP_TOOBIG` when the response would exceed it.
 
+## Encryption
+
+A server started with `--native-tls` runs every connection over an encrypted rdmaduct endpoint. The requests and
+responses above are unchanged; rdmaduct carries each of them as one AES-256-GCM record of 17 more bytes, which
+reduces the largest request and response by 17 bytes (the record format is in
+[`../../rdmaduct/docs/ARCHITECTURE.md`](../../rdmaduct/docs/ARCHITECTURE.md#encrypted-endpoints)).
+
 ## Versioning
 
 The protocol has no version field. Revision 2 only added operation codes, status codes and an optional extension

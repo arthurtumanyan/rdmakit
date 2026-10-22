@@ -18,6 +18,8 @@
  *   --resp-port PORT            RESP2 / Redis protocol (default: off)
  *   --tls-memcached-port PORT, --tls-resp-port PORT, --tls-cert FILE, --tls-key FILE, --tls-ca FILE
  *                               TLS listeners (build with TLS=1)
+ *   --native-tls                encrypt the native listener and replication links (TLS=1; uses
+ *                               --tls-cert, --tls-key and --tls-ca)
  * Engine:
  *   --capacity SIZE             cache memory, with optional K, M or G suffix (default: 256M)
  *   --shards N                  shards, power of two (default: 64)
@@ -96,6 +98,7 @@ static const char usage[] =
     "  --tls-memcached-port PORT, --tls-resp-port PORT   TLS listeners (build with TLS=1)\n"
     "  --tls-cert FILE, --tls-key FILE   server certificate chain and private key (PEM)\n"
     "  --tls-ca FILE               require client certificates signed by this CA\n"
+    "  --native-tls                encrypt the native listener and replication links (TLS=1)\n"
     "Engine:\n"
     "  --capacity SIZE             cache memory, with optional K, M or G suffix (default: 256M)\n"
     "  --shards N                  shards, power of two up to 1024 (default: 64)\n"
@@ -269,6 +272,7 @@ static const struct option lo[] = {
     {"primary-auth", required_argument, NULL, 1022},
     {"replica-read-only", required_argument, NULL, 1023},
     {"repl-backlog-size", required_argument, NULL, 1024},
+    {"native-tls", no_argument, NULL, 1027},
     {"help", no_argument, NULL, 'h'},
     {"version", no_argument, NULL, 'V'},
     {NULL, 0, NULL, 0},
@@ -641,6 +645,9 @@ int main(int argc, char **argv) {
                 return bad_value(name, optarg, "yes or no");
             }
             break;
+        case 1027:
+            cfg.native_tls = 1;
+            break;
         case 1024:
             cfg.repl_backlog_size = (size_t)parse_size(optarg);
             if (cfg.repl_backlog_size < 4096) {
@@ -677,6 +684,10 @@ int main(int argc, char **argv) {
     if ((cfg.tls_memcached_port != NULL || cfg.tls_resp_port != NULL) &&
         (cfg.tls_cert == NULL || cfg.tls_key == NULL)) {
         fprintf(stderr, "arenakvd: TLS listeners need --tls-cert and --tls-key\n");
+        return 2;
+    }
+    if (cfg.native_tls && (cfg.tls_cert == NULL || cfg.tls_key == NULL)) {
+        fprintf(stderr, "arenakvd: --native-tls needs --tls-cert and --tls-key\n");
         return 2;
     }
     if ((cfg.cluster_config == NULL) != (cfg.cluster_node_id == NULL)) {

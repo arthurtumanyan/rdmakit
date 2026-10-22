@@ -235,15 +235,45 @@ VERSION 1.6.0-arenakv-0.2.0
 $ kvpace --driver resp --port 6380 --tls --cacert ca.crt --sni localhost --duration 1      # TLS=1 build of kvpace
 ```
 
-The certificate and key are read at start; a renewed certificate takes effect after a restart. The native protocol
-over rdmaduct is never encrypted, over TCP or RDMA.
+The certificate and key are read at start; a renewed certificate takes effect after a restart.
+
+### Encrypted native protocol
+
+`--native-tls` encrypts the native listener and the replication links, over TCP and over RDMA (rdmaduct encrypted
+endpoints: a TLS 1.3 handshake, then AES-256-GCM per message; [`../../rdmaduct/README.md`](../../rdmaduct/README.md#encryption)).
+It uses the same `--tls-cert`, `--tls-key` and `--tls-ca` as the TLS listeners and needs a `TLS=1` build. With
+`--tls-ca`, native clients must present a certificate signed by a CA in the file, and a replica verifies its
+primary's certificate against it and against the host given to `--replicaof`; a replica without `--tls-ca` logs a
+warning, because its link is then encrypted but the primary is not verified. Every node of a replication group
+must use the same setting: an unencrypted peer is disconnected. Each message costs 17 bytes of the message limit.
+
+The session below uses the certificates from above, a primary on port 17600 and a replica on 17601 that requires
+client certificates (`arenakvd --port 17600 --native-tls --tls-cert server.crt --tls-key server.key` and
+`arenakvd --port 17601 --native-tls --tls-cert server.crt --tls-key server.key --tls-ca ca.crt --replicaof
+127.0.0.1:17600`):
+
+```
+$ akv_cli --port 17600 --tls --cacert ca.crt set t1 secure
+$ akv_cli --port 17600 --tls --cacert ca.crt --sni cache.example.net get t1
+secure
+$ akv_cli --port 17600 --tls --cacert ca.crt --sni other.example.net get t1
+akv_cli: cannot connect to 127.0.0.1:17600: protocol violation
+$ akv_cli --port 17600 get t1
+akv_cli: connection closed by peer
+$ akv_cli --port 17601 --tls --cacert ca.crt --cert server.crt --key server.key get t1
+secure
+```
+
+The C client takes the same settings in `struct duct_opts` (`tls`, `tls_ca`, `tls_cert`, `tls_key`,
+`tls_server_name`), and `kvpace --driver native --tls --cacert ca.crt` measures the encrypted path. Registered-memory
+and one-sided rdmaduct operations are not available on encrypted endpoints; the native protocol uses neither.
 
 ## Network exposure
 
 - Bind the text listeners to the addresses clients use (`--text-addr`) and the native listener with `--addr`; the
   defaults listen on all IPv4 addresses.
-- Expose the plain listeners only to trusted networks, use `--auth-file` everywhere, and TLS where traffic crosses
-  untrusted links. Over RDMA each connection exposes a 4 KiB flow-control page to the peer with remote-write access
+- Expose the plain listeners only to trusted networks, use `--auth-file` everywhere, and TLS (and `--native-tls`)
+  where traffic crosses untrusted links. Over RDMA each connection exposes a 4 KiB flow-control page to the peer with remote-write access
   ([`../../SECURITY.md`](../../SECURITY.md)); do not accept RDMA connections from untrusted hosts.
 - There is no rate limiting; `--max-conns` and `--idle-timeout` bound the connections.
 

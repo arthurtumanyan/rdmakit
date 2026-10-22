@@ -16,7 +16,11 @@ the same API and the same behavior on both.
 - Builds without RDMA libraries (`make RDMA=0`) for machines without RDMA hardware.
 - Tested for faults and malformed input (see [Testing](#testing)).
 
-**Status:** experimental. The API may change before a first release. No encryption or authentication.
+- Optional encryption (`TLS=1`, OpenSSL 3): a TLS 1.3 handshake inside the first messages, then AES-256-GCM per
+  message, on both transports; see [Encryption](#encryption).
+
+**Status:** experimental. The API may change before a first release. Encryption is optional and has not been
+reviewed by an outside party.
 
 ## Why this exists
 
@@ -114,6 +118,7 @@ One-way streaming throughput in MB/s (batched sends, 64 buffers per direction). 
 ## Requirements
 
 - Linux, a C compiler with `-std=gnu2x` (gcc 13 or newer, clang 18 or newer), `make`, pthreads.
+- For encryption (`TLS=1`): OpenSSL 3 (`libssl-dev`).
 - For RDMA: `libibverbs-dev` and `librdmacm-dev` (Debian/Ubuntu names) and an RDMA device. Soft-RoCE
   (`rdma_rxe`) works for development: `sudo modprobe rdma_rxe && sudo rdma link add rxe0 type rxe netdev <interface>`.
 - Python 3 is not required.
@@ -124,9 +129,11 @@ One-way streaming throughput in MB/s (batched sends, 64 buffers per direction). 
 make                 # build/<arch>/librdmaduct.a, duct_echo, duct_bench, examples
 make RDMA=0          # TCP transport only: needs only libc and pthreads
 make SAN=1 test      # AddressSanitizer + UndefinedBehaviorSanitizer
+make TLS=1           # with encrypted endpoints (OpenSSL)
 ```
 
-`RDMA=0` builds go to `build/<arch>-tcp/`.
+`RDMA=0` builds go to `build/<arch>-tcp/`, `TLS=1` builds to a directory with the suffix `-tls`; link `TLS=1`
+builds with `-lssl -lcrypto` as well.
 
 Link with `build/<arch>/librdmaduct.a -lpthread` and, for RDMA builds, `-lrdmacm -libverbs`. Include path:
 `include/`.
@@ -238,6 +245,10 @@ target's CPU.
 | `send_depth` | 32 | send buffers per endpoint (RDMA) |
 | `connect_timeout_ms` | 10000 | connection setup timeout; `-1` waits indefinitely |
 | `wait` | `DUCT_WAIT_POLL` | RDMA waiting: spin on the completion queue, or sleep until an event |
+| `tls` | 0 | 1 encrypts every endpoint of the context (`TLS=1` builds; otherwise `duct_ctx_create` returns `-ENOTSUP`) |
+| `tls_cert`, `tls_key` | NULL | PEM certificate chain and key: required to listen; sent as client certificate when connecting |
+| `tls_ca` | NULL | PEM CA bundle: the connecting side verifies the server against it, the listening side requires client certificates signed by it; NULL verifies nothing |
+| `tls_server_name` | NULL | name or address the server certificate must match; NULL uses the address passed to `duct_connect` |
 
 The effective send limit of an endpoint is the smaller of the local and the peer's `max_msg`.
 
@@ -259,6 +270,25 @@ The effective send limit of an endpoint is the smaller of the local and the peer
 Negative `errno` values (`-ETIMEDOUT`, `-EMSGSIZE`, `-ECONNREFUSED`, ...) and `DUCT_ECLOSED` (peer closed),
 `DUCT_EPROTO` (protocol violation), `DUCT_EWC` (RDMA work completion error), `DUCT_ENODEV` (no usable RDMA device),
 `DUCT_EACCESS` (a one-sided operation violated the remote region's range or rights).
+
+## Encryption
+
+With `tls = 1` both sides of every connection of the context run a TLS 1.3 handshake (OpenSSL) inside their first
+rdmaduct messages. The connecting side completes it inside `duct_connect()`; an accepted endpoint is returned at
+once and completes it inside `duct_recv()`, `duct_progress()` and `duct_ep_arm()`, so that one slow client cannot
+hold up the thread that accepts; a handshake that does not finish within `connect_timeout_ms` fails with
+`DUCT_EPROTO`. Then each direction encrypts every message with AES-256-GCM, keyed from the TLS exporter
+(RFC 8446, section 7.5), with the message number as nonce and a new key after every 2^24 messages (RFC 8446,
+section 5.5). Each message carries 17 bytes more (a type byte and the 16-byte tag), so `duct_ep_peer_max_msg()` is
+17 bytes smaller. Messages are encrypted while they are copied into the send buffer and decrypted in place in the
+receive buffer. A message that fails authentication breaks the endpoint (`DUCT_EPROTO`).
+
+Not available on encrypted endpoints (`-ENOTSUP`): `duct_send_mr()`, one-sided reads, writes and atomics, and
+`duct_wait()`. A one-sided operation is executed by the peer's network adapter without the peer's CPU, so it cannot
+be encrypted this way. Both sides must set `tls`: an unencrypted peer fails with `DUCT_EPROTO`. Without `tls_ca`
+the peer is not verified, which leaves the connection open to an active man in the middle.
+
+The record format and state machine are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#encrypted-endpoints).
 
 ## Waiting modes
 
@@ -304,6 +334,7 @@ and clang on x86-64 and arm64.
 | `test_poll` | 64 connections per side driven by one epoll set per side with non-blocking sends; fails on any missed wake-up |
 | `test_mr` | write/read back up to 256 KiB, 64 pipelined writes, fetch-and-add and compare-and-swap, zero-copy send, local validation, `DUCT_EACCESS` for forged and deregistered regions |
 | `test_faults` | TCP framing, handshake and 1500 random control frames attacked through a raw socket; accept timeout, refused connections, asymmetric limits, abrupt close |
+| `test_tls` | encrypted endpoints (`TLS=1`): every message size, batches, a server that waits in `poll()`, verification by address and by name, wrong CA, wrong name, client certificates, unencrypted peers, a changed ciphertext byte, a handshake that never starts, key updates every five messages, refused operations; over TCP, and over RDMA in both waiting modes when `DUCT_TEST_ADDR` is set |
 | `run_examples.sh` | the example server and client |
 
 ## Limitations
@@ -312,7 +343,8 @@ and clang on x86-64 and arm64.
 - No multiple NICs, no GPU memory, no tag matching or collectives.
 - Received messages land in the endpoint's buffers (no zero-copy receive); `duct_send_mr` avoids the send copy.
 - On TCP, one-sided operations progress only while the target application calls into the library on that endpoint.
-- No encryption or authentication: use it on a trusted network.
+- Without `tls` nothing is encrypted or authenticated. With `tls`, registered-memory sends and one-sided operations
+  are not available, and the encryption code has not been reviewed by an outside party.
 - Received-completion visibility after a peer disconnect is handled with a short grace period (see
   `docs/ARCHITECTURE.md`); the underlying cause was not identified.
 - Performance numbers exist only for Soft-RoCE and TCP on Ethernet; there are none for RDMA hardware.

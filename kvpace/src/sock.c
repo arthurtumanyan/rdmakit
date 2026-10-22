@@ -61,6 +61,15 @@ int pace_tls_setup(const pace_tls_cfg *cfg) {
 #endif
 }
 
+const pace_tls_cfg *pace_tls_config(void) {
+#ifdef PACE_HAVE_TLS
+    return &g_cfg;
+#else
+    static const pace_tls_cfg none;
+    return &none;
+#endif
+}
+
 int pace_tls_enabled(void) {
 #ifdef PACE_HAVE_TLS
     return g_ctx != NULL;

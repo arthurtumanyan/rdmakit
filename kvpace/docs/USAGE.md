@@ -102,8 +102,10 @@ warm-up (`--warmup`, default 2 s) whose operations are not counted, then the mea
 **TLS.** TLS needs a build with `make TLS=1` (OpenSSL 1.1.1 or newer; the binary is in `build/<arch>-tls/`). `--tls`
 enables it for the `resp` and `memcached` drivers. The server certificate is verified against `--cacert FILE` (or
 the system store), and its name or IP address must match `--sni NAME` or the host. `--cert` and `--key` present a
-client certificate. `--tls-skip-verify` disables verification for test setups. The native driver does not support
-TLS.
+client certificate. `--tls-skip-verify` disables verification for test setups. With the native driver the same
+options select an encrypted rdmaduct endpoint (server started with `--native-tls`, over TCP or RDMA); this needs
+kvpace built with `TLS=1`, which links the `TLS=1` builds of arenakv and rdmaduct, and `--cacert` is required unless
+`--tls-skip-verify` is given (the system store is not used).
 
 ```
 kvpace --driver resp --host cache.example.net --port 6380 --tls --cacert ca.crt --auth app:secret

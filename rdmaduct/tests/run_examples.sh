@@ -1,15 +1,29 @@
 #!/bin/bash
-# Smoke test of the examples: starts hello_server on a free port, runs hello_client against it over TCP and
+# Smoke test of the examples: starts hello_server on a port that no socket uses, runs hello_client against it over TCP and
 # (when DUCT_TEST_ADDR is set) RDMA, and checks the replies.
 #   run_examples.sh BUILD_DIR
 set -euo pipefail
 dir=${1:?build directory}
-port=$((20000 + RANDOM % 20000))
 fail=0
+
+# Prints a port from 20000 to 27999 that no socket uses (TCP or UDP), so that the server can bind it.
+free_port() {
+    local p
+    for _ in $(seq 1 100); do
+        p=$((20000 + RANDOM % 8000))
+        if [ -z "$(ss -Htan "sport = :$p" 2>/dev/null)" ] && [ -z "$(ss -Huan "sport = :$p" 2>/dev/null)" ]; then
+            echo "$p"
+            return
+        fi
+    done
+    echo "no free port found" >&2
+    exit 1
+}
 
 check() {
     transport=$1
     host=$2
+    port=$(free_port)
     "$dir/hello_server" "$transport" "$port" >/dev/null &
     server=$!
     sleep 0.5
@@ -27,7 +41,6 @@ check() {
 
 check tcp 127.0.0.1
 if [ -n "${DUCT_TEST_ADDR:-}" ] && [ -f "$dir/.rdma_enabled" ]; then
-    port=$((port + 1))
     check rdma "$DUCT_TEST_ADDR"
 fi
 exit $fail

@@ -84,7 +84,7 @@ Statements about other systems reflect their public documentation at the time of
 | Target values | large, mostly immutable blocks | small to medium objects | data structures | data structures |
 | Memory layout | log-structured arena per shard | slab allocator | per-object allocation (jemalloc) | per-object allocation (mimalloc) |
 | Eviction | second chance in write order | segmented LRU | approximate LRU / LFU policies | cache mode (2Q-based) |
-| Network transport | TCP, TLS, RDMA reliable connections | TCP, UDP, Unix sockets, TLS | TCP, Unix sockets, TLS | TCP, Unix sockets, TLS |
+| Network transport | TCP, TLS, RDMA reliable connections (encrypted with `--native-tls`) | TCP, UDP, Unix sockets, TLS | TCP, Unix sockets, TLS | TCP, Unix sockets, TLS |
 | Protocols | memcached text and meta, RESP2 and RESP3, native binary ([PROTOCOL.md](arenakv/docs/PROTOCOL.md)) | text, meta, binary | RESP2, RESP3 | RESP2, RESP3, memcached text |
 | Expiry, CAS, conditional stores, increments | yes | yes | yes | yes |
 | Transactions, pub/sub | MULTI/EXEC/WATCH, SUBSCRIBE/PSUBSCRIBE/PUBLISH (RESP) | no | yes | yes |
@@ -238,10 +238,11 @@ and clang on x86-64 and arm64, runs the TCP suites and the sanitizers, compiles 
 
 ## Status and limitations
 
-- The software is experimental and meant for trusted networks. `rdmaduct` neither authenticates peers nor encrypts
-  traffic; `arenakvd` offers users with per-user rights and TLS for its text protocols, but its native protocol is
-  not encrypted ([`SECURITY.md`](SECURITY.md), [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)). No external
-  security review has taken place.
+- The software is experimental. `rdmaduct` encrypts and authenticates only when built with `TLS=1` and asked to
+  (`tls` option), and then not for one-sided operations; `arenakvd` offers users with per-user rights, TLS for its
+  text protocols, and encryption of its native protocol and replication links with `--native-tls`
+  ([`SECURITY.md`](SECURITY.md), [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)). No external security review has
+  taken place.
 - No measurement on RDMA hardware exists yet; see [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## License

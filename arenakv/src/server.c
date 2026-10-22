@@ -460,6 +460,12 @@ void akvd_duct_opts(const akvd *d, struct duct_opts *o) {
     o->max_msg = d->cfg.max_msg;
     o->recv_depth = d->cfg.recv_depth;
     o->send_depth = d->cfg.send_depth;
+    if (d->cfg.native_tls) {
+        o->tls = 1;
+        o->tls_cert = d->cfg.tls_cert;
+        o->tls_key = d->cfg.tls_key;
+        o->tls_ca = d->cfg.tls_ca;
+    }
 }
 
 struct repl *akvd_repl(akvd *d) {
@@ -2494,12 +2500,7 @@ akvd *akvd_start(const akvd_config *cfg, int *err) {
     }
     if (d->cfg.port != NULL) {
         struct duct_opts o;
-        duct_opts_default(&o);
-        o.transport = d->cfg.transport;
-        o.wait = d->cfg.wait;
-        o.max_msg = d->cfg.max_msg;
-        o.recv_depth = d->cfg.recv_depth;
-        o.send_depth = d->cfg.send_depth;
+        akvd_duct_opts(d, &o);
         if ((*err = duct_ctx_create(&o, &d->ctx)) != 0) {
             akvd_log(d, AKVD_LOG_ERROR, "native transport cannot be set up: %s", duct_strerror(*err));
             goto fail;

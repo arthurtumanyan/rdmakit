@@ -37,6 +37,9 @@ int pace_tls_setup(const pace_tls_cfg *cfg);
 /* Returns 1 when TLS is configured. */
 int pace_tls_enabled(void);
 
+/* Returns the configuration of the last successful pace_tls_setup() (all zero when TLS is not configured). */
+const pace_tls_cfg *pace_tls_config(void);
+
 /* Connects to host:port. Returns 0 or -1. */
 int pace_sock_connect(pace_sock *s, const char *host, const char *port, int nonblock);
 

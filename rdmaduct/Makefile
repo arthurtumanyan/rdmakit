@@ -1,9 +1,10 @@
 # rdmaduct build. Targets: all, test, test-rdma, clean, format.
 #   make RDMA=0      build the TCP transport only (no libibverbs / librdmacm needed)
 #   make SAN=1       build with AddressSanitizer and UndefinedBehaviorSanitizer
+#   make TLS=1       add encrypted endpoints (OpenSSL 3: libssl-dev), in a separate build directory
 #   make test-rdma   run the RDMA suite; ADDR selects the local address of the RDMA device
 ARCH := $(shell uname -m)
-OUT := build/$(ARCH)$(if $(SAN),-san)$(if $(filter 0,$(RDMA)),-tcp)
+OUT := build/$(ARCH)$(if $(SAN),-san)$(if $(filter 0,$(RDMA)),-tcp)$(if $(filter 1,$(TLS)),-tls)
 
 HAVE_RDMA_HEADERS := $(shell test -f /usr/include/infiniband/verbs.h && test -f /usr/include/rdma/rdma_cma.h && echo 1)
 RDMA ?= $(if $(HAVE_RDMA_HEADERS),1,0)
@@ -14,6 +15,10 @@ LDLIBS += -lpthread
 ifeq ($(RDMA),1)
 CFLAGS += -DDUCT_HAVE_RDMA
 LDLIBS += -lrdmacm -libverbs
+endif
+ifeq ($(TLS),1)
+CFLAGS += -DDUCT_HAVE_TLS
+LDLIBS += -lssl -lcrypto
 endif
 # Hardening (HARDEN=0 disables): fortified libc calls (not with the sanitizers, whose runtimes replace
 # them), stack protector, stack clash protection, control-flow protection (x86-64: CET; aarch64: PAC and
@@ -37,7 +42,7 @@ CFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit
 LDFLAGS += -fsanitize=address,undefined
 endif
 
-LIB_SRC := src/hello.c src/duct.c src/tcp.c $(if $(filter 1,$(RDMA)),src/rdma.c)
+LIB_SRC := src/hello.c src/duct.c src/tcp.c src/tls.c $(if $(filter 1,$(RDMA)),src/rdma.c)
 LIB_OBJ := $(patsubst src/%.c,$(OUT)/%.o,$(LIB_SRC))
 LIB := $(OUT)/librdmaduct.a
 TESTS := $(patsubst tests/%.c,$(OUT)/%,$(wildcard tests/test_*.c))
@@ -80,6 +85,11 @@ FUZZERS := $(patsubst tests/fuzz/%.c,$(FUZZ_OUT)/%,$(wildcard tests/fuzz/fuzz_*.
 $(FUZZ_OUT)/fuzz_%: tests/fuzz/fuzz_%.c $(FUZZ_SRC) $(wildcard src/*.h include/*.h)
 	@mkdir -p $(FUZZ_OUT)
 	$(FUZZ_CC) $(FUZZ_FLAGS) -o $@ $< $(FUZZ_SRC) -lpthread
+
+# The encrypted-record harness includes src/tls.c (for access to its endpoint state) and links OpenSSL.
+$(FUZZ_OUT)/fuzz_tls: tests/fuzz/fuzz_tls.c src/tls.c $(FUZZ_SRC) $(wildcard src/*.h include/*.h)
+	@mkdir -p $(FUZZ_OUT)
+	$(FUZZ_CC) $(FUZZ_FLAGS) -DDUCT_HAVE_TLS -o $@ $< $(FUZZ_SRC) -lpthread -lssl -lcrypto
 
 fuzz: $(FUZZERS)
 	@set -e; for f in $(FUZZERS); do \
