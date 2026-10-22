@@ -5,6 +5,10 @@
  * limit, DUCT_EPROTO and DUCT_ECLOSED are acceptable outcomes (others abort, which the fuzzer reports).
  * Control frames (emulated one-sided operations) are answered by the library; a registered region with
  * remote access exists so that valid requests reach the memory checks.
+ *
+ * The raw socket is closed with SO_LINGER 0 (a reset) after the library has seen the end of the stream,
+ * so that no connection stays in TIME_WAIT: hundreds of thousands of inputs would otherwise exhaust the
+ * ephemeral ports of the loopback interface. An input whose connection cannot be set up is skipped.
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -56,7 +60,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t n) {
     struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-        abort();
+        close(fd);
+        pthread_join(th, NULL); /* the accept times out */
+        if (a.rc == 0) {
+            duct_ep_close(a.ep);
+        }
+        return 0;
     }
     uint8_t hello[DUCT_HELLO_SIZE];
     struct duct_hello h = {.max_msg = MAX_MSG, .recv_depth = 4};
@@ -99,7 +108,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t n) {
         }
         break;
     }
-    duct_ep_close(a.ep);
+    /* The reset reaches the endpoint first, so neither side stays in TIME_WAIT. */
+    struct linger lg = {.l_onoff = 1, .l_linger = 0};
+    setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
     close(fd);
+    duct_ep_close(a.ep);
     return 0;
 }
