@@ -137,18 +137,18 @@ the figures and every tagged statement ([C1] ...) match it. The complete data, m
 The throughput figure above is drawn from this table:
 
 <!-- BEGIN GENERATED:matrix-throughput -->
-Data: `benchmarks/data/2026-10-21-run3` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `cb8f60b7eaa0`, summary digest `c9976f2a8da5b83b`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-23-run5` (790 runs: 754 ok, 26 with operation errors, 0 failed, 10 skipped), commit `9054e10aa2ab`, summary digest `8262d6bae955c711`. Mean over repetitions; `cv` is the coefficient of variation.
 
 Operations per second (KV-cache rows: requests per second).
 
 | Workload | Server CPUs | arenakv (TCP) | arenakv (Soft-RoCE) | arenakv (memcached protocol) | Valkey | Dragonfly | memcached |
 |---|---|---|---|---|---|---|---|
-| 64-byte values | 1 | 267,146 (cv 2.1%) | 226,389 (cv 0.9%) | 258,139 (cv 1.7%) | 210,691 (cv 1.5%) | 204,423 (cv 3.4%) | 232,434 (cv 0.9%) |
-| 64-byte values | 4 | 723,389 (cv 4.4%) | 244,918 (cv 4.5%) | 805,570 (cv 1.2%) | 477,558 (cv 4.0%) | 529,566 (cv 2.1%) | 725,576 (cv 4.6%) |
-| 16 KiB values | 1 | 157,518 (cv 3.9%) | 118,128 (cv 1.9%) | 159,958 (cv 0.8%) | 143,522 (cv 0.4%) | 136,874 (cv 0.6%) | 144,302 (cv 2.9%) |
-| 16 KiB values | 4 | 510,367 (cv 3.9%) | 133,901 (cv 3.7%) | 517,462 (cv 6.8%) | 342,350 (cv 4.3%) | 377,634 (cv 6.3%) | 493,253 (cv 3.5%) |
-| KV-cache requests | 1 | 2,034 (cv 2.3%) | 1,445 (cv 1.7%) | 1,993 (cv 0.7%) | 1,758 (cv 1.1%) | 1,772 (cv 5.1%) | 1,862 (cv 2.6%) |
-| KV-cache requests | 4 | 4,704 (cv 3.2%) | 1,762 (cv 6.0%) | 4,864 (cv 2.4%) | 3,885 (cv 1.6%) | 2,340 (cv 5.0%) | 4,427 (cv 4.3%) |
+| 64-byte values | 1 | 267,326 (cv 1.3%) | 226,745 (cv 0.5%) | 261,541 (cv 1.1%) | 210,303 (cv 0.5%) | 209,497 (cv 0.6%) | 231,548 (cv 0.7%) |
+| 64-byte values | 4 | 725,006 (cv 3.5%) | 246,569 (cv 3.2%) | 782,749 (cv 1.2%) | 475,480 (cv 2.7%) | 529,027 (cv 5.1%) | 740,397 (cv 3.3%) |
+| 16 KiB values | 1 | 160,180 (cv 2.3%) | 118,380 (cv 2.3%) | 159,022 (cv 0.4%) | 142,610 (cv 0.2%) | 136,526 (cv 0.5%) | 147,010 (cv 0.4%) |
+| 16 KiB values | 4 | 509,698 (cv 2.2%) | 142,196 (cv 6.8%) | 510,336 (cv 1.7%) | 336,293 (cv 2.5%) | 385,691 (cv 1.5%) | 491,118 (cv 1.5%) |
+| KV-cache requests | 1 | 2,052 (cv 0.3%) | 1,449 (cv 2.4%) | 1,991 (cv 0.4%) | 1,749 (cv 2.3%) | 1,784 (cv 1.6%) | 1,881 (cv 0.3%) |
+| KV-cache requests | 4 | 4,733 (cv 1.6%) | 1,764 (cv 3.6%) | 5,002 (cv 1.8%) | 3,940 (cv 1.6%) | 2,791 (cv 3.7%) | 4,266 (cv 3.7%) |
 <!-- END GENERATED:matrix-throughput -->
 
 <picture>
@@ -157,17 +157,17 @@ Operations per second (KV-cache rows: requests per second).
 </picture>
 
 <!-- BEGIN GENERATED:capacity-reuse -->
-Data: `benchmarks/data/2026-10-21-run3` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `cb8f60b7eaa0`, summary digest `c9976f2a8da5b83b`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-23-run5` (790 runs: 754 ok, 26 with operation errors, 0 failed, 10 skipped), commit `9054e10aa2ab`, summary digest `8262d6bae955c711`. Mean over repetitions; `cv` is the coefficient of variation.
 
 KV-cache scenario, reuse rate (fraction of needed blocks served from the cache) by configured capacity.
 
 | System | 16 MB | 64 MB | 256 MB | 1 GB | 4 GB |
 |---|---|---|---|---|---|
-| arenakv (TCP) | 0.182 (cv 1.3%) | 0.429 (cv 0.3%) | 0.642 (cv 0.2%) | 0.822 (cv 0.2%) | 0.904 (cv 0.0%) |
-| Valkey | 0.036 (cv 5.5%) | 0.115 (cv 3.0%) | 0.307 (cv 0.9%) | 0.789 (cv 0.2%) | 0.902 (cv 0.0%) |
-| Dragonfly | n/a | n/a | 0.408 (cv 0.9%) | 0.685 (cv 0.5%) | 0.902 (cv 0.0%) |
-| Dragonfly (eviction flag raised) | n/a | n/a | 0.436 (cv 0.5%) | 0.599 (cv 0.6%) | 0.902 (cv 0.0%) |
-| memcached | 0.354 (cv 0.3%) | 0.497 (cv 0.2%) | 0.663 (cv 0.2%) | 0.845 (cv 0.1%) | 0.903 (cv 0.0%) |
+| arenakv (TCP) | 0.183 (cv 2.7%) | 0.430 (cv 0.2%) | 0.643 (cv 0.2%) | 0.822 (cv 0.1%) | 0.904 (cv 0.0%) |
+| Valkey | 0.036 (cv 4.0%) | 0.115 (cv 1.0%) | 0.304 (cv 0.8%) | 0.789 (cv 0.5%) | 0.902 (cv 0.0%) |
+| Dragonfly | n/a | n/a | 0.407 (cv 1.3%) | 0.689 (cv 0.7%) | 0.902 (cv 0.0%) |
+| Dragonfly (eviction flag raised) | n/a | n/a | 0.435 (cv 0.4%) | 0.600 (cv 0.7%) | 0.902 (cv 0.0%) |
+| memcached | 0.354 (cv 0.3%) | 0.497 (cv 0.2%) | 0.664 (cv 0.2%) | 0.845 (cv 0.1%) | 0.903 (cv 0.0%) |
 <!-- END GENERATED:capacity-reuse -->
 
 The pipelining, connection and CPU-split figures above have their tables in
@@ -176,15 +176,20 @@ The pipelining, connection and CPU-split figures above have their tables in
 Findings:
 
 - arenakv over TCP, with its native protocol or the memcached protocol, has the highest throughput in every matrix
-  row [C1] and the lowest server CPU time per operation in five of six rows [C4]. At one server CPU arenakv over the
+  row [C1] and the lowest server CPU time per operation in every row [C4]. At one server CPU arenakv over the
   memcached protocol is faster than memcached itself in all three workloads [C3]. The native protocol over TCP is
   faster than Valkey and Dragonfly at four server CPUs [C2].
 - With pipelined requests native arenakv leads at depth 32, with at least twice the throughput of Valkey, Dragonfly
   and memcached [C24]; from depth 1 to 32 it scales by a factor above 15, Dragonfly and memcached by less than 6.5
-  [C25]. From 16 to 1024 connections arenakv, memcached and Valkey lose less than 5% of their throughput [C26], and
+  [C25]. From 16 to 1024 connections native arenakv loses between 5% and 6% of its throughput, arenakv over the
+  memcached protocol, memcached and Valkey less than 3%, Dragonfly more than 15% [C26], and
   arenakv over the memcached protocol has the lowest p99 latency at 1024 connections [C27].
 - With one request in flight the kernel accounts for more than 80% of the server CPU time of arenakv and for more
   than 70% for every server [C28]; pipelining lowers that share for all of them [C30].
+- An append-only log synced every second costs arenakv and Valkey less than 7% of their throughput [C39], one
+  asynchronous replica costs arenakv less than 3% [C42]; a log synced on every write is bound by the disk for both
+  [C40]. Encryption keeps a larger share of the throughput on arenakv's native protocol than TLS does on the RESP
+  path of arenakv and Valkey [C44].
 - In the KV-cache workload arenakv reuses more cached blocks than Valkey at small capacities [C11]; memcached reuses
   more up to 1 GB [C12]. Dragonfly's default eviction settings rejected most requests at 256 MB and 1 GB [C14].
 - With 64-byte values arenakv has the smallest resident memory of the four servers, because its hash index starts

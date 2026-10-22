@@ -82,18 +82,18 @@ root checks them and every tagged statement. Method and caveats: [`../benchmarks
 </picture>
 
 <!-- BEGIN GENERATED:matrix-throughput -->
-Data: `benchmarks/data/2026-10-21-run3` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `cb8f60b7eaa0`, summary digest `c9976f2a8da5b83b`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-23-run5` (790 runs: 754 ok, 26 with operation errors, 0 failed, 10 skipped), commit `9054e10aa2ab`, summary digest `8262d6bae955c711`. Mean over repetitions; `cv` is the coefficient of variation.
 
 Operations per second (KV-cache rows: requests per second).
 
 | Workload | Server CPUs | arenakv (TCP) | arenakv (Soft-RoCE) | arenakv (memcached protocol) | Valkey | Dragonfly | memcached |
 |---|---|---|---|---|---|---|---|
-| 64-byte values | 1 | 267,146 (cv 2.1%) | 226,389 (cv 0.9%) | 258,139 (cv 1.7%) | 210,691 (cv 1.5%) | 204,423 (cv 3.4%) | 232,434 (cv 0.9%) |
-| 64-byte values | 4 | 723,389 (cv 4.4%) | 244,918 (cv 4.5%) | 805,570 (cv 1.2%) | 477,558 (cv 4.0%) | 529,566 (cv 2.1%) | 725,576 (cv 4.6%) |
-| 16 KiB values | 1 | 157,518 (cv 3.9%) | 118,128 (cv 1.9%) | 159,958 (cv 0.8%) | 143,522 (cv 0.4%) | 136,874 (cv 0.6%) | 144,302 (cv 2.9%) |
-| 16 KiB values | 4 | 510,367 (cv 3.9%) | 133,901 (cv 3.7%) | 517,462 (cv 6.8%) | 342,350 (cv 4.3%) | 377,634 (cv 6.3%) | 493,253 (cv 3.5%) |
-| KV-cache requests | 1 | 2,034 (cv 2.3%) | 1,445 (cv 1.7%) | 1,993 (cv 0.7%) | 1,758 (cv 1.1%) | 1,772 (cv 5.1%) | 1,862 (cv 2.6%) |
-| KV-cache requests | 4 | 4,704 (cv 3.2%) | 1,762 (cv 6.0%) | 4,864 (cv 2.4%) | 3,885 (cv 1.6%) | 2,340 (cv 5.0%) | 4,427 (cv 4.3%) |
+| 64-byte values | 1 | 267,326 (cv 1.3%) | 226,745 (cv 0.5%) | 261,541 (cv 1.1%) | 210,303 (cv 0.5%) | 209,497 (cv 0.6%) | 231,548 (cv 0.7%) |
+| 64-byte values | 4 | 725,006 (cv 3.5%) | 246,569 (cv 3.2%) | 782,749 (cv 1.2%) | 475,480 (cv 2.7%) | 529,027 (cv 5.1%) | 740,397 (cv 3.3%) |
+| 16 KiB values | 1 | 160,180 (cv 2.3%) | 118,380 (cv 2.3%) | 159,022 (cv 0.4%) | 142,610 (cv 0.2%) | 136,526 (cv 0.5%) | 147,010 (cv 0.4%) |
+| 16 KiB values | 4 | 509,698 (cv 2.2%) | 142,196 (cv 6.8%) | 510,336 (cv 1.7%) | 336,293 (cv 2.5%) | 385,691 (cv 1.5%) | 491,118 (cv 1.5%) |
+| KV-cache requests | 1 | 2,052 (cv 0.3%) | 1,449 (cv 2.4%) | 1,991 (cv 0.4%) | 1,749 (cv 2.3%) | 1,784 (cv 1.6%) | 1,881 (cv 0.3%) |
+| KV-cache requests | 4 | 4,733 (cv 1.6%) | 1,764 (cv 3.6%) | 5,002 (cv 1.8%) | 3,940 (cv 1.6%) | 2,791 (cv 3.7%) | 4,266 (cv 3.7%) |
 <!-- END GENERATED:matrix-throughput -->
 
 <picture>
@@ -102,18 +102,18 @@ Operations per second (KV-cache rows: requests per second).
 </picture>
 
 <!-- BEGIN GENERATED:matrix-cpu -->
-Data: `benchmarks/data/2026-10-21-run3` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `cb8f60b7eaa0`, summary digest `c9976f2a8da5b83b`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-23-run5` (790 runs: 754 ok, 26 with operation errors, 0 failed, 10 skipped), commit `9054e10aa2ab`, summary digest `8262d6bae955c711`. Mean over repetitions; `cv` is the coefficient of variation.
 
 Server CPU time per operation in microseconds (KV-cache rows: per block GET or PUT).
 
 | Workload | Server CPUs | arenakv (TCP) | arenakv (Soft-RoCE) | arenakv (memcached protocol) | Valkey | Dragonfly | memcached |
 |---|---|---|---|---|---|---|---|
-| 64-byte values | 1 | 3.74 (cv 2.2%) | 4.42 (cv 0.9%) | 3.87 (cv 1.7%) | 4.75 (cv 1.6%) | 4.89 (cv 3.5%) | 4.30 (cv 0.9%) |
-| 64-byte values | 4 | 5.13 (cv 4.9%) | 9.20 (cv 3.6%) | 4.92 (cv 1.2%) | 8.39 (cv 4.1%) | 7.39 (cv 2.2%) | 5.45 (cv 4.2%) |
-| 16 KiB values | 1 | 6.35 (cv 4.0%) | 8.45 (cv 1.9%) | 6.25 (cv 0.8%) | 6.97 (cv 0.4%) | 7.30 (cv 0.6%) | 6.94 (cv 3.0%) |
-| 16 KiB values | 4 | 7.74 (cv 3.9%) | 11.44 (cv 4.0%) | 7.68 (cv 6.4%) | 11.69 (cv 4.3%) | 10.32 (cv 6.3%) | 8.07 (cv 3.4%) |
-| KV-cache requests | 1 | 6.34 (cv 2.5%) | 9.24 (cv 1.8%) | 6.49 (cv 0.7%) | 7.47 (cv 1.3%) | 7.42 (cv 5.9%) | 7.00 (cv 2.9%) |
-| KV-cache requests | 4 | 8.38 (cv 4.1%) | 11.96 (cv 5.2%) | 8.60 (cv 2.5%) | 12.34 (cv 1.7%) | 12.68 (cv 3.0%) | 8.26 (cv 3.7%) |
+| 64-byte values | 1 | 3.74 (cv 1.3%) | 4.41 (cv 0.5%) | 3.82 (cv 1.1%) | 4.75 (cv 0.4%) | 4.78 (cv 0.6%) | 4.32 (cv 0.6%) |
+| 64-byte values | 4 | 5.09 (cv 3.7%) | 9.19 (cv 3.2%) | 5.07 (cv 1.7%) | 8.42 (cv 2.7%) | 7.42 (cv 4.9%) | 5.36 (cv 3.1%) |
+| 16 KiB values | 1 | 6.24 (cv 2.3%) | 8.44 (cv 2.4%) | 6.29 (cv 0.4%) | 7.01 (cv 0.3%) | 7.32 (cv 0.5%) | 6.80 (cv 0.3%) |
+| 16 KiB values | 4 | 7.76 (cv 2.2%) | 10.92 (cv 5.5%) | 7.77 (cv 2.3%) | 11.89 (cv 2.6%) | 10.11 (cv 1.6%) | 8.09 (cv 1.6%) |
+| KV-cache requests | 1 | 6.28 (cv 0.3%) | 9.20 (cv 2.5%) | 6.49 (cv 0.5%) | 7.51 (cv 2.4%) | 7.35 (cv 1.7%) | 6.91 (cv 0.3%) |
+| KV-cache requests | 4 | 8.44 (cv 1.5%) | 11.96 (cv 2.9%) | 8.30 (cv 2.3%) | 12.16 (cv 1.7%) | 11.68 (cv 2.9%) | 8.55 (cv 2.2%) |
 <!-- END GENERATED:matrix-cpu -->
 
 <picture>
@@ -122,32 +122,32 @@ Server CPU time per operation in microseconds (KV-cache rows: per block GET or P
 </picture>
 
 <!-- BEGIN GENERATED:capacity-reuse -->
-Data: `benchmarks/data/2026-10-21-run3` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `cb8f60b7eaa0`, summary digest `c9976f2a8da5b83b`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-23-run5` (790 runs: 754 ok, 26 with operation errors, 0 failed, 10 skipped), commit `9054e10aa2ab`, summary digest `8262d6bae955c711`. Mean over repetitions; `cv` is the coefficient of variation.
 
 KV-cache scenario, reuse rate (fraction of needed blocks served from the cache) by configured capacity.
 
 | System | 16 MB | 64 MB | 256 MB | 1 GB | 4 GB |
 |---|---|---|---|---|---|
-| arenakv (TCP) | 0.182 (cv 1.3%) | 0.429 (cv 0.3%) | 0.642 (cv 0.2%) | 0.822 (cv 0.2%) | 0.904 (cv 0.0%) |
-| Valkey | 0.036 (cv 5.5%) | 0.115 (cv 3.0%) | 0.307 (cv 0.9%) | 0.789 (cv 0.2%) | 0.902 (cv 0.0%) |
-| Dragonfly | n/a | n/a | 0.408 (cv 0.9%) | 0.685 (cv 0.5%) | 0.902 (cv 0.0%) |
-| Dragonfly (eviction flag raised) | n/a | n/a | 0.436 (cv 0.5%) | 0.599 (cv 0.6%) | 0.902 (cv 0.0%) |
-| memcached | 0.354 (cv 0.3%) | 0.497 (cv 0.2%) | 0.663 (cv 0.2%) | 0.845 (cv 0.1%) | 0.903 (cv 0.0%) |
+| arenakv (TCP) | 0.183 (cv 2.7%) | 0.430 (cv 0.2%) | 0.643 (cv 0.2%) | 0.822 (cv 0.1%) | 0.904 (cv 0.0%) |
+| Valkey | 0.036 (cv 4.0%) | 0.115 (cv 1.0%) | 0.304 (cv 0.8%) | 0.789 (cv 0.5%) | 0.902 (cv 0.0%) |
+| Dragonfly | n/a | n/a | 0.407 (cv 1.3%) | 0.689 (cv 0.7%) | 0.902 (cv 0.0%) |
+| Dragonfly (eviction flag raised) | n/a | n/a | 0.435 (cv 0.4%) | 0.600 (cv 0.7%) | 0.902 (cv 0.0%) |
+| memcached | 0.354 (cv 0.3%) | 0.497 (cv 0.2%) | 0.664 (cv 0.2%) | 0.845 (cv 0.1%) | 0.903 (cv 0.0%) |
 <!-- END GENERATED:capacity-reuse -->
 
 <!-- BEGIN GENERATED:matrix-rss -->
-Data: `benchmarks/data/2026-10-21-run3` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `cb8f60b7eaa0`, summary digest `c9976f2a8da5b83b`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-23-run5` (790 runs: 754 ok, 26 with operation errors, 0 failed, 10 skipped), commit `9054e10aa2ab`, summary digest `8262d6bae955c711`. Mean over repetitions; `cv` is the coefficient of variation.
 
 Server resident memory at the end of the run in MiB.
 
 | Workload | Server CPUs | arenakv (TCP) | arenakv (Soft-RoCE) | arenakv (memcached protocol) | Valkey | Dragonfly | memcached |
 |---|---|---|---|---|---|---|---|
-| 64-byte values | 1 | 17 (cv 0.2%) | 50 (cv 0.0%) | 17 (cv 0.1%) | 23 (cv 0.4%) | 32 (cv 2.1%) | 21 (cv 0.3%) |
-| 64-byte values | 4 | 17 (cv 0.3%) | 50 (cv 0.0%) | 17 (cv 0.1%) | 24 (cv 0.3%) | 34 (cv 2.1%) | 22 (cv 0.2%) |
+| 64-byte values | 1 | 17 (cv 0.2%) | 50 (cv 0.1%) | 17 (cv 0.2%) | 23 (cv 0.3%) | 31 (cv 0.2%) | 21 (cv 0.3%) |
+| 64-byte values | 4 | 17 (cv 0.3%) | 50 (cv 0.1%) | 17 (cv 0.1%) | 24 (cv 0.5%) | 34 (cv 2.1%) | 22 (cv 0.5%) |
 | 16 KiB values | 1 | 318 (cv 0.0%) | 351 (cv 0.0%) | 318 (cv 0.0%) | 407 (cv 0.0%) | 339 (cv 0.2%) | 341 (cv 0.0%) |
-| 16 KiB values | 4 | 318 (cv 0.0%) | 351 (cv 0.0%) | 318 (cv 0.0%) | 449 (cv 0.9%) | 345 (cv 0.0%) | 341 (cv 0.0%) |
-| KV-cache requests | 1 | 2,988 (cv 1.6%) | 2,204 (cv 1.0%) | 2,913 (cv 0.6%) | 3,233 (cv 1.6%) | 2,640 (cv 4.3%) | 2,923 (cv 2.2%) |
-| KV-cache requests | 4 | 7,220 (cv 2.3%) | 2,750 (cv 4.5%) | 7,362 (cv 2.6%) | 7,256 (cv 0.9%) | 4,624 (cv 2.7%) | 7,022 (cv 3.3%) |
+| 16 KiB values | 4 | 318 (cv 0.0%) | 351 (cv 0.0%) | 318 (cv 0.0%) | 451 (cv 0.8%) | 345 (cv 0.0%) | 341 (cv 0.0%) |
+| KV-cache requests | 1 | 2,996 (cv 0.2%) | 2,210 (cv 1.5%) | 2,910 (cv 0.4%) | 3,227 (cv 1.6%) | 2,671 (cv 1.1%) | 2,941 (cv 0.3%) |
+| KV-cache requests | 4 | 7,224 (cv 1.1%) | 2,757 (cv 2.3%) | 7,588 (cv 1.7%) | 7,262 (cv 1.6%) | 5,042 (cv 1.7%) | 6,812 (cv 3.2%) |
 <!-- END GENERATED:matrix-rss -->
 
 <picture>
@@ -156,38 +156,38 @@ Server resident memory at the end of the run in MiB.
 </picture>
 
 <!-- BEGIN GENERATED:engine-scale -->
-Data: `benchmarks/data/2026-10-21-run3` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `cb8f60b7eaa0`, summary digest `c9976f2a8da5b83b`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-23-run5` (790 runs: 754 ok, 26 with operation errors, 0 failed, 10 skipped), commit `9054e10aa2ab`, summary digest `8262d6bae955c711`. Mean over repetitions; `cv` is the coefficient of variation.
 
 Engine operations per second (90% GET, uniform keys, key space preloaded, no eviction).
 
 | Value size | 1 threads | 2 threads | 4 threads | 8 threads | 12 threads | 16 threads |
 |---|---|---|---|---|---|---|
-| 64-byte values | 3,755,944 (cv 1.4%) | 6,646,938 (cv 1.1%) | 11,480,767 (cv 1.6%) | 18,632,091 (cv 1.8%) | 22,429,186 (cv 1.4%) | 23,051,921 (cv 7.0%) |
-| 4096-byte values | 1,516,694 (cv 0.5%) | 2,506,579 (cv 0.8%) | 3,883,060 (cv 0.7%) | 5,361,826 (cv 0.7%) | 5,721,626 (cv 0.9%) | 5,901,489 (cv 4.8%) |
+| 64-byte values | 3,733,462 (cv 1.1%) | 6,392,434 (cv 0.8%) | 10,982,242 (cv 1.5%) | 17,475,078 (cv 2.0%) | 21,333,074 (cv 1.6%) | 22,255,629 (cv 4.8%) |
+| 4096-byte values | 1,503,683 (cv 1.7%) | 2,550,371 (cv 0.6%) | 3,919,707 (cv 0.9%) | 5,381,192 (cv 1.0%) | 5,727,927 (cv 1.4%) | 6,014,616 (cv 0.8%) |
 <!-- END GENERATED:engine-scale -->
 
 <!-- BEGIN GENERATED:pipeline -->
-Data: `benchmarks/data/2026-10-21-run3` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `cb8f60b7eaa0`, summary digest `c9976f2a8da5b83b`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-23-run5` (790 runs: 754 ok, 26 with operation errors, 0 failed, 10 skipped), commit `9054e10aa2ab`, summary digest `8262d6bae955c711`. Mean over repetitions; `cv` is the coefficient of variation.
 
 Closed loop, one server CPU, 64-byte values, 90% GET, 16 connections from 4 client threads, with the given number of requests in flight per connection. Latencies are GET latencies in microseconds. Server kernel share: kernel-mode part of the server CPU time (stime in /proc/<pid>/stat), that is system calls and the TCP stack run on the server's behalf.
 
 | System | Depth | ops/s | p50 | p99 | Server CPU µs/op | Server kernel share | Server RSS MiB |
 |---|---|---|---|---|---|---|---|
-| arenakv (TCP) | 1 | 308,298 (cv 0.2%) | 48 (cv 0.2%) | 100 (cv 0.6%) | 3.24 (cv 0.4%) | 86% (cv 0.3%) | 17 (cv 0.0%) |
-| arenakv (TCP) | 8 | 2,036,734 (cv 0.6%) | 57 (cv 0.8%) | 121 (cv 0.5%) | 0.49 (cv 0.6%) | 74% (cv 0.8%) | 17 (cv 0.1%) |
-| arenakv (TCP) | 32 | 5,265,280 (cv 0.7%) | 87 (cv 1.0%) | 186 (cv 0.9%) | 0.19 (cv 0.6%) | 53% (cv 1.8%) | 17 (cv 0.1%) |
-| arenakv (memcached protocol) | 1 | 295,667 (cv 0.6%) | 50 (cv 0.8%) | 105 (cv 0.6%) | 3.38 (cv 0.6%) | 85% (cv 0.2%) | 17 (cv 0.2%) |
-| arenakv (memcached protocol) | 8 | 1,717,097 (cv 0.4%) | 69 (cv 0.6%) | 144 (cv 0.3%) | 0.58 (cv 0.4%) | 64% (cv 1.2%) | 17 (cv 0.3%) |
-| arenakv (memcached protocol) | 32 | 3,626,581 (cv 0.4%) | 129 (cv 0.5%) | 273 (cv 0.8%) | 0.28 (cv 0.4%) | 38% (cv 1.3%) | 17 (cv 0.1%) |
-| Valkey | 1 | 221,048 (cv 0.6%) | 67 (cv 0.4%) | 134 (cv 0.4%) | 4.52 (cv 0.7%) | 83% (cv 0.9%) | 23 (cv 0.4%) |
-| Valkey | 8 | 1,162,288 (cv 0.4%) | 101 (cv 0.4%) | 170 (cv 1.9%) | 0.86 (cv 0.4%) | 56% (cv 1.8%) | 23 (cv 0.3%) |
-| Valkey | 32 | 2,239,084 (cv 0.5%) | 187 (cv 0.5%) | 348 (cv 0.9%) | 0.45 (cv 0.4%) | 30% (cv 0.7%) | 23 (cv 0.4%) |
-| Dragonfly | 1 | 215,365 (cv 0.6%) | 73 (cv 0.8%) | 93 (cv 3.6%) | 4.64 (cv 0.5%) | 74% (cv 0.6%) | 32 (cv 2.4%) |
-| Dragonfly | 8 | 816,860 (cv 0.3%) | 143 (cv 0.3%) | 249 (cv 1.6%) | 1.23 (cv 0.4%) | 38% (cv 1.3%) | 32 (cv 0.2%) |
-| Dragonfly | 32 | 1,299,547 (cv 0.6%) | 350 (cv 0.6%) | 661 (cv 1.2%) | 0.77 (cv 0.6%) | 19% (cv 4.2%) | 33 (cv 0.3%) |
-| memcached | 1 | 265,316 (cv 0.4%) | 54 (cv 0.5%) | 119 (cv 0.6%) | 3.77 (cv 0.4%) | 81% (cv 0.3%) | 21 (cv 0.2%) |
-| memcached | 8 | 1,221,762 (cv 0.6%) | 87 (cv 0.8%) | 281 (cv 0.9%) | 0.82 (cv 0.7%) | 56% (cv 0.9%) | 21 (cv 0.2%) |
-| memcached | 32 | 1,570,030 (cv 0.8%) | 285 (cv 0.5%) | 570 (cv 3.5%) | 0.64 (cv 0.8%) | 45% (cv 1.3%) | 22 (cv 0.4%) |
+| arenakv (TCP) | 1 | 306,433 (cv 0.4%) | 48 (cv 0.7%) | 101 (cv 0.6%) | 3.26 (cv 0.5%) | 86% (cv 0.5%) | 17 (cv 0.2%) |
+| arenakv (TCP) | 8 | 2,014,072 (cv 0.7%) | 58 (cv 1.1%) | 122 (cv 0.5%) | 0.50 (cv 0.7%) | 73% (cv 0.8%) | 17 (cv 0.2%) |
+| arenakv (TCP) | 32 | 5,130,043 (cv 0.3%) | 90 (cv 0.5%) | 192 (cv 0.4%) | 0.20 (cv 0.4%) | 52% (cv 1.9%) | 17 (cv 0.3%) |
+| arenakv (memcached protocol) | 1 | 293,627 (cv 0.7%) | 50 (cv 1.1%) | 105 (cv 0.7%) | 3.40 (cv 0.7%) | 85% (cv 1.0%) | 17 (cv 0.3%) |
+| arenakv (memcached protocol) | 8 | 1,688,995 (cv 0.3%) | 70 (cv 0.4%) | 146 (cv 0.7%) | 0.59 (cv 0.3%) | 63% (cv 0.4%) | 17 (cv 0.1%) |
+| arenakv (memcached protocol) | 32 | 3,551,958 (cv 0.4%) | 131 (cv 0.4%) | 281 (cv 0.9%) | 0.28 (cv 0.6%) | 37% (cv 1.8%) | 17 (cv 0.1%) |
+| Valkey | 1 | 222,416 (cv 0.4%) | 67 (cv 0.6%) | 133 (cv 0.6%) | 4.49 (cv 0.5%) | 83% (cv 0.9%) | 23 (cv 0.3%) |
+| Valkey | 8 | 1,168,070 (cv 0.3%) | 100 (cv 0.4%) | 168 (cv 0.5%) | 0.86 (cv 0.2%) | 56% (cv 1.2%) | 23 (cv 0.5%) |
+| Valkey | 32 | 2,250,029 (cv 0.1%) | 186 (cv 0.3%) | 346 (cv 0.4%) | 0.44 (cv 0.0%) | 29% (cv 1.0%) | 23 (cv 0.4%) |
+| Dragonfly | 1 | 216,633 (cv 0.4%) | 73 (cv 0.6%) | 91 (cv 2.5%) | 4.61 (cv 0.4%) | 74% (cv 0.9%) | 32 (cv 2.6%) |
+| Dragonfly | 8 | 815,180 (cv 0.3%) | 143 (cv 0.4%) | 251 (cv 1.2%) | 1.23 (cv 0.3%) | 38% (cv 0.8%) | 32 (cv 0.2%) |
+| Dragonfly | 32 | 1,296,459 (cv 0.8%) | 351 (cv 0.5%) | 673 (cv 3.9%) | 0.77 (cv 0.8%) | 20% (cv 3.6%) | 33 (cv 0.2%) |
+| memcached | 1 | 265,205 (cv 0.3%) | 54 (cv 0.4%) | 119 (cv 0.5%) | 3.77 (cv 0.3%) | 82% (cv 0.5%) | 21 (cv 0.1%) |
+| memcached | 8 | 1,227,908 (cv 0.2%) | 87 (cv 0.3%) | 279 (cv 0.4%) | 0.81 (cv 0.2%) | 56% (cv 1.4%) | 21 (cv 0.3%) |
+| memcached | 32 | 1,583,650 (cv 0.4%) | 283 (cv 0.5%) | 569 (cv 1.2%) | 0.63 (cv 0.5%) | 45% (cv 1.6%) | 22 (cv 0.4%) |
 <!-- END GENERATED:pipeline -->
 
 Findings:

@@ -1,6 +1,6 @@
 # Running the benchmark suite
 
-How to produce a new run directory like `data/2026-10-21-run3`, turn it into figures and tables, and check it. The
+How to produce a new run directory like `data/2026-10-23-run5`, turn it into figures and tables, and check it. The
 method behind the suites (definitions, CPU assignment, threats to validity) is in [`METHODOLOGY.md`](METHODOLOGY.md);
 the published results are in [`README.md`](README.md). Running `kvpace` by hand against one server is described in
 [`../kvpace/docs/USAGE.md`](../kvpace/docs/USAGE.md).
@@ -58,8 +58,8 @@ xargs -r docker stop < stopped-containers.txt
 xargs -r docker start < stopped-containers.txt
 ```
 
-**CPU frequency.** The `performance` governor removes frequency ramp-up from the measurements; run3 used it, run1
-and run2 used `powersave`. The run records the distinct governors of all CPUs (`cpu_governor`).
+**CPU frequency.** The `performance` governor removes frequency ramp-up from the measurements; run3 to run5 used it,
+run1 and run2 used `powersave`. The run records the distinct governors of all CPUs (`cpu_governor`).
 
 ```
 sudo cpupower frequency-set -g performance
@@ -99,22 +99,24 @@ fresh server. Progress is printed per run (`[matrix] valkey-1cpu-kvcache-r1 ok`)
 statuses:
 
 ```
-done: 690 runs, 0 failed, 20 with operation errors, 10 skipped
+done: 775 runs, 0 failed, 26 with operation errors, 10 skipped
 ```
 
-**Duration.** Run3 (five repetitions) recorded the following run times in its manifest (sum of `wall_s`); server
-starts and stops add to them, and the whole procedure took about 2.5 hours.
+**Duration.** Run5 (five repetitions) recorded the following run times in its manifest (sum of `wall_s`, 2.8 hours in
+all); server starts, stops and the builds add to them.
 
 | Suite | Runs | Minutes |
 |---|---|---|
-| matrix | 180 | 38.9 |
+| matrix | 180 | 39.1 |
 | sweep | 140 | 23.2 |
-| pipeline | 75 | 12.3 |
+| pipeline | 75 | 12.4 |
 | connections | 100 | 16.7 |
-| capacity (including capacity-evict) | 115 | 25.4 |
+| capacity (including capacity-evict) | 115 | 25.5 |
 | engine | 15 | 4.5 |
 | transport | 15 | 0.5 |
 | validation | 50 | 10.3 |
+| durability | 40 | 21.3 |
+| encryption | 60 | 12.9 |
 
 Do not build, test or run other benchmarks on the machine while a run is in progress.
 

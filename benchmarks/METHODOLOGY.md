@@ -154,12 +154,15 @@ overlap, or when the statement is a direct restatement of a table cell.
 
 - **Single machine, single run directory.** Results come from one machine (see `env.json`). Another CPU,
   kernel or NIC may rank the systems differently.
-- **Power management.** run3 used the `performance` governor; run1 and run2 used `powersave`, which adds wake-up
+- **Power management.** run3, run4 and run5 used the `performance` governor; run1 and run2 used `powersave`, which adds wake-up
   latency and frequency variation. C-states and turbo frequencies were left at their defaults in all runs, so the
   clock frequency still varies with the number of busy cores and with temperature. Tail latencies (p99 and above)
   remain noisy at moderate load [C10].
-- **Other processes.** For run3 containers unrelated to the benchmark were stopped; desktop and system services kept
-  running. Later runs record the number of running containers and the load average at the start in `env.json`.
+- **Other processes.** For run3 and later runs containers unrelated to the benchmark were stopped; desktop and system
+  services kept running. From run4 on `env.json` records the number of running containers and the load average at
+  the start (run5: no container, load average 0.81). During run4 other work ran on the machine and several suites
+  varied four to five times more than in run3; run4 is kept unpublished with a note in its directory
+  ([`data/2026-10-22-run4/NOTE.md`](data/2026-10-22-run4/NOTE.md)), and run5 repeated every suite.
 - **Client limits.** The matrix uses one thread per connection with blocking I/O on four client CPUs. In the
   four-CPU configurations the generator may be the bottleneck; those rows show the order of systems under this
   client, not the capacity of each server. With pipelined requests the same four client CPUs drive more than

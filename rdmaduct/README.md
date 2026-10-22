@@ -73,37 +73,37 @@ hardware). Tables are generated from the raw data in [`../benchmarks/data`](../b
 </picture>
 
 <!-- BEGIN GENERATED:transport-rtt -->
-Data: `benchmarks/data/2026-10-21-run3` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `cb8f60b7eaa0`, summary digest `c9976f2a8da5b83b`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-23-run5` (790 runs: 754 ok, 26 with operation errors, 0 failed, 10 skipped), commit `9054e10aa2ab`, summary digest `8262d6bae955c711`. Mean over repetitions; `cv` is the coefficient of variation.
 
 Median round-trip time in microseconds (ping-pong, one message in flight). Loopback on one host.
 
 | Message bytes | TCP | Soft-RoCE, polling | Soft-RoCE, event-driven |
 |---|---|---|---|
-| 64 | 7.3 (cv 1.6%) | 7.0 (cv 9.2%) | 10.2 (cv 7.5%) |
-| 256 | 7.1 (cv 3.3%) | 6.6 (cv 2.4%) | 10.0 (cv 2.8%) |
-| 1024 | 7.6 (cv 4.4%) | 6.7 (cv 1.9%) | 10.5 (cv 3.2%) |
-| 4096 | 8.4 (cv 2.5%) | 11.1 (cv 1.9%) | 15.3 (cv 3.2%) |
-| 16384 | 11.1 (cv 5.2%) | 30.2 (cv 3.0%) | 34.4 (cv 2.2%) |
-| 65536 | 22.1 (cv 2.6%) | 110.9 (cv 8.4%) | 112.5 (cv 0.8%) |
-| 262144 | 49.2 (cv 8.5%) | 440.4 (cv 1.6%) | 450.9 (cv 1.2%) |
-| 1048576 | 181.9 (cv 2.0%) | 1,864.1 (cv 1.0%) | 1,927.9 (cv 1.2%) |
+| 64 | 7.4 (cv 3.2%) | 6.9 (cv 5.2%) | 10.4 (cv 7.2%) |
+| 256 | 7.5 (cv 2.6%) | 6.7 (cv 2.7%) | 10.4 (cv 4.7%) |
+| 1024 | 7.7 (cv 4.6%) | 7.1 (cv 3.1%) | 11.2 (cv 7.5%) |
+| 4096 | 8.5 (cv 2.4%) | 11.4 (cv 1.8%) | 15.3 (cv 2.9%) |
+| 16384 | 10.8 (cv 3.7%) | 30.5 (cv 0.9%) | 35.9 (cv 1.7%) |
+| 65536 | 22.7 (cv 1.2%) | 109.5 (cv 3.1%) | 114.0 (cv 5.3%) |
+| 262144 | 48.9 (cv 3.4%) | 451.7 (cv 3.1%) | 454.2 (cv 0.8%) |
+| 1048576 | 181.0 (cv 1.4%) | 1,889.5 (cv 0.8%) | 1,932.7 (cv 1.1%) |
 <!-- END GENERATED:transport-rtt -->
 
 <!-- BEGIN GENERATED:transport-stream -->
-Data: `benchmarks/data/2026-10-21-run3` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `cb8f60b7eaa0`, summary digest `c9976f2a8da5b83b`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-23-run5` (790 runs: 754 ok, 26 with operation errors, 0 failed, 10 skipped), commit `9054e10aa2ab`, summary digest `8262d6bae955c711`. Mean over repetitions; `cv` is the coefficient of variation.
 
 One-way streaming throughput in MB/s (batched sends, 64 buffers per direction). Loopback on one host.
 
 | Message bytes | TCP | Soft-RoCE, polling | Soft-RoCE, event-driven |
 |---|---|---|---|
-| 64 | 301 (cv 17.0%) | 47 (cv 1.7%) | 47 (cv 5.0%) |
-| 256 | 1,203 (cv 17.1%) | 190 (cv 5.8%) | 172 (cv 8.8%) |
-| 1024 | 3,509 (cv 2.8%) | 763 (cv 3.8%) | 665 (cv 9.0%) |
-| 4096 | 8,181 (cv 1.6%) | 930 (cv 4.7%) | 952 (cv 2.5%) |
-| 16384 | 11,527 (cv 2.7%) | 1,154 (cv 2.6%) | 1,146 (cv 1.6%) |
-| 65536 | 9,865 (cv 11.8%) | 1,300 (cv 2.0%) | 1,270 (cv 1.3%) |
-| 262144 | 5,430 (cv 13.4%) | 1,196 (cv 4.7%) | 1,193 (cv 2.2%) |
-| 1048576 | 5,892 (cv 33.2%) | 1,139 (cv 2.5%) | 1,102 (cv 2.2%) |
+| 64 | 315 (cv 2.7%) | 46 (cv 5.7%) | 44 (cv 5.3%) |
+| 256 | 1,161 (cv 4.0%) | 187 (cv 6.5%) | 167 (cv 10.1%) |
+| 1024 | 3,137 (cv 11.1%) | 703 (cv 9.7%) | 679 (cv 5.6%) |
+| 4096 | 7,913 (cv 5.9%) | 898 (cv 4.4%) | 935 (cv 2.0%) |
+| 16384 | 10,631 (cv 12.8%) | 1,130 (cv 0.9%) | 1,139 (cv 1.1%) |
+| 65536 | 10,538 (cv 8.1%) | 1,293 (cv 1.6%) | 1,284 (cv 0.5%) |
+| 262144 | 6,007 (cv 4.6%) | 1,176 (cv 2.9%) | 1,176 (cv 1.2%) |
+| 1048576 | 8,037 (cv 16.8%) | 1,118 (cv 1.6%) | 1,091 (cv 0.9%) |
 <!-- END GENERATED:transport-stream -->
 
 - For messages up to 1 KiB the median round trip of Soft-RoCE with polling is lower than that of TCP; from 16 KiB TCP

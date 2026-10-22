@@ -19,8 +19,8 @@ The store is developed further only if it shows a clear, repeatable advantage ov
 least one KV-cache scenario, on hardware where the transport can show it. Over TCP on the measured machine arenakv has
 the highest throughput in every matrix row, is faster than memcached over the same protocol at one server CPU, and is
 ahead of Valkey and Dragonfly at four (see [`benchmarks/README.md`](../benchmarks/README.md), [C1] [C2] [C3]). In the
-KV-cache rows arenakv is ahead of memcached by less than 15% [C31], which is not the clear advantage the gate asks
-for.
+KV-cache rows arenakv is ahead of memcached by less than 10% at one server CPU and by 15% to 20% at four [C31], an
+advantage on one machine over TCP only, not yet the clear and repeatable one the gate asks for.
 
 With one request in flight, kernel mode accounts for more than 80% of the server CPU time of arenakv [C28], so the
 remaining per-request cost over TCP is mostly the kernel network path. That is the part a transport without kernel

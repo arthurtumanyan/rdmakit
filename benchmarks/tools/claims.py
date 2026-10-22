@@ -41,6 +41,28 @@ def loop(s, section, system, x, metric="throughput"):
     return s[section]["%s|%d" % (system, x)][metric]
 
 
+def dur(s, system, mode, metric="throughput"):
+    return s["durability"]["%s|%s" % (system, mode)][metric]
+
+
+def keep(s, system, mode):
+    """Mean throughput with a durability mode relative to no persistence."""
+    return dur(s, system, mode)["mean"] / dur(s, system, "none")["mean"]
+
+
+def enc(s, system, mode, wl, metric="throughput"):
+    return s["encryption"]["%s|%s|%s" % (system, mode, wl)][metric]
+
+
+def enc_ratio(s, system, wl):
+    return enc(s, system, "tls", wl)["mean"] / enc(s, system, "plain", wl)["mean"]
+
+
+def enc_added_cpu(s, system, wl):
+    return (enc(s, system, "tls", wl, "server_cpu_us_per_op")["mean"]
+            - enc(s, system, "plain", wl, "server_cpu_us_per_op")["mean"])
+
+
 def c1(s):
     return all(max(ALL_SYSTEMS, key=lambda x: mean(s, x, cpus, wl)) in ("kvstore", "kvstore-mc")
                for cpus in (1, 4) for wl in WORKLOADS)
@@ -59,10 +81,7 @@ def c3(s):
 def c4(s):
     def lowest(cpus, wl):
         return min(TCP_SYSTEMS, key=lambda x: mean(s, x, cpus, wl, "server_cpu_us_per_op"))
-    rows = [(cpus, wl) for cpus in (1, 4) for wl in WORKLOADS if (cpus, wl) != (4, "kvcache")]
-    last = mean(s, "kvstore", 4, "kvcache", "server_cpu_us_per_op") / mean(s, "memcached", 4, "kvcache", "server_cpu_us_per_op")
-    return (all(lowest(cpus, wl) in ("kvstore", "kvstore-mc") for cpus, wl in rows)
-            and lowest(4, "kvcache") == "memcached" and last < 1.02)
+    return all(lowest(cpus, wl) in ("kvstore", "kvstore-mc") for cpus in (1, 4) for wl in WORKLOADS)
 
 
 def c5(s):
@@ -189,7 +208,8 @@ def c25(s):
 def c26(s):
     def keep(x):
         return loop(s, "connections", x, 1024)["mean"] / loop(s, "connections", x, 16)["mean"]
-    return all(keep(x) > 0.95 for x in ("kvstore", "kvstore-mc", "memcached", "valkey")) and keep("dragonfly") < 0.85
+    return (0.94 < keep("kvstore") < 0.95 and all(0.97 < keep(x) < 1.03 for x in ("kvstore-mc", "memcached", "valkey"))
+            and keep("dragonfly") < 0.85)
 
 
 def c27(s):
@@ -216,7 +236,7 @@ def c31(s):
     def lead(cpus):
         best = max(mean(s, x, cpus, "kvcache") for x in ("kvstore", "kvstore-mc"))
         return best / mean(s, "memcached", cpus, "kvcache")
-    return all(1 < lead(cpus) < 1.15 for cpus in (1, 4))
+    return 1 < lead(1) < 1.10 and 1.15 < lead(4) < 1.20
 
 
 def c32(s):
@@ -246,7 +266,7 @@ def c36(s):
     def falls(x):
         p = [sweep(s, x, r, "p99_us")["mean"] for r in (100000, 140000, 180000, 220000)]
         return any(b < a for a, b in zip(p, p[1:]))
-    return all(falls(x) for x in SWEEP_SYSTEMS)
+    return falls("kvstore") and falls("valkey") and not falls("dragonfly") and not falls("memcached")
 
 
 def c37(s):
@@ -257,11 +277,47 @@ def c38(s):
     return max(loop(s, "pipeline", x, 32)["min"] for x in TCP_SYSTEMS) > 3_000_000
 
 
+def c39(s):
+    return keep(s, "kvstore", "everysec") >= 0.93 and keep(s, "valkey", "everysec") >= 0.93
+
+
+def c40(s):
+    return (keep(s, "kvstore", "always") < 0.02 and keep(s, "valkey", "always") < 0.02
+            and above(dur(s, "kvstore", "always"), dur(s, "valkey", "always")))
+
+
+def c41(s):
+    return dur(s, "kvstore", "always", "p50_us")["mean"] < 50 and dur(s, "valkey", "always", "p50_us")["mean"] > 5000
+
+
+def c42(s):
+    return keep(s, "kvstore", "replica") >= 0.97 and keep(s, "valkey", "replica") >= 0.93
+
+
+def c43(s):
+    ratio = dur(s, "kvstore", "always", "put_p50_us")["mean"] / (s["env"]["data_dir_fsync_p50_ms"] * 1000)
+    return 1.5 <= ratio <= 2.5
+
+
+def c44(s):
+    return all(enc_ratio(s, "kvstore", wl) > max(enc_ratio(s, "kvstore-resp", wl), enc_ratio(s, "valkey", wl))
+               for wl in ("small", "block"))
+
+
+def c45(s):
+    return all(above(enc(s, "kvstore", "tls", wl), enc(s, "valkey", "tls", wl)) for wl in ("small", "block"))
+
+
+def c46(s):
+    return all(enc_added_cpu(s, "kvstore", wl) < min(enc_added_cpu(s, "kvstore-resp", wl), enc_added_cpu(s, "valkey", wl))
+               for wl in ("small", "block"))
+
+
 _TEXT = {
     1: "arenakv over TCP, with its native protocol or with the memcached protocol, has the highest mean throughput in all six matrix rows",
     2: "at four server CPUs the throughput of arenakv (TCP, native protocol) is higher than that of Valkey and of Dragonfly in all three workloads, with non-overlapping ranges",
     3: "at one server CPU arenakv over the memcached protocol has higher throughput than memcached in all three workloads, with non-overlapping ranges",
-    4: "one of the two arenakv TCP rows (native protocol or memcached protocol) has the lowest mean server CPU time per operation of the five TCP servers in five of the six matrix rows; in the KV-cache row at four server CPUs memcached is lowest and native arenakv is within 2% of it",
+    4: "one of the two arenakv TCP rows (native protocol or memcached protocol) has the lowest mean server CPU time per operation of the five TCP servers in every matrix row",
     5: "at four server CPUs arenakv (TCP) uses less server CPU time per operation than Valkey and Dragonfly in all three workloads (means)",
     6: "arenakv over Soft-RoCE has lower mean throughput than arenakv over TCP in all six matrix rows",
     7: "at 260,000 offered operations per second arenakv (TCP) achieves the offered rate within 1% in every repetition, while Valkey, Dragonfly and memcached achieve less than 240,000 operations per second in every repetition",
@@ -283,19 +339,27 @@ _TEXT = {
     23: "with one blocking thread per connection kvpace measures between 5% and 15% less throughput than memtier_benchmark with 16 connections on both validation servers",
     24: "at pipeline depth 32 native arenakv has the highest throughput of the five servers, with non-overlapping ranges, and at least twice the mean throughput of Valkey, Dragonfly and memcached",
     25: "from pipeline depth 1 to 32 the throughput of native arenakv grows by a factor above 15, that of arenakv over the memcached protocol and of Valkey by a factor between 9 and 13, and that of Dragonfly and memcached by less than 6.5",
-    26: "from 16 to 1024 connections the throughput of native arenakv, arenakv over the memcached protocol, memcached and Valkey falls by less than 5%, that of Dragonfly by more than 15%",
+    26: "from 16 to 1024 connections the mean throughput of native arenakv falls by between 5% and 6%, that of arenakv over the memcached protocol, memcached and Valkey changes by less than 3%, and that of Dragonfly falls by more than 15%",
     27: "at 1024 connections arenakv over the memcached protocol has the lowest mean GET p99 latency of the five servers",
     28: "at pipeline depth 1 kernel mode accounts for more than 80% of the server CPU time of native arenakv in every repetition, and for more than 70% of the server CPU time of each of the five TCP servers (means)",
     29: "in every matrix row the mean server CPU time per operation of native arenakv and of arenakv over the memcached protocol differ by less than 5%",
     30: "for each of the five TCP servers the kernel-mode share of the server CPU time is lower at pipeline depth 32 than at depth 1, with non-overlapping ranges",
-    31: "in the KV-cache rows the higher of the two arenakv TCP means exceeds the mean throughput of memcached by less than 15%, at one and at four server CPUs",
+    31: "in the KV-cache rows the higher of the two arenakv TCP means exceeds the mean throughput of memcached by less than 10% at one server CPU and by between 15% and 20% at four",
     32: "in run 2026-10-21-run2 the mean server CPU time per operation of native arenakv is higher than that of arenakv over the memcached protocol in every matrix row",
     33: "in run 2026-10-20-run1 the mean resident memory of arenakv with 64-byte values is more than eight times that of each of Valkey, Dragonfly and memcached, at one and at four server CPUs",
     34: "in run 2026-10-20-run1 the median loopback round trip of TCP is higher than that of Soft-RoCE with polling for messages of 64, 256 and 1024 bytes",
     35: "with one connection kvpace measures a mean p50 latency between 7 and 9 microseconds and memtier_benchmark reports 15 microseconds, on both validation servers",
-    36: "for each of the four servers of the sweep the mean p99 latency decreases at least once between consecutive offered rates from 100,000 to 220,000 operations per second",
+    36: "between consecutive offered rates from 100,000 to 220,000 operations per second the mean p99 latency of arenakv and of Valkey decreases at least once, while that of Dragonfly and of memcached rises at every step",
     37: "in run 2026-10-20-run1 Dragonfly with default flags failed more than 80% of requests in every repetition at 256 MB and at 1 GB",
     38: "with 32 requests in flight per connection the four client CPUs drive more than 3 million operations per second in every repetition of at least one server of the pipeline suite",
+    39: "with the append-only log synced every second arenakv and Valkey each keep at least 93% of their mean throughput without persistence",
+    40: "with the log synced on every write the mean throughput of arenakv and of Valkey falls below 2% of their throughput without persistence, and that of arenakv is higher than that of Valkey with non-overlapping ranges",
+    41: "with the log synced on every write the mean GET median latency of arenakv stays below 50 microseconds while that of Valkey exceeds 5 milliseconds",
+    42: "with one asynchronous replica arenakv keeps at least 97% and Valkey at least 93% of their mean throughput without persistence",
+    43: "with the log synced on every write the mean PUT median latency of arenakv lies between 1.5 and 2.5 times the median fsync time of the log disk recorded at the start of the run",
+    44: "for 64-byte and 16 KiB values the encrypted native protocol of arenakv keeps a larger share of its unencrypted throughput than TLS keeps on the RESP path of arenakv and of Valkey",
+    45: "encrypted, the native protocol of arenakv has a higher throughput than Valkey over TLS for 64-byte and 16 KiB values, with non-overlapping ranges",
+    46: "for 64-byte and 16 KiB values encryption adds less server CPU time per operation to the native protocol of arenakv than TLS adds to the RESP path of arenakv and of Valkey",
 }
 # Claims about an earlier run: claim number -> run directory name under benchmarks/data.
 _RUN = {32: "2026-10-21-run2", 33: "2026-10-20-run1", 34: "2026-10-20-run1", 37: "2026-10-20-run1"}

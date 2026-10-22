@@ -80,18 +80,18 @@ data in [`../benchmarks/data`](../benchmarks/data) and checked by `make verify` 
 Validation against `memtier_benchmark` (Valkey, one server CPU):
 
 <!-- BEGIN GENERATED:validation -->
-Data: `benchmarks/data/2026-10-21-run3` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `cb8f60b7eaa0`, summary digest `c9976f2a8da5b83b`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-23-run5` (790 runs: 754 ok, 26 with operation errors, 0 failed, 10 skipped), commit `9054e10aa2ab`, summary digest `8262d6bae955c711`. Mean over repetitions; `cv` is the coefficient of variation.
 
 One server CPU, 64-byte values, 90% GET. memtier_benchmark runs `-t 1 -c 1` for one connection and `-t 4 -c 4` for 16. Latencies are GET latencies in microseconds; memtier reports milliseconds with three decimals.
 
 | Server | Connections | kvpace client model | kvpace ops/s | memtier ops/s | Ratio | kvpace p50 | memtier p50 | kvpace p99 | memtier p99 |
 |---|---|---|---|---|---|---|---|---|---|
-| Valkey (RESP) | 1 | 1 thread, 1 connection | 116,950 (cv 0.7%) | 89,760 (cv 0.3%) | 1.30 | 8.4 (cv 0.4%) | 15.0 (cv 0.0%) | 11 (cv 2.4%) | 15 (cv 0.0%) |
-| Valkey (RESP) | 16 | 4 threads x 4 connections | 221,077 (cv 0.5%) | 227,432 (cv 0.2%) | 0.97 | 67.3 (cv 0.4%) | 71.0 (cv 0.0%) | 134 (cv 0.4%) | 95 (cv 0.0%) |
-| Valkey (RESP) | 16 | 16 threads x 1 connection | 210,438 (cv 0.9%) | 227,432 (cv 0.2%) | 0.93 | 72.8 (cv 0.6%) | 71.0 (cv 0.0%) | 139 (cv 0.8%) | 95 (cv 0.0%) |
-| arenakv (memcached protocol) | 1 | 1 thread, 1 connection | 136,463 (cv 1.3%) | 102,194 (cv 0.7%) | 1.34 | 7.2 (cv 1.3%) | 15.0 (cv 0.0%) | 10 (cv 1.7%) | 15 (cv 0.0%) |
-| arenakv (memcached protocol) | 16 | 4 threads x 4 connections | 296,016 (cv 0.1%) | 294,108 (cv 0.7%) | 1.01 | 49.6 (cv 0.3%) | 48.6 (cv 7.4%) | 104 (cv 0.6%) | 105 (cv 3.4%) |
-| arenakv (memcached protocol) | 16 | 16 threads x 1 connection | 258,259 (cv 0.8%) | 294,108 (cv 0.7%) | 0.88 | 57.9 (cv 1.0%) | 48.6 (cv 7.4%) | 120 (cv 0.6%) | 105 (cv 3.4%) |
+| Valkey (RESP) | 1 | 1 thread, 1 connection | 116,870 (cv 0.8%) | 89,611 (cv 1.1%) | 1.30 | 8.4 (cv 1.2%) | 15.0 (cv 0.0%) | 11 (cv 1.9%) | 15 (cv 0.0%) |
+| Valkey (RESP) | 16 | 4 threads x 4 connections | 221,642 (cv 0.6%) | 227,090 (cv 0.4%) | 0.98 | 67.0 (cv 0.6%) | 71.0 (cv 0.0%) | 133 (cv 0.3%) | 98 (cv 4.5%) |
+| Valkey (RESP) | 16 | 16 threads x 1 connection | 209,842 (cv 0.6%) | 227,090 (cv 0.4%) | 0.92 | 72.7 (cv 0.7%) | 71.0 (cv 0.0%) | 140 (cv 0.8%) | 98 (cv 4.5%) |
+| arenakv (memcached protocol) | 1 | 1 thread, 1 connection | 136,302 (cv 0.5%) | 101,226 (cv 0.9%) | 1.35 | 7.2 (cv 0.5%) | 15.0 (cv 0.0%) | 9 (cv 2.0%) | 15 (cv 0.0%) |
+| arenakv (memcached protocol) | 16 | 4 threads x 4 connections | 295,443 (cv 0.8%) | 293,834 (cv 0.5%) | 1.01 | 49.6 (cv 0.5%) | 50.2 (cv 8.7%) | 104 (cv 0.3%) | 105 (cv 3.4%) |
+| arenakv (memcached protocol) | 16 | 16 threads x 1 connection | 258,669 (cv 1.9%) | 293,834 (cv 0.5%) | 0.88 | 57.6 (cv 1.5%) | 50.2 (cv 8.7%) | 120 (cv 1.3%) | 105 (cv 3.4%) |
 <!-- END GENERATED:validation -->
 
 With memtier's client model (4 threads with 4 connections each) kvpace measures a throughput within 3% of
@@ -112,40 +112,40 @@ Open-loop sweep over offered load, and the effect of measuring from the intended
 </picture>
 
 <!-- BEGIN GENERATED:sweep -->
-Data: `benchmarks/data/2026-10-21-run3` (690 runs: 660 ok, 20 with operation errors, 0 failed, 10 skipped), commit `cb8f60b7eaa0`, summary digest `c9976f2a8da5b83b`. Mean over repetitions; `cv` is the coefficient of variation.
+Data: `benchmarks/data/2026-10-23-run5` (790 runs: 754 ok, 26 with operation errors, 0 failed, 10 skipped), commit `9054e10aa2ab`, summary digest `8262d6bae955c711`. Mean over repetitions; `cv` is the coefficient of variation.
 
 Open loop, one server CPU, 64-byte values, 16 connections. Latencies in microseconds, measured from the intended send time unless stated.
 
 | System | Offered ops/s | Achieved ops/s | p50 | p99 | p99 service time | Max schedule lag (ms) |
 |---|---|---|---|---|---|---|
-| arenakv (TCP) | 20,000 | 20,000 (cv 0.0%) | 9 (cv 3.1%) | 175 (cv 89.8%) | 116 (cv 72.2%) | 4.2 (cv 9.5%) |
-| arenakv (TCP) | 60,000 | 60,000 (cv 0.0%) | 54 (cv 42.1%) | 765 (cv 25.8%) | 494 (cv 12.0%) | 4.6 (cv 23.5%) |
-| arenakv (TCP) | 100,000 | 100,001 (cv 0.0%) | 219 (cv 7.0%) | 1,915 (cv 34.1%) | 709 (cv 10.3%) | 13.6 (cv 79.4%) |
-| arenakv (TCP) | 140,000 | 139,998 (cv 0.0%) | 218 (cv 25.1%) | 3,106 (cv 41.2%) | 665 (cv 14.3%) | 17.7 (cv 57.0%) |
-| arenakv (TCP) | 180,000 | 179,999 (cv 0.0%) | 190 (cv 8.1%) | 2,772 (cv 15.8%) | 532 (cv 1.8%) | 17.4 (cv 88.7%) |
-| arenakv (TCP) | 220,000 | 219,999 (cv 0.0%) | 122 (cv 6.2%) | 1,753 (cv 14.6%) | 346 (cv 5.7%) | 13.3 (cv 79.6%) |
-| arenakv (TCP) | 260,000 | 260,015 (cv 0.0%) | 93 (cv 6.6%) | 13,310 (cv 112.6%) | 149 (cv 9.5%) | 30.1 (cv 89.1%) |
-| Valkey | 20,000 | 20,000 (cv 0.0%) | 10 (cv 2.3%) | 200 (cv 55.7%) | 95 (cv 31.4%) | 4.1 (cv 14.6%) |
-| Valkey | 60,000 | 60,000 (cv 0.0%) | 113 (cv 32.0%) | 1,195 (cv 62.7%) | 608 (cv 4.6%) | 14.3 (cv 110.0%) |
-| Valkey | 100,000 | 100,000 (cv 0.0%) | 341 (cv 10.7%) | 5,865 (cv 17.5%) | 906 (cv 4.3%) | 25.9 (cv 89.3%) |
-| Valkey | 140,000 | 140,004 (cv 0.0%) | 172 (cv 2.4%) | 3,994 (cv 58.6%) | 535 (cv 1.3%) | 64.8 (cv 69.6%) |
-| Valkey | 180,000 | 180,016 (cv 0.0%) | 99 (cv 3.5%) | 1,339 (cv 30.1%) | 305 (cv 2.5%) | 27.9 (cv 92.1%) |
-| Valkey | 220,000 | 210,520 (cv 0.9%) | 242,011 (cv 11.4%) | 400,975 (cv 15.2%) | 140 (cv 1.0%) | 418.5 (cv 14.1%) |
-| Valkey | 260,000 | 211,542 (cv 0.4%) | 927,780 (cv 2.2%) | 1,488,139 (cv 2.1%) | 139 (cv 0.6%) | 1,521.3 (cv 2.8%) |
-| Dragonfly | 20,000 | 20,000 (cv 0.0%) | 10 (cv 6.1%) | 385 (cv 68.7%) | 222 (cv 61.6%) | 3.5 (cv 10.9%) |
-| Dragonfly | 60,000 | 60,004 (cv 0.0%) | 87 (cv 42.6%) | 1,098 (cv 33.7%) | 550 (cv 9.9%) | 29.2 (cv 27.4%) |
-| Dragonfly | 100,000 | 99,995 (cv 0.0%) | 498 (cv 8.8%) | 7,759 (cv 12.8%) | 880 (cv 7.2%) | 52.1 (cv 69.0%) |
-| Dragonfly | 140,000 | 140,003 (cv 0.0%) | 263 (cv 3.6%) | 4,912 (cv 25.9%) | 478 (cv 11.5%) | 47.3 (cv 101.7%) |
-| Dragonfly | 180,000 | 180,005 (cv 0.0%) | 168 (cv 31.9%) | 38,676 (cv 130.1%) | 192 (cv 15.4%) | 64.9 (cv 98.6%) |
-| Dragonfly | 220,000 | 210,165 (cv 0.7%) | 241,172 (cv 9.8%) | 406,428 (cv 8.5%) | 95 (cv 3.3%) | 413.6 (cv 7.8%) |
-| Dragonfly | 260,000 | 210,926 (cv 0.4%) | 957,140 (cv 2.1%) | 1,533,438 (cv 2.4%) | 95 (cv 3.6%) | 1,568.5 (cv 3.1%) |
-| memcached | 20,000 | 20,000 (cv 0.0%) | 9 (cv 3.1%) | 219 (cv 11.4%) | 176 (cv 23.4%) | 3.5 (cv 17.0%) |
-| memcached | 60,000 | 60,000 (cv 0.0%) | 77 (cv 49.4%) | 766 (cv 10.6%) | 546 (cv 12.1%) | 14.9 (cv 54.7%) |
-| memcached | 100,000 | 99,999 (cv 0.0%) | 358 (cv 14.1%) | 6,455 (cv 25.2%) | 1,022 (cv 2.4%) | 43.7 (cv 66.3%) |
-| memcached | 140,000 | 140,004 (cv 0.0%) | 272 (cv 4.8%) | 4,044 (cv 27.7%) | 704 (cv 2.4%) | 31.9 (cv 118.6%) |
-| memcached | 180,000 | 179,895 (cv 0.1%) | 177 (cv 6.3%) | 23,976 (cv 118.5%) | 465 (cv 5.8%) | 95.9 (cv 65.8%) |
-| memcached | 220,000 | 220,006 (cv 0.1%) | 104 (cv 4.4%) | 19,238 (cv 96.7%) | 219 (cv 8.0%) | 48.0 (cv 65.9%) |
-| memcached | 260,000 | 229,650 (cv 3.0%) | 554,068 (cv 24.2%) | 1,212,154 (cv 15.5%) | 141 (cv 7.3%) | 1,311.2 (cv 15.9%) |
+| arenakv (TCP) | 20,000 | 20,000 (cv 0.0%) | 9 (cv 0.6%) | 293 (cv 88.2%) | 200 (cv 87.8%) | 3.7 (cv 12.5%) |
+| arenakv (TCP) | 60,000 | 60,004 (cv 0.0%) | 88 (cv 67.8%) | 891 (cv 33.7%) | 532 (cv 16.8%) | 5.7 (cv 16.6%) |
+| arenakv (TCP) | 100,000 | 100,002 (cv 0.0%) | 238 (cv 18.7%) | 2,923 (cv 62.4%) | 774 (cv 18.2%) | 16.1 (cv 33.8%) |
+| arenakv (TCP) | 140,000 | 140,002 (cv 0.0%) | 216 (cv 14.5%) | 4,306 (cv 32.2%) | 696 (cv 5.2%) | 39.3 (cv 55.9%) |
+| arenakv (TCP) | 180,000 | 180,001 (cv 0.0%) | 191 (cv 14.6%) | 6,842 (cv 134.7%) | 536 (cv 2.5%) | 21.7 (cv 122.1%) |
+| arenakv (TCP) | 220,000 | 220,001 (cv 0.0%) | 131 (cv 7.8%) | 5,168 (cv 55.3%) | 364 (cv 4.4%) | 48.4 (cv 56.3%) |
+| arenakv (TCP) | 260,000 | 260,009 (cv 0.0%) | 107 (cv 25.7%) | 21,044 (cv 101.4%) | 142 (cv 6.6%) | 36.0 (cv 79.7%) |
+| Valkey | 20,000 | 20,000 (cv 0.0%) | 10 (cv 2.8%) | 79 (cv 23.9%) | 70 (cv 38.2%) | 3.8 (cv 14.8%) |
+| Valkey | 60,000 | 60,000 (cv 0.0%) | 87 (cv 63.3%) | 935 (cv 18.8%) | 536 (cv 15.1%) | 24.0 (cv 56.6%) |
+| Valkey | 100,000 | 100,000 (cv 0.0%) | 342 (cv 15.6%) | 5,898 (cv 13.1%) | 913 (cv 5.6%) | 25.9 (cv 68.8%) |
+| Valkey | 140,000 | 139,997 (cv 0.0%) | 189 (cv 8.8%) | 4,279 (cv 38.2%) | 552 (cv 4.2%) | 44.1 (cv 69.6%) |
+| Valkey | 180,000 | 179,937 (cv 0.1%) | 99 (cv 1.8%) | 3,655 (cv 134.1%) | 290 (cv 9.1%) | 32.6 (cv 95.9%) |
+| Valkey | 220,000 | 209,894 (cv 0.6%) | 251,449 (cv 15.8%) | 443,757 (cv 12.5%) | 140 (cv 0.6%) | 473.1 (cv 10.8%) |
+| Valkey | 260,000 | 211,590 (cv 0.4%) | 943,718 (cv 2.2%) | 1,504,916 (cv 1.7%) | 139 (cv 0.7%) | 1,532.2 (cv 1.4%) |
+| Dragonfly | 20,000 | 20,000 (cv 0.0%) | 10 (cv 4.4%) | 132 (cv 62.2%) | 96 (cv 58.0%) | 3.7 (cv 17.5%) |
+| Dragonfly | 60,000 | 60,011 (cv 0.0%) | 61 (cv 57.0%) | 1,656 (cv 78.3%) | 607 (cv 25.1%) | 25.2 (cv 66.3%) |
+| Dragonfly | 100,000 | 99,995 (cv 0.0%) | 492 (cv 19.1%) | 6,901 (cv 16.8%) | 829 (cv 7.4%) | 17.0 (cv 17.6%) |
+| Dragonfly | 140,000 | 140,003 (cv 0.0%) | 263 (cv 1.2%) | 7,976 (cv 82.3%) | 542 (cv 8.1%) | 54.3 (cv 106.7%) |
+| Dragonfly | 180,000 | 179,945 (cv 0.1%) | 148 (cv 8.1%) | 18,383 (cv 127.5%) | 218 (cv 6.1%) | 55.1 (cv 72.2%) |
+| Dragonfly | 220,000 | 209,622 (cv 0.5%) | 254,385 (cv 14.7%) | 413,534 (cv 13.7%) | 102 (cv 9.6%) | 421.7 (cv 14.3%) |
+| Dragonfly | 260,000 | 210,161 (cv 0.3%) | 972,240 (cv 5.8%) | 1,553,570 (cv 3.8%) | 98 (cv 1.8%) | 1,578.5 (cv 3.8%) |
+| memcached | 20,000 | 20,000 (cv 0.0%) | 9 (cv 1.9%) | 190 (cv 45.0%) | 143 (cv 47.9%) | 3.6 (cv 12.9%) |
+| memcached | 60,000 | 60,000 (cv 0.0%) | 82 (cv 80.6%) | 723 (cv 19.4%) | 503 (cv 23.3%) | 9.8 (cv 48.9%) |
+| memcached | 100,000 | 99,995 (cv 0.0%) | 336 (cv 17.8%) | 5,095 (cv 23.9%) | 1,010 (cv 9.0%) | 17.5 (cv 11.4%) |
+| memcached | 140,000 | 140,004 (cv 0.0%) | 270 (cv 4.3%) | 6,875 (cv 100.8%) | 659 (cv 8.3%) | 41.2 (cv 148.9%) |
+| memcached | 180,000 | 180,000 (cv 0.0%) | 183 (cv 9.7%) | 22,479 (cv 78.7%) | 467 (cv 3.7%) | 98.2 (cv 37.9%) |
+| memcached | 220,000 | 219,690 (cv 0.3%) | 149 (cv 62.3%) | 59,690 (cv 103.2%) | 212 (cv 10.1%) | 99.5 (cv 79.0%) |
+| memcached | 260,000 | 230,693 (cv 0.5%) | 585,525 (cv 6.0%) | 1,231,448 (cv 7.1%) | 140 (cv 1.0%) | 1,281.4 (cv 6.4%) |
 <!-- END GENERATED:sweep -->
 
 - Up to 140,000 offered operations per second all four servers achieve the offered rate within 1% [C8].

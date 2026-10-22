@@ -1,0 +1,8 @@
+{"tool": "akv_bench", "mode": "scale", "simd": "sse2", "keys": 200000, "value_size": 4096, "read_ratio": 0.900, "shards": 64, "duration_s": 3.0, "results": [
+  {"threads": 1, "ops_per_sec": 1526755, "ns_per_op_per_thread": 655.0, "entries": 200000, "evictions": 0},
+  {"threads": 2, "ops_per_sec": 2553838, "ns_per_op_per_thread": 783.1, "entries": 200000, "evictions": 0},
+  {"threads": 4, "ops_per_sec": 3927493, "ns_per_op_per_thread": 1018.5, "entries": 200000, "evictions": 0},
+  {"threads": 8, "ops_per_sec": 5385476, "ns_per_op_per_thread": 1485.5, "entries": 200000, "evictions": 0},
+  {"threads": 12, "ops_per_sec": 5759096, "ns_per_op_per_thread": 2083.7, "entries": 200000, "evictions": 0},
+  {"threads": 16, "ops_per_sec": 6034970, "ns_per_op_per_thread": 2651.2, "entries": 200000, "evictions": 0}
+]}

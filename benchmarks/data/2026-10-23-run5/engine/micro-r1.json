@@ -1,0 +1,9 @@
+{"tool": "akv_bench", "mode": "micro", "simd": "sse2", "match16": {"vector_ns_per_call": 0.692, "scalar_ns_per_call": 8.324, "speedup": 12.03}, "hash": [
+  {"key_len": 8, "ns_per_hash": 3.08, "gb_per_s": 2.60},
+  {"key_len": 16, "ns_per_hash": 4.12, "gb_per_s": 3.89},
+  {"key_len": 32, "ns_per_hash": 6.43, "gb_per_s": 4.98},
+  {"key_len": 64, "ns_per_hash": 11.07, "gb_per_s": 5.78},
+  {"key_len": 256, "ns_per_hash": 39.50, "gb_per_s": 6.48},
+  {"key_len": 1024, "ns_per_hash": 152.27, "gb_per_s": 6.72},
+  {"key_len": 4096, "ns_per_hash": 597.88, "gb_per_s": 6.85}
+], "sink": 1}

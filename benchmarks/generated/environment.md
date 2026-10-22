@@ -1,7 +1,7 @@
 | Item | Value |
 |---|---|
-| Run | 2026-10-21-run3 |
-| Date (UTC) | 2026-10-21T07:59:18Z |
+| Run | 2026-10-23-run5 |
+| Date (UTC) | 2026-10-22T20:32:03Z |
 | CPU | 12th Gen Intel(R) Core(TM) i9-12900K |
 | Logical CPUs | 24 |
 | CPU governor | performance |
@@ -15,5 +15,10 @@
 | Dragonfly | dragonfly v2.0.2-8ce4bbb106586057fbd85f71ed353c60d0d5bf87 |
 | memcached | memcached 1.6.45 |
 | Container runtime | Docker 29.9.0 |
-| Source commit | cb8f60b7eaa0 |
+| Source commit | 9054e10aa2ab |
 | Uncommitted files at run start | 0 |
+| Containers running at run start | 0 |
+| Load average (1 min) at run start | 0.81 |
+| OpenSSL | OpenSSL 3.0.13 30 Jan 2024 (Library: OpenSSL 3.0.13 30 Jan 2024) |
+| Filesystem of the append-only logs | ext4 |
+| fsync() after a 128-byte append, median | 6.08 ms |
