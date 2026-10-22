@@ -1,0 +1,6 @@
+driver=memcached threads=8 conns/thread=1 pipeline=1 value=64B keys=100000 dist=uniform
+ops=0 (gets=1314008 puts=236078 misses=18566 errors=1) in 10.00 s -> 0 ops/s
+kvcache: 18566 requests, reuse 84.6% of needed blocks, probe hit rate 98.6% (1295442 of 1314008), 236078 blocks recomputed and written, read 2122.4 MB/s, write 386.8 MB/s, corrupt 0
+server: 10.000 CPU s during run (0.00 us/op), RSS 1033.8 MiB
+service latency us: mean 4308.9  p50 3784.7  p90 7340.0  p99 11796.5  p99.9 13631.5  p99.99 17694.7  max 19919.8
+request latency us: mean 4308.9  p50 3784.7  p90 7340.0  p99 11796.5  p99.9 13631.5  p99.99 17694.7  max 19919.8

@@ -220,9 +220,8 @@ def run_kvpace(rec, suite, name, params, system, cpus, workload_args, extra_args
                "--label", "%s %s" % (system, name), "--out", str(out)]
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=duration + warmup + 120)
         if p.returncode == 3 and out.exists():
-            # kvpace exits with 3 when some operations failed; the result file is complete and records the count,
-            # so nothing else is kept.
-            status = "errors"
+            # kvpace exits with 3 when some operations failed; the result file is complete and records the count.
+            status, err = "errors", p.stdout
         elif p.returncode != 0:
             status, err = "failed", p.stderr + p.stdout
     except Exception as e:  # noqa: BLE001 - any failure is recorded and the suite continues

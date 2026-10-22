@@ -2,6 +2,8 @@ build/
 *.o
 *.a
 a.out
+# raw benchmark results of ad-hoc runs; published runs live under benchmarks/data/<run-id>/
+kvpace/results/*.json
 __pycache__/
 *.pyc
 # libFuzzer writes the inputs of findings to the current directory when a harness runs outside `make fuzz`
