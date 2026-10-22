@@ -1032,7 +1032,6 @@ int aof_open(const aof_config *cfg, akv *s, int load, aof **out, aof_load_info *
             rc = incr_create(a, 2);
             if (rc >= 0) {
                 a->fd = rc;
-                rc = 0;
                 a->incr = malloc(sizeof(*a->incr));
                 if (a->incr == NULL) {
                     rc = -ENOMEM;

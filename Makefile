@@ -32,10 +32,18 @@ format:
 format-check:
 	for p in $(PROJECTS) lab; do clang-format --dry-run --Werror $$(git ls-files "$$p/*.c" "$$p/*.h") || exit 1; done
 
+# Static analysis (clang static analyzer and cppcheck); fails on any finding.
+analyze:
+	scripts/analyze.sh
+
+# Coverage-guided fuzzing of every parser and loader (clang with libFuzzer); FUZZ_TIME seconds per harness.
+fuzz:
+	for p in rdmaduct arenakv; do $(MAKE) -C $$p fuzz || exit 1; done
+
 verify:
 	python3 benchmarks/tools/verify.py benchmarks/data/$(LATEST)
 
 clean:
 	for p in $(PROJECTS) lab; do $(MAKE) -C $$p clean; done
 
-.PHONY: all test test-tcp sanitize format format-check verify clean
+.PHONY: all test test-tcp sanitize analyze fuzz format format-check verify clean

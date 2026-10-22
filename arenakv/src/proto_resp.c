@@ -14,6 +14,7 @@
  * key) are not atomic with respect to concurrent clients. SCAN returns all matching keys in one reply
  * with cursor 0, which satisfies its guarantees; KEYS and SCAN copy each shard while its lock is held.
  */
+#include <ctype.h>
 #include <errno.h>
 #include <fnmatch.h>
 #include <limits.h>
@@ -168,6 +169,11 @@ static int64_t parse_expiry(const struct arg *opt, const struct arg *val, struct
         *bad = 1;
         return 0;
     }
+    if (v <= 0) {
+        r_err(o, "ERR invalid expire time in 'set' command");
+        *bad = 1;
+        return 0;
+    }
     int64_t ttl;
     if (is(opt, "EX")) {
         ttl = v > LLONG_MAX / 1000 ? -2 : v * 1000;
@@ -184,7 +190,7 @@ static int64_t parse_expiry(const struct arg *opt, const struct arg *val, struct
             return -1;
         }
     }
-    if (v <= 0 || ttl == -2) {
+    if (ttl == -2) {
         r_err(o, "ERR invalid expire time in 'set' command");
         *bad = 1;
         return 0;
@@ -293,8 +299,8 @@ static void cmd_expire(akvd *d, struct arg *a, size_t n, long long unit, int abs
         return;
     }
     long long ttl = v * unit;
-    if (abs) {
-        ttl -= now_unix_ms();
+    if (abs && __builtin_sub_overflow(ttl, now_unix_ms(), &ttl)) {
+        ttl = -1; /* far in the past: delete */
     }
     /* A non-positive time to live deletes the key (Redis semantics). */
     int rc = akv_touch(akvd_store(d), a[1].p, a[1].n, ttl > 0 ? ttl : -1);
@@ -428,10 +434,15 @@ static void cmd_config_get(akvd *d, const struct arg *pattern, struct obuf *o) {
     char threads[16];
     snprintf(maxmem, sizeof(maxmem), "%llu", (unsigned long long)st.arena_bytes);
     snprintf(threads, sizeof(threads), "%u", akvd_threads(d));
+    aof_info ai;
     const char *table[][2] = {
-        {"maxmemory", maxmem}, {"maxmemory-policy", akvd_no_evict(d) ? "noeviction" : "allkeys-lru"},
-        {"save", ""},          {"appendonly", "no"},
-        {"databases", "1"},    {"io-threads", threads},
+        {"maxmemory", maxmem},
+        {"maxmemory-policy", akvd_no_evict(d) ? "noeviction" : "allkeys-lru"},
+        {"save", ""},
+        {"appendonly", akvd_aof_info(d, &ai) == 0 ? "yes" : "no"},
+        {"appendfsync", akvd_appendfsync(d)},
+        {"databases", "1"},
+        {"io-threads", threads},
     };
     size_t count = 0;
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
@@ -447,12 +458,82 @@ static void cmd_config_get(akvd *d, const struct arg *pattern, struct obuf *o) {
 }
 
 /* Executes one command. */
+/* Lower-case copy of a command name for error messages (Valkey reports names in lower case). */
+static void lower_name(const struct arg *c, char *out, size_t cap) {
+    size_t n = c->n < cap - 1 ? c->n : cap - 1;
+    for (size_t i = 0; i < n; i++) {
+        out[i] = (char)tolower((unsigned char)c->p[i]);
+    }
+    out[n] = '\0';
+}
+
+/*
+ * Permission check of a RESP command for a user (NULL reason on success). Unknown commands pass (the
+ * dispatcher answers them). Keys are checked at the positions of the command table; SET with the GET
+ * option also reads its key.
+ */
+static const char *resp_denied(const acl_user *u, const struct arg *a, size_t n) {
+    int id = acl_cmd_find(ACL_RESP, a[0].p, a[0].n);
+    if (id < 0) {
+        return NULL;
+    }
+    if (!acl_cmd_allowed(u, (unsigned)id)) {
+        return "command";
+    }
+    const acl_cmd *k = acl_cmd_at((unsigned)id);
+    if (k->first == 0) {
+        return NULL;
+    }
+    unsigned access = k->access;
+    if (is(&a[0], "SET")) {
+        for (size_t i = 3; i < n; i++) {
+            access |= is(&a[i], "GET") ? ACL_KEY_READ : 0;
+        }
+    }
+    long last = k->last < 0 ? (long)n + k->last : k->last;
+    for (long i = k->first; i <= last && (size_t)i < n; i += k->step) {
+        if (!acl_key_allowed(u, a[i].p, a[i].n, access)) {
+            return "key";
+        }
+    }
+    return NULL;
+}
+
+/* Replies with the NOPERM error of Valkey for a denied command. Returns 1 when the command may run. */
+static int resp_permitted(struct session *ss, const struct arg *a, size_t n, struct obuf *o) {
+    if (ss->user == NULL || acl_unrestricted(ss->user)) {
+        return 1;
+    }
+    const char *why = resp_denied(ss->user, a, n);
+    if (why == NULL) {
+        return 1;
+    }
+    if (why[0] == 'k') {
+        r_err(o, "NOPERM No permissions to access a key");
+    } else {
+        char name[64];
+        lower_name(&a[0], name, sizeof(name));
+        ob_printf(o, "-NOPERM User %s has no permissions to run the '%s' command\r\n",
+                  acl_user_name(ss->user), name);
+    }
+    return 0;
+}
+
+static void cmd_acl(akvd *d, struct session *ss, struct arg *a, size_t n, struct obuf *o);
+
 static void dispatch(akvd *d, struct session *ss, struct arg *a, size_t n, struct obuf *o) {
     akv *s = akvd_store(d);
     const struct arg *c = &a[0];
     SRV_COUNT(d, commands, 1);
     if (!ss->authed && !is(c, "AUTH") && !is(c, "HELLO") && !is(c, "QUIT")) {
         r_err(o, "NOAUTH Authentication required.");
+        return;
+    }
+    if (akvd_session_refresh(d, ss) != 0) {
+        r_err(o, "ERR the user of this connection was removed or disabled");
+        return;
+    }
+    if (!resp_permitted(ss, a, n, o)) {
         return;
     }
     if (is(c, "GET")) {
@@ -709,18 +790,16 @@ static void dispatch(akvd *d, struct session *ss, struct arg *a, size_t n, struc
             r_arity(o, c);
             return;
         }
-        if (!akvd_auth_required(d)) {
+        if (!akvd_acl_enabled(d)) {
             r_err(o, "ERR AUTH <password> called without any password configured for the default user. "
                      "Are you sure your configuration is correct?");
             return;
         }
         const struct arg *user = n == 3 ? &a[1] : NULL;
         const struct arg *pass = &a[n - 1];
-        if (akvd_auth_check(d, user ? user->p : NULL, user ? user->n : 0, pass->p, pass->n)) {
-            ss->authed = 1;
+        if (akvd_login(d, ss, user ? user->p : NULL, user ? user->n : 0, pass->p, pass->n)) {
             r_ok(o);
         } else {
-            SRV_COUNT(d, auth_failures, 1);
             r_err(o, "WRONGPASS invalid username-password pair or user is disabled.");
         }
     } else if (is(c, "HELLO")) {
@@ -731,8 +810,8 @@ static void dispatch(akvd *d, struct session *ss, struct arg *a, size_t n, struc
         }
         for (size_t i = 2; i < n; i++) {
             if (is(&a[i], "AUTH") && i + 2 < n) {
-                if (!akvd_auth_check(d, a[i + 1].p, a[i + 1].n, a[i + 2].p, a[i + 2].n)) {
-                    SRV_COUNT(d, auth_failures, 1);
+                if (akvd_acl_enabled(d) &&
+                    !akvd_login(d, ss, a[i + 1].p, a[i + 1].n, a[i + 2].p, a[i + 2].n)) {
                     r_err(o, "WRONGPASS invalid username-password pair or user is disabled.");
                     return;
                 }
@@ -837,6 +916,8 @@ static void dispatch(akvd *d, struct session *ss, struct arg *a, size_t n, struc
         } else {
             r_err(o, "ERR persistence is not configured (snapshot option)");
         }
+    } else if (is(c, "ACL")) {
+        cmd_acl(d, ss, a, n, o);
     } else if (is(c, "BGREWRITEAOF")) {
         int rc = akvd_aof_rewrite(d);
         if (rc == 0) {
@@ -980,4 +1061,174 @@ size_t resp_execute(akvd *d, struct session *ss, const uint8_t *in, size_t len, 
         dispatch(d, ss, tl_args, nargs, out);
     }
     return used;
+}
+
+/* ---- ACL ---------------------------------------------------------------------------------------------- */
+
+static void acl_getuser(const acl_user *u, struct obuf *o) {
+    char desc[8192];
+    acl_describe(u, desc, sizeof(desc));
+    /* desc: "user <name> on|off [nopass] #h... ~k... %R~k... resetchannels|&c... <command rules>" */
+    struct obuf flags = {0};
+    struct obuf pass = {0};
+    struct obuf keys = {0};
+    struct obuf chans = {0};
+    struct obuf cmds = {0};
+    unsigned nflags = 0;
+    unsigned npass = 0;
+    char *save = NULL;
+    int field = 0;
+    for (char *tok = strtok_r(desc, " ", &save); tok != NULL; tok = strtok_r(NULL, " ", &save), field++) {
+        if (field < 2) {
+            continue; /* "user", name */
+        }
+        if (strcmp(tok, "on") == 0 || strcmp(tok, "off") == 0 || strcmp(tok, "nopass") == 0) {
+            r_bulk_str(&flags, tok);
+            nflags++;
+        } else if (tok[0] == '#') {
+            r_bulk_str(&pass, tok + 1);
+            npass++;
+        } else if (tok[0] == '~' || tok[0] == '%') {
+            ob_printf(&keys, "%s%s", keys.len ? " " : "", tok);
+        } else if (tok[0] == '&') {
+            ob_printf(&chans, "%s%s", chans.len ? " " : "", tok);
+        } else if (strcmp(tok, "resetchannels") != 0) {
+            ob_printf(&cmds, "%s%s", cmds.len ? " " : "", tok);
+        }
+    }
+    r_array(o, 10);
+    r_bulk_str(o, "flags");
+    r_array(o, nflags);
+    ob_add(o, flags.p, flags.len);
+    r_bulk_str(o, "passwords");
+    r_array(o, npass);
+    ob_add(o, pass.p, pass.len);
+    r_bulk_str(o, "commands");
+    r_bulk(o, cmds.p, cmds.len);
+    r_bulk_str(o, "keys");
+    r_bulk(o, keys.p, keys.len);
+    r_bulk_str(o, "channels");
+    r_bulk(o, chans.p, chans.len);
+    ob_free(&flags);
+    ob_free(&pass);
+    ob_free(&keys);
+    ob_free(&chans);
+    ob_free(&cmds);
+}
+
+/*
+ * ACL WHOAMI | USERS | LIST | CAT [category] | GETUSER name | DRYRUN user command [arg ...] | LOAD.
+ * SETUSER, DELUSER and SAVE are refused: the file is the only source of users.
+ */
+static void cmd_acl(akvd *d, struct session *ss, struct arg *a, size_t n, struct obuf *o) {
+    const acl *l = akvd_acl(d);
+    if (n < 2) {
+        r_arity(o, &a[0]);
+        return;
+    }
+    const struct arg *sub = &a[1];
+    if (is(sub, "CAT")) {
+        if (n == 2) {
+            unsigned k = 0;
+            while (acl_categories[k] != NULL) {
+                k++;
+            }
+            r_array(o, k);
+            for (unsigned i = 0; i < k; i++) {
+                r_bulk_str(o, acl_categories[i]);
+            }
+            return;
+        }
+        uint32_t cat = 0;
+        for (unsigned i = 0; acl_categories[i] != NULL; i++) {
+            if (is(&a[2], acl_categories[i])) {
+                cat = 1u << i;
+            }
+        }
+        if (cat == 0) {
+            ob_printf(o, "-ERR Unknown category '%.*s'\r\n", (int)(a[2].n > 64 ? 64 : a[2].n), a[2].p);
+            return;
+        }
+        struct obuf b = {0};
+        unsigned cnt = 0;
+        for (unsigned i = 0; i < acl_ncmds(); i++) {
+            const acl_cmd *k = acl_cmd_at(i);
+            if (k->proto == ACL_RESP && (k->cats & cat) != 0) {
+                char name[32];
+                size_t m = strlen(k->name);
+                for (size_t j = 0; j <= m; j++) {
+                    name[j] = (char)tolower((unsigned char)k->name[j]);
+                }
+                r_bulk_str(&b, name);
+                cnt++;
+            }
+        }
+        r_array(o, cnt);
+        ob_add(o, b.p, b.len);
+        ob_free(&b);
+        return;
+    }
+    if (l == NULL) {
+        if (is(sub, "WHOAMI")) {
+            r_bulk_str(o, "default");
+        } else {
+            r_err(o, "ERR access control is not configured (aclfile option)");
+        }
+        return;
+    }
+    if (is(sub, "WHOAMI")) {
+        r_bulk_str(o, ss->user != NULL ? acl_user_name(ss->user) : "default");
+    } else if (is(sub, "USERS")) {
+        r_array(o, (long long)acl_nusers(l));
+        for (size_t i = 0; i < acl_nusers(l); i++) {
+            r_bulk_str(o, acl_user_name(acl_user_at(l, i)));
+        }
+    } else if (is(sub, "LIST")) {
+        r_array(o, (long long)acl_nusers(l));
+        for (size_t i = 0; i < acl_nusers(l); i++) {
+            char desc[8192];
+            size_t m = acl_describe(acl_user_at(l, i), desc, sizeof(desc));
+            r_bulk(o, desc, m < sizeof(desc) ? m : sizeof(desc) - 1);
+        }
+    } else if (is(sub, "GETUSER") && n == 3) {
+        const acl_user *u = acl_find(l, a[2].p, a[2].n);
+        if (u == NULL) {
+            r_null(o);
+        } else {
+            acl_getuser(u, o);
+        }
+    } else if (is(sub, "DRYRUN") && n >= 4) {
+        const acl_user *u = acl_find(l, a[2].p, a[2].n);
+        if (u == NULL) {
+            ob_printf(o, "-ERR User '%.*s' not found\r\n", (int)(a[2].n > 64 ? 64 : a[2].n), a[2].p);
+            return;
+        }
+        if (acl_cmd_find(ACL_RESP, a[3].p, a[3].n) < 0) {
+            ob_printf(o, "-ERR Command '%.*s' not found\r\n", (int)(a[3].n > 64 ? 64 : a[3].n), a[3].p);
+            return;
+        }
+        const char *why = acl_unrestricted(u) ? NULL : resp_denied(u, a + 3, n - 3);
+        if (why == NULL) {
+            r_ok(o);
+        } else if (why[0] == 'k') {
+            ob_printf(o, "+User %s has no permissions to access one of the keys\r\n", acl_user_name(u));
+        } else {
+            char name[64];
+            lower_name(&a[3], name, sizeof(name));
+            ob_printf(o, "+User %s has no permissions to run the '%s' command\r\n", acl_user_name(u), name);
+        }
+    } else if (is(sub, "LOAD") && n == 2) {
+        char err[512];
+        int rc = akvd_acl_reload(d, err, sizeof(err));
+        if (rc == 0) {
+            r_ok(o);
+        } else {
+            ob_printf(o, "-ERR %s\r\n", err);
+        }
+    } else if (is(sub, "SETUSER") || is(sub, "DELUSER") || is(sub, "SAVE")) {
+        r_err(o, "ERR users are defined in the ACL file only; edit it and run ACL LOAD");
+    } else {
+        ob_printf(o, "-ERR unknown subcommand or wrong number of arguments for '%.*s'\r\n",
+                  (int)(sub->n > 32 ? 32 : sub->n), sub->p);
+    }
 }

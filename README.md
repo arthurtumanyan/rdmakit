@@ -88,11 +88,11 @@ Statements about other systems reflect their public documentation at the time of
 | Protocols | memcached text and meta, RESP2, native binary ([PROTOCOL.md](arenakv/docs/PROTOCOL.md)) | text, meta, binary | RESP2, RESP3 | RESP2, RESP3, memcached text |
 | Expiry, CAS, conditional stores, increments | yes | yes | yes | yes |
 | Data types | strings | strings | strings, lists, hashes, sets, sorted sets, streams | as Valkey |
-| Authentication | shared credentials file | SASL, ASCII auth | ACL users | ACL users |
+| Authentication | ACL users with per-user commands, categories and key patterns (subset of the Valkey ACL file syntax) | SASL, ASCII auth | ACL users | ACL users |
 | Persistence | snapshots, append-only log (fsync always, everysec or no), warm restart | warm restart | RDB, AOF | snapshots |
 | Replication, cluster | no (client-side consistent hashing) | no (client-side hashing) | yes | replication, cluster mode |
 | Hash index | grows from a small size | grows | grows | grows |
-| Source size | about 8,600 lines (engine, server, protocols, persistence, client) | large | large | large |
+| Source size | about 10,200 lines (engine, server, protocols, persistence, access control, client) | large | large | large |
 | Production use | not recommended | widely deployed | widely deployed | deployed |
 
 ### rdmaduct and RDMA communication frameworks
@@ -233,13 +233,14 @@ and clang on x86-64 and arm64, runs the TCP suites and the sanitizers, compiles 
 | developers | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md), the architecture document of each project, [`CONTRIBUTING.md`](CONTRIBUTING.md) |
 | people checking performance claims | [`benchmarks/README.md`](benchmarks/README.md), [`benchmarks/METHODOLOGY.md`](benchmarks/METHODOLOGY.md) |
 | newcomers to RDMA | [`lab/README.md`](lab/README.md) |
-| maintainers | [`docs/ROADMAP.md`](docs/ROADMAP.md), [`SECURITY.md`](SECURITY.md) |
+| maintainers | [`docs/ROADMAP.md`](docs/ROADMAP.md), [`SECURITY.md`](SECURITY.md), [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md), [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) |
 
 ## Status and limitations
 
 - The software is experimental and meant for trusted networks. `rdmaduct` neither authenticates peers nor encrypts
-  traffic; `arenakvd` offers shared-secret authentication and TLS for its text protocols, but its native protocol is
-  never encrypted ([`SECURITY.md`](SECURITY.md)).
+  traffic; `arenakvd` offers users with per-user rights and TLS for its text protocols, but its native protocol is
+  not encrypted ([`SECURITY.md`](SECURITY.md), [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)). No external
+  security review has taken place.
 - No measurement on RDMA hardware exists yet; see [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## License

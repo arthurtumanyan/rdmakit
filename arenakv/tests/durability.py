@@ -169,6 +169,9 @@ def crash_case(name, workdir, fsync, rewrite=False):
     s = Server(workdir, opts)
     acked, history, killed_at, sample = write_until_killed(s, 4.0 if fsync == "everysec" else 1.5, rewrite)
     s2 = Server(workdir, opts)
+    if name == "always":
+        cfg = Resp(s2.port).call(b"CONFIG", b"GET", b"append*")
+        check("CONFIG GET reports the log", cfg == [b"appendonly", b"yes", b"appendfsync", b"always"], str(cfg))
     got = present(s2.port, acked)
     log = s2.log_since_start()
     s2.kill(signal.SIGTERM)

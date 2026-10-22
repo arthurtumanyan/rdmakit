@@ -59,6 +59,11 @@ typedef struct akvd_config {
      * before other commands. NULL disables authentication.
      */
     const char *auth_file;
+    /*
+     * Access control list (src/acl.h: a subset of the Valkey ACL file syntax) with users, passwords and
+     * per-user permissions; excludes auth_file. Reloaded by ACL LOAD. NULL disables access control.
+     */
+    const char *acl_file;
     /* Snapshot file; NULL disables persistence. Loaded at start when it exists. */
     const char *snapshot_path;
     unsigned save_interval_s; /* periodic snapshot when entries changed; 0 = only on request and exit */

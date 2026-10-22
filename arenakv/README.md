@@ -12,8 +12,9 @@ instructions, and evicts with a second chance.
   CAS), increments, touch, flush, multi-key reads.
 - Event-loop server: worker threads serve thousands of pipelined connections; native connections use rdmaduct's
   pollable descriptors.
-- Authentication for all protocols, TLS for the text protocols (optional OpenSSL build), configuration file, log
-  rotation, systemd unit and container image.
+- Access control for all protocols: users with passwords and per-user rights over commands, categories and key
+  patterns, in a subset of the Valkey ACL file syntax (`ACL LIST`, `ACL DRYRUN`, `ACL LOAD`); TLS for the text
+  protocols (optional OpenSSL build); configuration file, log rotation, systemd unit and container image.
 - Persistence: snapshots, an append-only log of every change with the fsync policies of Valkey (`always`,
   `everysec`, `no`) and background rewrites, and warm restart (the cache memory survives a restart of the process).
   Every file block is CRC-checked.
@@ -39,7 +40,7 @@ use an RDMA transport. `arenakv` is a cache built for that access pattern:
   model test against a reference map checks this under eviction.
 - **Transport-independent server.** The native protocol runs over [`rdmaduct`](../rdmaduct), so the same binary
   serves TCP and RDMA clients, next to standard memcached and Redis clients on the text protocols.
-- **Small enough to audit:** about 8,600 lines including the server, three protocols, persistence and the client.
+- **Small enough to audit:** about 10,200 lines including the server, three protocols, persistence, access control and the client.
 
 memcached, Valkey and Dragonfly are mature and remain the right default for general caching. The measurements
 below show where `arenakv` is in the same range, where it is better, and where it is worse.
@@ -56,7 +57,7 @@ below show where `arenakv` is in the same range, where it is better, and where i
 | Protocols | memcached text and meta, RESP2, native binary ([PROTOCOL.md](docs/PROTOCOL.md)) | text, meta, binary | RESP2, RESP3 | RESP2, RESP3, memcached text |
 | Expiry, CAS, conditional stores, increments | yes | yes | yes | yes |
 | Data types | strings | strings | strings, lists, hashes, sets, sorted sets, streams | as Valkey |
-| Authentication | shared credentials file | SASL, ASCII auth | ACL users | ACL users |
+| Authentication | ACL users with per-user commands, categories and key patterns (subset of the Valkey ACL file syntax) | SASL, ASCII auth | ACL users | ACL users |
 | Persistence | snapshots, append-only log (fsync always, everysec or no), warm restart | warm restart | RDB, AOF | snapshots |
 | Replication, cluster | no (client-side consistent hashing) | no (client-side hashing) | yes | replication, cluster mode |
 | Hash index | grows from a small size | grows | grows | grows |
@@ -234,7 +235,9 @@ and clang on x86-64 and arm64.
 |---|---|
 | `test_akv` | model check against a reference map (exact with ample memory, only the latest version under eviction) with a presized and a growing index; store modes, flags, CAS; expiry, touch, keep-ttl; increments; flush; enumeration; no-evict; eight-thread stress |
 | `test_primitives` | vector tag matching equals the scalar reference for all lane combinations; hash avalanche and bucket distribution |
-| `test_proto` | memcached and RESP commands with exact replies, also fed one byte at a time; framing errors; authentication; one million fuzzed inputs |
+| `test_proto` | memcached and RESP commands with exact replies, also fed one byte at a time; framing errors; authentication; per-user rights in all three protocols, the ACL commands and `ACL LOAD`; extreme expiry values; one million fuzzed inputs |
+| `test_acl` | SHA-256 against the FIPS 180-4 vectors, glob patterns, every ACL rule and the order of rules, error messages with line numbers, logins, credentials files of earlier versions |
+| `tests/fuzz` | libFuzzer harnesses for the RESP, memcached and native protocols, the snapshot and log loaders, the ACL parser and glob matching (`make fuzz`) |
 | `test_net` | pipelining, large values and backpressure on real sockets, 16 concurrent clients, connection limit, idle timeout, snapshots (round trip, expiry across downtime, corruption, truncation), TLS, native revision 2, consistent hashing |
 | `test_feed` | change feed replayed into a second engine gives the identical state (with eviction, expiry, flush, index-window drops); transaction ids; lock sets under concurrency; warm restart round trip, expiry across the downtime, changed configuration, missing detach, damaged header |
 | `test_aof` | append-only log round trip, rewrites while four threads write, automatic rewrites, torn and zero-filled tails, damage before the end, incomplete transactions, durable sequence numbers |
@@ -276,7 +279,8 @@ END
 | `--no-evict` | off | refuse stores when full instead of evicting |
 | `--threads N` | CPUs of the affinity mask | worker threads |
 | `--max-conns N`, `--idle-timeout SEC` | unlimited, never | connection limits |
-| `--auth-file FILE` | none | credentials (`user:password` or a password per line) |
+| `--auth-file FILE` | none | credentials (`user:password` or a password per line), every user with all rights |
+| `--aclfile FILE` | none | users with per-user rights; reloaded by `ACL LOAD` |
 | `--snapshot FILE`, `--save-interval SEC`, `--no-save-on-stop` | none, off, save at stop | snapshots |
 | `--appendonly DIR`, `--appendfsync always\|everysec\|no` | none, everysec | append-only log |
 | `--warm-restart FILE` | none | keep the cache memory (on tmpfs) across restarts |

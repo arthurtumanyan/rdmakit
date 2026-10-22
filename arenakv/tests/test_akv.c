@@ -520,6 +520,14 @@ static void test_ttl(void) {
     akv_store_opts add = {.mode = AKV_ADD};
     EXPECT(akv_store(s, "a", 1, "w", 1, &add, NULL) == 0, "add over an expired entry");
 
+    /* the largest times to live are clamped to AKV_TTL_MAX instead of overflowing into the past */
+    akv_store_opts huge = {.ttl_ms = INT64_MAX};
+    EXPECT(akv_store(s, "h", 1, "v", 1, &huge, NULL) == 0 &&
+               akv_get_meta(s, "h", 1, out, sizeof(out), &n, &m, AKV_TTL_KEEP) == 0 &&
+               m.ttl_ms > AKV_TTL_MAX - 1000 && m.ttl_ms <= AKV_TTL_MAX,
+           "huge ttl clamped (%lld)", (long long)m.ttl_ms);
+    EXPECT(akv_touch(s, "h", 1, INT64_MAX) == 0 && akv_exists(s, "h", 1), "huge touch clamped");
+
     t.ttl_ms = 60;
     akv_store(s, "b", 1, "v", 1, &t, NULL);
     EXPECT(akv_touch(s, "b", 1, 0) == 0, "persist");

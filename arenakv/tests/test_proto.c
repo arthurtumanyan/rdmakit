@@ -6,6 +6,9 @@
  * the replies must be identical to those of the whole buffer (incremental parsing). A random fuzz feeds
  * one million inputs mixing valid commands, mutations and noise; the modules must consume no more than
  * offered, never crash (run under the sanitizers as well) and keep the engine consistent.
+ * Access control: users of an ACL file with command, category and key restrictions in all three
+ * protocols, the ACL subcommands, and ACL LOAD (disabled users lose their connection, a damaged file is
+ * refused and the old rules stay in force).
  */
 #include <errno.h>
 #include <stdio.h>
@@ -13,6 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "akvproto.h"
 #include "srv.h"
 
 static int failures;
@@ -72,6 +76,8 @@ static void test_memcached(akvd *d) {
     exec_fn m = mc_execute;
     akv_flush(akvd_store(d));
     free(run(d, m, "set a 5 0 3\r\nabc\r\nget a\r\n", "STORED\r\nVALUE a 5 3\r\nabc\r\nEND\r\n", 1));
+    free(run(d, m, "set far 0 9223372036854775807 1\r\nx\r\nget far\r\n",
+             "STORED\r\nVALUE far 0 1\r\nx\r\nEND\r\n", 1)); /* absolute exptime at the limit */
     run2(d, m, "get a b\r\n", "VALUE a 5 3\r\nabc\r\nEND\r\n");
     run2(d, m, "add a 0 0 1\r\nx\r\n", "NOT_STORED\r\n");
     run2(d, m, "replace zz 0 0 1\r\nx\r\n", "NOT_STORED\r\n");
@@ -200,6 +206,13 @@ static void test_resp(akvd *d) {
     free(run(d, r, "SETNX n 1\r\nSETNX n 2\r\nGETDEL n\r\nGET n\r\n", ":1\r\n:0\r\n$1\r\n1\r\n$-1\r\n", 1));
     free(run(d, r, "GETEX k EX 50\r\nTTL k\r\n", "$3\r\nnew\r\n:50\r\n", 1));
     run2(d, r, "SET k v EX 0\r\n", "-ERR invalid expire time in 'set' command\r\n");
+    run2(d, r, "CONFIG GET append*\r\n",
+         "*4\r\n$10\r\nappendonly\r\n$2\r\nno\r\n$11\r\nappendfsync\r\n$8\r\neverysec\r\n");
+    /* extreme values: rejected or clamped, never overflowing (found by fuzz_native and code review) */
+    run2(d, r, "SET k v EX -9223372036854775808\r\n", "-ERR invalid expire time in 'set' command\r\n");
+    run2(d, r, "SET k v PXAT -9223372036854775808\r\n", "-ERR invalid expire time in 'set' command\r\n");
+    free(run(d, r, "SET k v\r\nPEXPIREAT k -9223372036854775808\r\nEXISTS k\r\n", "+OK\r\n:1\r\n:0\r\n", 1));
+    free(run(d, r, "SET k v\r\nPEXPIRE k 9223372036854775807\r\nEXISTS k\r\n", "+OK\r\n:1\r\n:1\r\n", 1));
     run2(d, r, "SET k v BOGUS\r\n", "-ERR syntax error\r\n");
     run2(d, r, "GET\r\n", "-ERR wrong number of arguments for 'GET' command\r\n");
     run2(d, r, "FOO bar\r\n", "-ERR unknown command 'FOO'\r\n");
@@ -299,7 +312,132 @@ static void fuzz(akvd *d, exec_fn fn, const char *const *seeds, unsigned nseeds,
     printf("%s fuzz: 500000 inputs, %u closed the connection\n", name, closes);
 }
 
+/* Feeds input on an existing session and compares the replies. */
+static void sess(akvd *d, exec_fn fn, struct session *ss, const char *in, const char *want) {
+    char *got = feed(d, fn, ss, in, strlen(in), 0);
+    EXPECT(strcmp(got, want) == 0, "request %.70s\n  got  [%s]\n  want [%s]", in, got, want);
+    free(got);
+}
+
+/* Returns 1 when the replies to in contain needle. */
+static int sess_has(akvd *d, exec_fn fn, struct session *ss, const char *in, const char *needle) {
+    char *got = feed(d, fn, ss, in, strlen(in), 0);
+    int ok = strstr(got, needle) != NULL;
+    EXPECT(ok, "request %.60s: [%s] lacks [%s]", in, got, needle);
+    free(got);
+    return ok;
+}
+
+/* Status of one native request (operation, key, value) on a session. */
+static int native(akvd *d, struct session *ss, uint8_t op, const char *key, const void *val, size_t vlen) {
+    uint8_t req[512];
+    uint8_t resp[4096];
+    size_t klen = key != NULL ? strlen(key) : 0;
+    struct akvp_req rq = {.op = op, .klen = (uint16_t)klen, .reqid = 7, .vlen = (uint32_t)vlen};
+    akvp_req_encode(req, &rq);
+    if (klen > 0) {
+        memcpy(req + AKVP_REQ_HDR, key, klen);
+    }
+    if (vlen > 0) {
+        memcpy(req + AKVP_REQ_HDR + klen, val, vlen);
+    }
+    size_t n = akvd_native_execute(d, ss, req, AKVP_REQ_HDR + klen + vlen, resp, sizeof(resp));
+    struct akvp_resp rs;
+    return n >= AKVP_RESP_HDR && akvp_resp_decode(resp, n, &rs) == 0 ? rs.status : -1;
+}
+
+static void write_text(const char *path, const char *text) {
+    FILE *f = fopen(path, "w");
+    EXPECT(f != NULL && fputs(text, f) >= 0, "write %s", path);
+    fclose(f);
+}
+
+static void test_acl_protocols(akvd *d, const char *path) {
+    exec_fn r = resp_execute;
+    exec_fn m = mc_execute;
+    akv_flush(akvd_store(d));
+    struct session app = {0};
+    akvd_session_init(d, &app);
+    sess(d, r, &app, "GET a\r\n", "-NOAUTH Authentication required.\r\n");
+    sess(d, r, &app, "AUTH app wrong\r\n",
+         "-WRONGPASS invalid username-password pair or user is disabled.\r\n");
+    sess(d, r, &app, "AUTH app apppw\r\n", "+OK\r\n");
+    sess(d, r, &app, "SET app:1 v\r\nGET app:1\r\n", "+OK\r\n$1\r\nv\r\n");
+    sess(d, r, &app, "SET other v\r\n", "-NOPERM No permissions to access a key\r\n");
+    sess(d, r, &app, "GET shared:1\r\n", "$-1\r\n");
+    sess(d, r, &app, "SET shared:1 v\r\n", "-NOPERM No permissions to access a key\r\n");
+    sess(d, r, &app, "INCR shared:n\r\n", "-NOPERM No permissions to access a key\r\n");
+    sess(d, r, &app, "MGET app:1 shared:1\r\n", "*2\r\n$1\r\nv\r\n$-1\r\n");
+    sess(d, r, &app, "MGET app:1 other\r\n", "-NOPERM No permissions to access a key\r\n");
+    sess(d, r, &app, "MSET app:2 x other y\r\n", "-NOPERM No permissions to access a key\r\n");
+    sess(d, r, &app, "FLUSHALL\r\n", "-NOPERM User app has no permissions to run the 'flushall' command\r\n");
+    sess(d, r, &app, "ACL LIST\r\n", "-NOPERM User app has no permissions to run the 'acl' command\r\n");
+    sess(d, r, &app, "PING\r\n", "+PONG\r\n");
+
+    struct session adm = {0};
+    akvd_session_init(d, &adm);
+    sess(d, r, &adm, "AUTH admin adminpw\r\nACL WHOAMI\r\n", "+OK\r\n$5\r\nadmin\r\n");
+    sess(d, r, &adm, "ACL USERS\r\n", "*4\r\n$7\r\ndefault\r\n$5\r\nadmin\r\n$3\r\napp\r\n$2\r\nro\r\n");
+    sess_has(d, r, &adm, "ACL LIST\r\n", "user app on #");
+    sess_has(d, r, &adm, "ACL LIST\r\n", " ~app:* %R~shared:* resetchannels +@all -@dangerous");
+    sess_has(d, r, &adm, "ACL CAT\r\n", "$9\r\ndangerous\r\n");
+    sess_has(d, r, &adm, "ACL CAT dangerous\r\n", "$8\r\nflushall\r\n");
+    sess(d, r, &adm, "ACL DRYRUN app GET app:1\r\n", "+OK\r\n");
+    sess(d, r, &adm, "ACL DRYRUN app FLUSHALL\r\n",
+         "+User app has no permissions to run the 'flushall' command\r\n");
+    sess(d, r, &adm, "ACL DRYRUN app SET other v\r\n",
+         "+User app has no permissions to access one of the keys\r\n");
+    sess_has(d, r, &adm, "ACL GETUSER ro\r\n", "$5\r\nflags\r\n*1\r\n$2\r\non\r\n");
+    sess(d, r, &adm, "ACL GETUSER nobody\r\n", "$-1\r\n");
+    sess(d, r, &adm, "ACL SETUSER x on\r\n",
+         "-ERR users are defined in the ACL file only; edit it and run ACL LOAD\r\n");
+
+    /* memcached: authentication data "<user> <password>"; read-only user */
+    struct session ro = {0};
+    akvd_session_init(d, &ro);
+    sess(d, m, &ro, "get app:1\r\n", "CLIENT_ERROR unauthenticated\r\n");
+    sess(d, m, &ro, "set x 0 0 7\r\nro ropw\r\n", "STORED\r\n");
+    sess(d, m, &ro, "get app:1 shared:1\r\n", "VALUE app:1 0 1\r\nv\r\nEND\r\n");
+    sess(d, m, &ro, "set app:1 0 0 1\r\nz\r\n", "CLIENT_ERROR permission denied\r\n");
+    sess(d, m, &ro, "delete app:1\r\nflush_all\r\n",
+         "CLIENT_ERROR permission denied\r\nCLIENT_ERROR permission denied\r\n");
+    sess(d, m, &ro, "mg app:1 v\r\n", "VA 1\r\nv\r\n");
+
+    /* native: login, a key outside the patterns, a denied category, MGET per key */
+    struct session nat = {0};
+    akvd_session_init(d, &nat);
+    EXPECT(native(d, &nat, AKVP_GET, "app:1", NULL, 0) == AKVP_NOAUTH, "native: login required");
+    EXPECT(native(d, &nat, AKVP_AUTH, NULL, "app:apppw", 9) == AKVP_OK, "native: login");
+    EXPECT(native(d, &nat, AKVP_PUT, "app:3", "v", 1) == AKVP_OK, "native: own key");
+    EXPECT(native(d, &nat, AKVP_PUT, "other", "v", 1) == AKVP_NOPERM, "native: foreign key");
+    EXPECT(native(d, &nat, AKVP_FLUSH, NULL, NULL, 0) == AKVP_NOPERM, "native: dangerous operation");
+    uint8_t keys[] = {5, 0, 'a', 'p', 'p', ':', '1', 5, 0, 'o', 't', 'h', 'e', 'r'};
+    EXPECT(native(d, &nat, AKVP_MGET, NULL, keys, sizeof(keys)) == AKVP_NOPERM,
+           "native: MGET checks every key");
+    EXPECT(native(d, &nat, AKVP_MGET, NULL, keys, 7) == AKVP_OK, "native: MGET of permitted keys");
+
+    /* ACL LOAD: a damaged file is refused; then "app" is disabled and its connections are closed */
+    write_text(path, "user admin on >adminpw allkeys +@all\nuser app on +@nosuch\n");
+    sess_has(d, r, &adm, "ACL LOAD\r\n", "-ERR ");
+    sess(d, r, &app, "GET app:1\r\n", "$1\r\nv\r\n");
+    write_text(path, "user default off\nuser admin on >adminpw allkeys allchannels +@all\nuser app off\n"
+                     "user ro on >ropw ~* -@all +@read +@write\n");
+    sess(d, r, &adm, "ACL LOAD\r\n", "+OK\r\n");
+    sess(d, r, &app, "GET app:1\r\n", "-ERR the user of this connection was removed or disabled\r\n");
+    EXPECT(app.close, "connection of a disabled user is closed");
+    EXPECT(native(d, &nat, AKVP_GET, "app:1", NULL, 0) == AKVP_NOAUTH && nat.close,
+           "native session closed too");
+    sess(d, m, &ro, "set app:1 0 0 1\r\nz\r\n", "STORED\r\n"); /* the new rules of ro apply at once */
+}
+
 int main(void) {
+    char acl_path[] = "/tmp/akv-test-acl-XXXXXX";
+    int afd = mkstemp(acl_path);
+    EXPECT(afd >= 0, "ACL file");
+    close(afd);
+    write_text(acl_path,
+               "user default off\nuser admin on >adminpw allkeys allchannels +@all\n"
+               "user app on >apppw ~app:* %R~shared:* +@all -@dangerous\nuser ro on >ropw ~* -@all +@read\n");
     char cred_path[] = "/tmp/akv-test-cred-XXXXXX";
     int fd = mkstemp(cred_path);
     const char creds[] = "# test credentials\nalice:secret\npw\n";
@@ -362,6 +500,15 @@ int main(void) {
         test_auth(d);
         akvd_stop(d);
     }
+    cfg.auth_file = NULL;
+    cfg.acl_file = acl_path;
+    d = akvd_start(&cfg, &err);
+    EXPECT(d != NULL, "server with an ACL file: %d", err);
+    if (d != NULL) {
+        test_acl_protocols(d, acl_path);
+        akvd_stop(d);
+    }
+    unlink(acl_path);
     unlink(cred_path);
     srv_thread_exit(); /* the protocol modules ran on this thread */
     resp_thread_exit();

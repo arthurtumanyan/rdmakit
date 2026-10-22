@@ -21,6 +21,10 @@ jobs:
         run: make format-check
       - name: Build and test without RDMA
         run: make test-tcp
+      - name: Hardening of the executables
+        run: >-
+          scripts/check_hardening.sh arenakv/build/*-tcp/arenakvd arenakv/build/*-tcp/akv_cli
+          kvpace/build/*-tcp/kvpace rdmaduct/build/*-tcp/hello_server
 
   sanitizers:
     runs-on: ubuntu-24.04
@@ -47,6 +51,34 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y build-essential
       - name: arenakv engine and server under ThreadSanitizer
         run: make -C arenakv RDMA=0 TSAN=1 test
+
+  static-analysis:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang cppcheck libibverbs-dev librdmacm-dev
+      - name: clang static analyzer and cppcheck, no findings allowed
+        run: make analyze
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Every libFuzzer harness for 60 seconds under AddressSanitizer and UndefinedBehaviorSanitizer
+        run: make fuzz FUZZ_TIME=60
+      - name: Keep the inputs of a failing harness
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings
+          path: |
+            arenakv/build/fuzz/*-crash-*
+            arenakv/build/fuzz/*-leak-*
+            arenakv/build/fuzz/*-timeout-*
+            rdmaduct/build/fuzz/*-crash-*
+            rdmaduct/build/fuzz/*-leak-*
+            rdmaduct/build/fuzz/*-timeout-*
 
   client-compatibility:
     runs-on: ubuntu-24.04

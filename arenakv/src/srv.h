@@ -15,6 +15,7 @@
 
 #include "akv.h"
 #include "akvd.h"
+#include "acl.h"
 #include "aof.h"
 
 /* Growable output buffer. Bytes [off, len) are pending. */
@@ -49,11 +50,14 @@ void ob_free(struct obuf *b);
 
 /* Per-connection protocol state. */
 struct session {
-    int authed;     /* authentication done or not required */
-    int close;      /* set by a protocol module: close after the pending output is written */
-    size_t swallow; /* memcached: bytes of an oversized data block still to be discarded */
-    char name[64];  /* RESP CLIENT SETNAME */
-    uint64_t id;    /* connection number (RESP CLIENT ID) */
+    int authed; /* authentication done or not required */
+    /* Logged-in user; NULL without access control (everything allowed). */
+    const struct acl_user *user;
+    uint64_t acl_gen; /* access control generation the user was resolved in */
+    int close;        /* set by a protocol module: close after the pending output is written */
+    size_t swallow;   /* memcached: bytes of an oversized data block still to be discarded */
+    char name[64];    /* RESP CLIENT SETNAME */
+    uint64_t id;      /* connection number (RESP CLIENT ID) */
 };
 
 /* Server statistics updated by all threads. */
@@ -76,14 +80,49 @@ struct srv_counters {
 
 struct srv_counters *akvd_counters(akvd *d);
 
-/* Returns 1 when authentication is required. */
+/* Returns 1 when access control is configured (an ACL file or a credentials file). */
+int akvd_acl_enabled(const akvd *d);
+
+/* Returns 1 when a new connection must authenticate (access control without a password-less default). */
 int akvd_auth_required(const akvd *d);
 
+/* Sets up the access state of a new session: logged in as the password-less default user, if any. */
+void akvd_session_init(akvd *d, struct session *ss);
+
 /*
- * Checks credentials in constant time per entry. user == NULL (or ulen == 0) selects the default user.
- * Returns 1 when they match an entry.
+ * Logs the session in. user == NULL (or ulen == 0) selects "default". Returns 1 on success; 0 for an
+ * unknown or disabled user or a wrong password (counted in auth_failures).
  */
-int akvd_auth_check(akvd *d, const char *user, size_t ulen, const char *pass, size_t plen);
+int akvd_login(akvd *d, struct session *ss, const char *user, size_t ulen, const char *pass, size_t plen);
+
+/*
+ * Applies an ACL reload to the session: re-resolves its user by name. Returns 0, or -1 when the user was
+ * removed or disabled (the session is then marked for closing). Costs one atomic load when nothing changed.
+ */
+static inline int akvd_session_refresh(akvd *d, struct session *ss);
+
+/* Current generation of the access control list (incremented by every reload). */
+uint64_t akvd_acl_gen(const akvd *d);
+
+/* Slow path of akvd_session_refresh(). */
+int akvd_session_reresolve(akvd *d, struct session *ss);
+
+static inline int akvd_session_refresh(akvd *d, struct session *ss) {
+    return ss->user == NULL || ss->acl_gen == akvd_acl_gen(d) ? 0 : akvd_session_reresolve(d, ss);
+}
+
+/* The current access control list (NULL without access control); valid until the server stops. */
+const acl *akvd_acl(akvd *d);
+
+/* Reloads the ACL file. Returns 0, -EINVAL (no ACL file configured) or -EBADMSG (message in err). */
+int akvd_acl_reload(akvd *d, char *err, size_t errlen);
+
+/*
+ * Executes one native request into out (capacity cap) for the session. Returns the response length, or 0
+ * when the request cannot be decoded (the connection is closed).
+ */
+size_t akvd_native_execute(akvd *d, struct session *ss, const uint8_t *msg, size_t len, uint8_t *out,
+                           size_t cap);
 
 /*
  * Reads key into a thread-local buffer that grows to the largest value read by the thread, applying
@@ -107,6 +146,9 @@ unsigned akvd_threads(const akvd *d);
 
 /* State of the append-only log. Returns 0, or -EINVAL when no log is configured. */
 int akvd_aof_info(akvd *d, aof_info *out);
+
+/* fsync policy of the append-only log as Valkey names it ("always", "everysec", "no"). */
+const char *akvd_appendfsync(const akvd *d);
 
 /* Outcome of the warm-restart attach at start. */
 void akvd_warm_info(akvd *d, akv_warm_info *out);

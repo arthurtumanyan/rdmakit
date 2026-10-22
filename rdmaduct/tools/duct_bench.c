@@ -114,16 +114,10 @@ static void *server_main(void *p) {
 
 /* ---- client ---------------------------------------------------------------------------------------- */
 
-static int run_client(const struct options *o, duct_ctx *ctx, FILE *out) {
-    duct_ep *ep = NULL;
-    int rc = duct_connect(ctx, o->addr, o->port, &ep);
-    if (rc != 0) {
-        fprintf(stderr, "connect: %s\n", duct_strerror(rc));
-        return 1;
-    }
-    uint8_t *buf = malloc(o->max_msg);
-    memset(buf, 0xa5, o->max_msg);
-    double *rtt = malloc(sizeof(double) * o->pingpong);
+/* Runs the measurements of every size over ep with the buffers buf (max_msg bytes) and rtt (pingpong
+ * entries). Returns the exit status. */
+static int measure(const struct options *o, duct_ctx *ctx, duct_ep *ep, uint8_t *buf, double *rtt,
+                   FILE *out) {
     struct duct_msg batch[16];
     fprintf(out,
             "{\"tool\": \"duct_bench\", \"transport\": \"%s\", \"wait\": \"%s\", \"pingpong_max\": %u, "
@@ -204,10 +198,29 @@ static int run_client(const struct options *o, duct_ctx *ctx, FILE *out) {
         fflush(out);
     }
     fprintf(out, "\n]}\n");
+    return 0;
+}
+
+static int run_client(const struct options *o, duct_ctx *ctx, FILE *out) {
+    duct_ep *ep = NULL;
+    int rc = duct_connect(ctx, o->addr, o->port, &ep);
+    if (rc != 0) {
+        fprintf(stderr, "connect: %s\n", duct_strerror(rc));
+        return 1;
+    }
+    uint8_t *buf = malloc(o->max_msg);
+    double *rtt = malloc(sizeof(double) * o->pingpong);
+    int status = 1;
+    if (buf == NULL || rtt == NULL) {
+        fprintf(stderr, "out of memory\n");
+    } else {
+        memset(buf, 0xa5, o->max_msg);
+        status = measure(o, ctx, ep, buf, rtt, out);
+    }
     free(buf);
     free(rtt);
     duct_ep_close(ep);
-    return 0;
+    return status;
 }
 
 int main(int argc, char **argv) {
@@ -293,6 +306,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     int rc;
+    char port[16]; /* the loopback listener's port; referenced by o until the end */
     if (strcmp(argv[1], "loopback") == 0) {
         struct server_arg a = {.o = &o, .ctx = ctx, .once = 1};
         rc = duct_listen(ctx, o.addr, "0", &a.listener);
@@ -300,7 +314,6 @@ int main(int argc, char **argv) {
             fprintf(stderr, "listen: %s\n", duct_strerror(rc));
             return 1;
         }
-        char port[16];
         snprintf(port, sizeof(port), "%d", duct_listener_port(a.listener));
         o.port = port;
         pthread_t th;

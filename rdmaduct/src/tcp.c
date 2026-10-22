@@ -1422,12 +1422,12 @@ int duct_tcp_listen(duct_ctx *ctx, const char *addr, const char *port, duct_list
     int fd = socket(res->ai_family, res->ai_socktype | SOCK_NONBLOCK, res->ai_protocol);
     int rc = 0;
     if (fd < 0) {
-        rc = -errno;
+        rc = errno != 0 ? -errno : -EIO;
     } else {
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
         if (bind(fd, res->ai_addr, res->ai_addrlen) != 0 || listen(fd, 128) != 0) {
-            rc = -errno;
+            rc = errno != 0 ? -errno : -EIO;
             close(fd);
         }
     }
@@ -1435,9 +1435,13 @@ int duct_tcp_listen(duct_ctx *ctx, const char *addr, const char *port, duct_list
     if (rc != 0) {
         return rc;
     }
-    struct sockaddr_in sa;
+    struct sockaddr_in sa = {0}; /* initialized: the analyzer does not model getsockname() */
     socklen_t sl = sizeof(sa);
-    getsockname(fd, (struct sockaddr *)&sa, &sl);
+    if (getsockname(fd, (struct sockaddr *)&sa, &sl) != 0) {
+        rc = -errno;
+        close(fd);
+        return rc;
+    }
     struct tcp_listener *l = calloc(1, sizeof(*l));
     if (l == NULL) {
         close(fd);

@@ -126,7 +126,8 @@ that names the option and the accepted range.
 | `--threads N` | CPUs of the affinity mask | 1 to 4096 worker threads |
 | `--max-conns N` | 0 (unlimited) | connections above the limit are closed after accepting |
 | `--idle-timeout SECONDS` | 0 (never) | close connections without traffic |
-| `--auth-file FILE` | | credentials; every protocol then requires authentication ([OPERATIONS.md](OPERATIONS.md#authentication)) |
+| `--auth-file FILE` | | credentials (`user:password` per line); every protocol then requires authentication and every user has all rights ([OPERATIONS.md](OPERATIONS.md#authentication-and-access-control)) |
+| `--aclfile FILE` | | users with passwords and per-user rights in a subset of the Valkey ACL file syntax; reloaded by `ACL LOAD`; excludes `--auth-file` |
 | `--snapshot FILE` | | load at start, write on `SAVE`/`BGSAVE`, periodically and at stop; the directory must be writable |
 | `--save-interval SECONDS` | 0 (off) | periodic snapshot when data changed |
 | `--no-save-on-stop` | | skip the snapshot at stop |
@@ -254,12 +255,13 @@ Command names are case-insensitive. Values and keys are byte strings; the engine
 | `DBSIZE` | number of entries | includes expired entries not yet reclaimed |
 | `FLUSHALL`, `FLUSHDB` | `OK` | removes all entries; `ASYNC`/`SYNC` arguments are ignored |
 | `PING [message]`, `ECHO message` | `PONG` or the message | |
-| `AUTH [user] password` | `OK` or `WRONGPASS` | error when no credentials are configured |
+| `AUTH [user] password` | `OK` or `WRONGPASS` | error when no ACL or credentials file is configured |
 | `HELLO [2] [AUTH user password] [SETNAME name]` | server information | protocol 3 answers `NOPROTO` |
 | `SELECT 0` | `OK` | only database 0 exists |
 | `CLIENT SETNAME name`, `CLIENT GETNAME`, `CLIENT ID`, `CLIENT SETINFO ...` | | |
 | `COMMAND`, `COMMAND COUNT` | empty array, 0 | for client compatibility |
-| `CONFIG GET pattern` | `maxmemory`, `maxmemory-policy`, `save`, `appendonly`, `databases`, `io-threads` | `CONFIG SET` is refused: use the server options |
+| `CONFIG GET pattern` | `maxmemory`, `maxmemory-policy`, `save`, `appendonly` (`yes` with `--appendonly`), `appendfsync`, `databases`, `io-threads` | `CONFIG SET` is refused: use the server options |
+| `ACL WHOAMI\|USERS\|LIST\|CAT [category]\|GETUSER name\|DRYRUN user command [arg ...]\|LOAD` | see [OPERATIONS.md](OPERATIONS.md#inspecting-and-reloading) | `SETUSER`, `DELUSER`, `SAVE` are refused: the ACL file is the only source of users |
 | `INFO [section]` | all sections | fields in [OPERATIONS.md](OPERATIONS.md#monitoring) |
 | `SAVE` | `OK` | writes the snapshot synchronously; error without `--snapshot` |
 | `BGSAVE` | `Background saving started` | error while a background save runs |

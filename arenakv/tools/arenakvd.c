@@ -30,6 +30,7 @@
  *   --max-conns N               connection limit (default: unlimited)
  *   --idle-timeout SECONDS      close idle connections (default: never)
  *   --auth-file FILE            credentials, "user:password" or a password per line
+ *   --aclfile FILE              users with passwords and permissions (Valkey ACL file syntax subset)
  *   --snapshot FILE             snapshot file, loaded at start, written on SAVE/BGSAVE and at exit
  *   --save-interval SECONDS     periodic snapshot when data changed (default: off)
  *   --no-save-on-stop           do not write the snapshot at exit
@@ -101,6 +102,8 @@ static const char usage[] =
     "  --max-conns N               connection limit (default: unlimited)\n"
     "  --idle-timeout SECONDS      close idle connections (default: never)\n"
     "  --auth-file FILE            credentials, \"user:password\" or a password per line\n"
+    "  --aclfile FILE              users with passwords and permissions (subset of the Valkey ACL file\n"
+    "                              syntax); reloaded by ACL LOAD; excludes --auth-file\n"
     "  --snapshot FILE             snapshot file, loaded at start, written on SAVE/BGSAVE and at exit\n"
     "  --save-interval SECONDS     periodic snapshot when data changed (default: off)\n"
     "  --no-save-on-stop           do not write the snapshot at exit\n"
@@ -244,6 +247,7 @@ static const struct option lo[] = {
     {"aof-rewrite-min-size", required_argument, NULL, 1016},
     {"aof-load-damaged", no_argument, NULL, 1017},
     {"warm-restart", required_argument, NULL, 1018},
+    {"aclfile", required_argument, NULL, 1019},
     {"help", no_argument, NULL, 'h'},
     {"version", no_argument, NULL, 'V'},
     {NULL, 0, NULL, 0},
@@ -362,11 +366,13 @@ int main(int argc, char **argv) {
     args[nargs++] = argv[0];
     for (int i = 1; i + 1 < argc; i++) {
         if (strcmp(argv[i], "--config") == 0 && read_config(argv[i + 1], &args, &nargs) != 0) {
+            free(args); /* the option strings read so far are released at exit */
             return 2;
         }
     }
     char **all = realloc(args, (size_t)(nargs + argc) * sizeof(char *));
     if (all == NULL) {
+        free(args);
         return 1;
     }
     all_args = all;
@@ -584,6 +590,9 @@ int main(int argc, char **argv) {
         case 1018:
             cfg.store.shm_path = optarg;
             break;
+        case 1019:
+            cfg.acl_file = optarg;
+            break;
         default:
             fprintf(stderr, "Try 'arenakvd --help' for the list of options.\n");
             return 2;
@@ -608,6 +617,10 @@ int main(int argc, char **argv) {
     if ((cfg.tls_memcached_port != NULL || cfg.tls_resp_port != NULL) &&
         (cfg.tls_cert == NULL || cfg.tls_key == NULL)) {
         fprintf(stderr, "arenakvd: TLS listeners need --tls-cert and --tls-key\n");
+        return 2;
+    }
+    if (cfg.auth_file != NULL && cfg.acl_file != NULL) {
+        fprintf(stderr, "arenakvd: --auth-file and --aclfile exclude each other\n");
         return 2;
     }
     const char *files[3] = {cfg.snapshot_path, cfg.store.shm_path, cfg.aof_dir};

@@ -144,12 +144,11 @@ void pace_report_json(FILE *f, const pace_config *cfg, const pace_result *res, c
     gmtime_r(&now, &tm);
     strftime(when, sizeof(when), "%Y-%m-%dT%H:%M:%SZ", &tm);
     const pace_workload *w = &cfg->wl;
-    double read_ratio = w->weight[PACE_OP_GET] / (w->cum[PACE_OP_COUNT - 1] > 0 ? 1.0 : 1.0);
     double sumw = 0.0;
     for (unsigned i = 0; i < PACE_OP_COUNT; i++) {
         sumw += w->weight[i];
     }
-    read_ratio = sumw > 0 ? w->weight[PACE_OP_GET] / sumw : 0.0;
+    double read_ratio = sumw > 0 ? w->weight[PACE_OP_GET] / sumw : 0.0;
 
     fprintf(f, "{\n  \"schema\": 2,\n  \"tool\": {\"name\": \"kvpace\", \"commit\": ");
     pace_json_str(f, PACE_GIT);

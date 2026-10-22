@@ -1187,10 +1187,10 @@ static int rdma_listener_accept(duct_listener *base, int timeout_ms, duct_ep **o
     struct rdma_listener *l = (struct rdma_listener *)base;
     duct_ctx *ctx = base->ctx;
     int64_t deadline = duct_deadline(timeout_ms);
-    struct rdma_cm_event *ev;
+    struct rdma_cm_event *ev = NULL;
     int rc = cm_wait(l->ec, RDMA_CM_EVENT_CONNECT_REQUEST, deadline, &ev);
-    if (rc != 0) {
-        return rc;
+    if (rc != 0 || ev == NULL) {
+        return rc != 0 ? rc : DUCT_EPROTO; /* cm_wait sets ev whenever it returns 0 */
     }
     struct rdma_cm_id *id = ev->id;
     struct duct_hello theirs;

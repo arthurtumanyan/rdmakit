@@ -129,13 +129,6 @@ struct worker {
     atomic_int has_parked;
 };
 
-struct cred {
-    char *user;
-    size_t ulen;
-    char *pass;
-    size_t plen;
-};
-
 struct akvd {
     akvd_config cfg;
     akv *store;
@@ -155,8 +148,12 @@ struct akvd {
     unsigned next_worker;
     struct srv_counters counters;
     atomic_ullong next_id;
-    struct cred *creds;
-    size_t ncreds;
+    /* access control: the current list, older lists (still referenced by sessions), the generation */
+    _Atomic(acl *) acl;
+    acl **retired;
+    size_t nretired;
+    atomic_ullong acl_gen;
+    pthread_mutex_t acl_lock;
     pthread_mutex_t log_lock;
     FILE *log;
     struct timespec started;
@@ -270,32 +267,86 @@ struct srv_counters *akvd_counters(akvd *d) {
     return &d->counters;
 }
 
+int akvd_acl_enabled(const akvd *d) {
+    return atomic_load(&((akvd *)d)->acl) != NULL;
+}
+
 int akvd_auth_required(const akvd *d) {
-    return d->ncreds > 0;
+    acl *a = atomic_load(&((akvd *)d)->acl);
+    return a != NULL && acl_default_login(a) == NULL;
 }
 
-/* Compares two byte strings in time that depends only on their lengths. */
-static int ct_equal(const char *a, size_t an, const char *b, size_t bn) {
-    unsigned diff = an != bn;
-    size_t n = an < bn ? an : bn;
-    for (size_t i = 0; i < n; i++) {
-        diff |= (unsigned)(unsigned char)(a[i] ^ b[i]);
-    }
-    return diff == 0;
+uint64_t akvd_acl_gen(const akvd *d) {
+    return atomic_load_explicit(&((akvd *)d)->acl_gen, memory_order_acquire);
 }
 
-int akvd_auth_check(akvd *d, const char *user, size_t ulen, const char *pass, size_t plen) {
-    if (user == NULL || ulen == 0) {
-        user = "default";
-        ulen = 7;
+const acl *akvd_acl(akvd *d) {
+    return atomic_load(&d->acl);
+}
+
+void akvd_session_init(akvd *d, struct session *ss) {
+    acl *a = atomic_load(&d->acl);
+    ss->acl_gen = akvd_acl_gen(d);
+    ss->user = a != NULL ? acl_default_login(a) : NULL;
+    ss->authed = a == NULL || ss->user != NULL;
+}
+
+int akvd_login(akvd *d, struct session *ss, const char *user, size_t ulen, const char *pass, size_t plen) {
+    uint64_t gen = akvd_acl_gen(d);
+    acl *a = atomic_load(&d->acl);
+    const acl_user *u = a != NULL ? acl_login(a, user, ulen, pass, plen) : NULL;
+    if (u == NULL) {
+        SRV_COUNT(d, auth_failures, 1);
+        return 0;
     }
-    int ok = 0;
-    for (size_t i = 0; i < d->ncreds; i++) {
-        int u = ct_equal(d->creds[i].user, d->creds[i].ulen, user, ulen);
-        int p = ct_equal(d->creds[i].pass, d->creds[i].plen, pass, plen);
-        ok |= u & p;
+    ss->user = u;
+    ss->acl_gen = gen;
+    ss->authed = 1;
+    return 1;
+}
+
+int akvd_session_reresolve(akvd *d, struct session *ss) {
+    uint64_t gen = akvd_acl_gen(d);
+    acl *a = atomic_load(&d->acl);
+    const char *name = acl_user_name(ss->user);
+    const acl_user *u = acl_find(a, name, strlen(name));
+    ss->acl_gen = gen;
+    if (u == NULL || !acl_user_enabled(u)) {
+        akvd_log(d, AKVD_LOG_INFO, "closing connection %llu: user %s was removed or disabled",
+                 (unsigned long long)ss->id, name);
+        ss->user = NULL;
+        ss->authed = 0;
+        ss->close = 1;
+        return -1;
     }
-    return ok;
+    ss->user = u;
+    return 0;
+}
+
+int akvd_acl_reload(akvd *d, char *err, size_t errlen) {
+    if (d->cfg.acl_file == NULL) {
+        snprintf(err, errlen, "no ACL file is configured (aclfile option)");
+        return -EINVAL;
+    }
+    acl *n = acl_load(d->cfg.acl_file, 0, err, errlen);
+    if (n == NULL) {
+        return -EBADMSG;
+    }
+    pthread_mutex_lock(&d->acl_lock);
+    acl **r = realloc(d->retired, (d->nretired + 1) * sizeof(*r));
+    if (r == NULL) {
+        pthread_mutex_unlock(&d->acl_lock);
+        acl_free(n);
+        snprintf(err, errlen, "out of memory");
+        return -ENOMEM;
+    }
+    d->retired = r;
+    d->retired[d->nretired++] = atomic_load(&d->acl);
+    atomic_store(&d->acl, n);
+    atomic_fetch_add_explicit(&d->acl_gen, 1, memory_order_release);
+    pthread_mutex_unlock(&d->acl_lock);
+    akvd_log(d, AKVD_LOG_INFO, "access control list reloaded: %zu users", acl_nusers(n));
+    return 0;
 }
 
 int akvd_no_evict(const akvd *d) {
@@ -322,6 +373,11 @@ int akvd_aof_info(akvd *d, aof_info *out) {
     }
     aof_info_get(d->aof, out);
     return 0;
+}
+
+const char *akvd_appendfsync(const akvd *d) {
+    static const char *const names[] = {"no", "everysec", "always"};
+    return d->cfg.aof_fsync <= AOF_FSYNC_ALWAYS ? names[d->cfg.aof_fsync] : "everysec";
 }
 
 void akvd_warm_info(akvd *d, akv_warm_info *out) {
@@ -433,50 +489,6 @@ void akvd_reopen_log(akvd *d) {
         d->log = f;
     }
     pthread_mutex_unlock(&d->log_lock);
-}
-
-/* ---- credentials -------------------------------------------------------------------------------------- */
-
-static int load_creds(akvd *d, const char *path) {
-    FILE *f = fopen(path, "r");
-    if (f == NULL) {
-        return -errno;
-    }
-    char line[1024];
-    int rc = 0;
-    while (fgets(line, sizeof(line), f) != NULL) {
-        size_t n = strcspn(line, "\r\n");
-        line[n] = '\0';
-        if (n == 0 || line[0] == '#') {
-            continue;
-        }
-        char *colon = strchr(line, ':');
-        const char *user = "default";
-        const char *pass = line;
-        if (colon != NULL) {
-            *colon = '\0';
-            user = line;
-            pass = colon + 1;
-        }
-        struct cred *c = realloc(d->creds, (d->ncreds + 1) * sizeof(*c));
-        if (c == NULL) {
-            rc = -ENOMEM;
-            break;
-        }
-        d->creds = c;
-        c[d->ncreds] = (struct cred){
-            .user = strdup(user), .ulen = strlen(user), .pass = strdup(pass), .plen = strlen(pass)};
-        if (c[d->ncreds].user == NULL || c[d->ncreds].pass == NULL) {
-            rc = -ENOMEM;
-            break;
-        }
-        d->ncreds++;
-    }
-    fclose(f);
-    if (rc == 0 && d->ncreds == 0) {
-        rc = -EINVAL; /* an empty credentials file would silently disable authentication */
-    }
-    return rc;
 }
 
 /* ---- persistence -------------------------------------------------------------------------------------- */
@@ -623,10 +635,10 @@ static void conn_free(struct conn *c) {
         ob_free(&c->in);
         ob_free(&c->out);
     }
-    if (c->prev != NULL) {
-        c->prev->next = c->next;
-    } else if (w->conns == c) {
+    if (w->conns == c) {
         w->conns = c->next;
+    } else if (c->prev != NULL) {
+        c->prev->next = c->next;
     }
     if (c->next != NULL) {
         c->next->prev = c->prev;
@@ -658,9 +670,43 @@ static enum akv_mode store_mode(uint8_t op) {
     }
 }
 
-/* Executes one native request into out (capacity cap). Returns the response length, or 0 to close. */
-static size_t native_handle(akvd *d, struct conn *c, const uint8_t *msg, size_t len, uint8_t *out,
-                            size_t cap) {
+/* Command-table ids of the native operations (index: operation code), filled on first use. */
+static int native_ids[AKVP_NOOP + 1];
+static pthread_once_t native_ids_once = PTHREAD_ONCE_INIT;
+
+static void native_ids_init(void) {
+    static const char *const names[AKVP_NOOP + 1] = {
+        [AKVP_GET] = "GET",       [AKVP_PUT] = "PUT",         [AKVP_DEL] = "DEL",
+        [AKVP_STATS] = "STATS",   [AKVP_ADD] = "ADD",         [AKVP_REPLACE] = "REPLACE",
+        [AKVP_APPEND] = "APPEND", [AKVP_PREPEND] = "PREPEND", [AKVP_CAS] = "CAS",
+        [AKVP_INCR] = "INCR",     [AKVP_INCRS] = "INCRS",     [AKVP_TOUCH] = "TOUCH",
+        [AKVP_FLUSH] = "FLUSH",   [AKVP_HAS] = "HAS",         [AKVP_GETM] = "GETM",
+        [AKVP_MGET] = "MGET",     [AKVP_AUTH] = "AUTH",       [AKVP_NOOP] = "NOOP",
+    };
+    for (unsigned i = 0; i <= AKVP_NOOP; i++) {
+        native_ids[i] = names[i] != NULL ? acl_cmd_find(ACL_NATIVE, names[i], strlen(names[i])) : -1;
+    }
+}
+
+/* 1 when the session's user may run native operation op on key (klen 0: no key). */
+static int native_permitted(const struct session *ss, uint8_t op, const uint8_t *key, size_t klen) {
+    if (ss->user == NULL || acl_unrestricted(ss->user)) {
+        return 1;
+    }
+    pthread_once(&native_ids_once, native_ids_init);
+    int id = op <= AKVP_NOOP ? native_ids[op] : -1;
+    if (id < 0) {
+        return 1; /* unknown operation: answered AKVP_BADREQ */
+    }
+    if (!acl_cmd_allowed(ss->user, (unsigned)id)) {
+        return 0;
+    }
+    const acl_cmd *k = acl_cmd_at((unsigned)id);
+    return klen == 0 || k->first == 0 || acl_key_allowed(ss->user, key, klen, k->access);
+}
+
+size_t akvd_native_execute(akvd *d, struct session *ss, const uint8_t *msg, size_t len, uint8_t *out,
+                           size_t cap) {
     struct akvp_req rq;
     if (akvp_req_decode(msg, len, &rq) != 0) {
         return 0;
@@ -683,8 +729,12 @@ static size_t native_handle(akvd *d, struct conn *c, const uint8_t *msg, size_t 
 
     if (!valid) {
         status = AKVP_BADREQ;
-    } else if (!c->ss.authed && rq.op != AKVP_AUTH && rq.op != AKVP_NOOP) {
+    } else if (!ss->authed && rq.op != AKVP_AUTH && rq.op != AKVP_NOOP) {
         status = AKVP_NOAUTH;
+    } else if (akvd_session_refresh(d, ss) != 0) {
+        status = AKVP_NOAUTH;
+    } else if (rq.op != AKVP_MGET && !native_permitted(ss, rq.op, key, rq.klen)) {
+        status = AKVP_NOPERM;
     } else {
         switch (rq.op) {
         case AKVP_GET:
@@ -832,6 +882,10 @@ static size_t native_handle(akvd *d, struct conn *c, const uint8_t *msg, size_t 
                     status = AKVP_TOOBIG;
                     break;
                 }
+                if (!native_permitted(ss, AKVP_MGET, val + off, klen)) {
+                    status = AKVP_NOPERM;
+                    break;
+                }
                 size_t vlen = 0;
                 SRV_COUNT(d, cmd_get, 1);
                 int rc = akv_get(s, val + off, klen, pay + used + 8, room - used - 8, &vlen);
@@ -855,18 +909,15 @@ static size_t native_handle(akvd *d, struct conn *c, const uint8_t *msg, size_t 
                 status = AKVP_BADREQ;
                 break;
             }
-            if (!akvd_auth_required(d)) {
+            if (!akvd_acl_enabled(d)) {
                 break; /* nothing to check: accepted */
             }
             const char *cv = (const char *)val;
             const char *colon = memchr(cv, ':', rq.vlen);
-            int ok = colon != NULL ? akvd_auth_check(d, cv, (size_t)(colon - cv), colon + 1,
-                                                     rq.vlen - (size_t)(colon - cv) - 1)
-                                   : akvd_auth_check(d, NULL, 0, cv, rq.vlen);
-            if (ok) {
-                c->ss.authed = 1;
-            } else {
-                SRV_COUNT(d, auth_failures, 1);
+            int ok = colon != NULL ? akvd_login(d, ss, cv, (size_t)(colon - cv), colon + 1,
+                                                rq.vlen - (size_t)(colon - cv) - 1)
+                                   : akvd_login(d, ss, NULL, 0, cv, rq.vlen);
+            if (!ok) {
                 status = AKVP_NOAUTH;
             }
             break;
@@ -1110,7 +1161,10 @@ static int native_serve(struct worker *w, struct conn *c) {
                 }
                 for (unsigned j = 0; j < k; j++) {
                     uint8_t *out = w->resp + used;
-                    size_t n = native_handle(d, c, rx[j].data, rx[j].len, out, cap);
+                    size_t n = akvd_native_execute(d, &c->ss, rx[j].data, rx[j].len, out, cap);
+                    if (c->ss.close) {
+                        n = 0; /* the user was removed or disabled by an ACL reload */
+                    }
                     duct_rx_release(c->ep, &rx[j]);
                     if (n == 0) {
                         conn_free(c);
@@ -1499,6 +1553,11 @@ static void *worker_main(void *arg) {
     w->nparked = 0;
     while (w->conns != NULL) {
         struct conn *c = w->conns;
+        w->conns = c->next; /* unlinked here, so conn_free() has no list to update */
+        if (c->next != NULL) {
+            c->next->prev = NULL;
+        }
+        c->prev = c->next = NULL;
         if (c->kind != CK_NATIVE) {
             text_write(c); /* best effort: deliver replies already produced */
         }
@@ -1515,7 +1574,7 @@ static void hand_over(akvd *d, struct conn *c) {
     unsigned cur = __atomic_add_fetch(&d->counters.curr_connections, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&d->counters.total_connections, 1, __ATOMIC_RELAXED);
     c->ss.id = atomic_fetch_add(&d->next_id, 1) + 1;
-    c->ss.authed = !akvd_auth_required(d);
+    akvd_session_init(d, &c->ss);
     if (d->cfg.max_conns != 0 && cur > d->cfg.max_conns) {
         __atomic_fetch_add(&d->counters.rejected_connections, 1, __ATOMIC_RELAXED);
         __atomic_fetch_sub(&d->counters.curr_connections, 1, __ATOMIC_RELAXED);
@@ -1651,12 +1710,12 @@ static int tcp_listen(const char *addr, const char *port, int *bound) {
     int fd = socket(res->ai_family, res->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC, res->ai_protocol);
     int rc = 0;
     if (fd < 0) {
-        rc = -errno;
+        rc = errno != 0 ? -errno : -EIO;
     } else {
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
         if (bind(fd, res->ai_addr, res->ai_addrlen) != 0 || listen(fd, 1024) != 0) {
-            rc = -errno;
+            rc = errno != 0 ? -errno : -EIO;
             close(fd);
         }
     }
@@ -1664,9 +1723,13 @@ static int tcp_listen(const char *addr, const char *port, int *bound) {
     if (rc != 0) {
         return rc;
     }
-    struct sockaddr_in sa;
+    struct sockaddr_in sa = {0}; /* initialized: the analyzer does not model getsockname() */
     socklen_t sl = sizeof(sa);
-    getsockname(fd, (struct sockaddr *)&sa, &sl);
+    if (getsockname(fd, (struct sockaddr *)&sa, &sl) != 0) {
+        rc = -errno;
+        close(fd);
+        return rc;
+    }
     *bound = ntohs(sa.sin_port);
     return fd;
 }
@@ -1750,11 +1813,12 @@ static void free_all(akvd *d) {
     } else {
         akv_destroy(d->store);
     }
-    for (size_t i = 0; i < d->ncreds; i++) {
-        free(d->creds[i].user);
-        free(d->creds[i].pass);
+    acl_free(atomic_load(&d->acl));
+    for (size_t i = 0; i < d->nretired; i++) {
+        acl_free(d->retired[i]);
     }
-    free(d->creds);
+    free(d->retired);
+    pthread_mutex_destroy(&d->acl_lock);
 #ifdef AKV_HAVE_TLS
     if (d->tls != NULL) {
         SSL_CTX_free(d->tls);
@@ -1784,6 +1848,7 @@ akvd *akvd_start(const akvd_config *cfg, int *err) {
     d->cfg = *cfg;
     d->mc_fd = d->resp_fd = d->tls_mc_fd = d->tls_resp_fd = d->stop_fd = -1;
     pthread_mutex_init(&d->log_lock, NULL);
+    pthread_mutex_init(&d->acl_lock, NULL);
     pthread_mutex_init(&d->save_lock, NULL);
     pthread_mutex_init(&d->saver_lock, NULL);
     pthread_cond_init(&d->saver_cond, NULL);
@@ -1827,8 +1892,21 @@ akvd *akvd_start(const akvd_config *cfg, int *err) {
         }
     }
 #endif
-    if (d->cfg.auth_file != NULL && (*err = load_creds(d, d->cfg.auth_file)) != 0) {
-        goto fail;
+    if (d->cfg.auth_file != NULL || d->cfg.acl_file != NULL) {
+        char msg[512];
+        if (d->cfg.auth_file != NULL && d->cfg.acl_file != NULL) {
+            akvd_log(d, AKVD_LOG_ERROR, "the credentials file and the ACL file exclude each other");
+            *err = -EINVAL;
+            goto fail;
+        }
+        acl *a = d->cfg.acl_file != NULL ? acl_load(d->cfg.acl_file, 0, msg, sizeof(msg))
+                                         : acl_load(d->cfg.auth_file, 1, msg, sizeof(msg));
+        if (a == NULL) {
+            akvd_log(d, AKVD_LOG_ERROR, "access control list: %s", msg);
+            *err = -EINVAL;
+            goto fail;
+        }
+        atomic_store(&d->acl, a);
     }
     d->cfg.store.on_change = on_change;
     d->cfg.store.on_change_arg = d;

@@ -1,0 +1,2 @@
+user app on >pw ~app:* %R~shared:* &news.* +@all -@dangerous
+user r on -@all +@read ~*

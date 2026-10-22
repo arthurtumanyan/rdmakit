@@ -85,6 +85,7 @@ enum akvp_status {
     AKVP_NOMEM = 6,  /* no space without eviction (server started with eviction disabled) */
     AKVP_NOAUTH = 7, /* authentication required or failed */
     AKVP_NOTNUM = 8, /* INCR of a non-numeric value, signed overflow */
+    AKVP_NOPERM = 9, /* the user may not run the operation or access the key (access control list) */
 };
 
 /*

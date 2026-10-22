@@ -26,8 +26,25 @@ ifeq ($(TLS),1)
 CFLAGS += -DAKV_HAVE_TLS
 LDLIBS += -lssl -lcrypto
 endif
+# Hardening (HARDEN=0 disables): fortified libc calls (not with the sanitizers, whose runtimes replace
+# them), stack protector, stack clash protection, control-flow protection (x86-64: CET; aarch64: PAC and
+# BTI), position-independent executables, read-only relocations resolved at start, non-executable stack.
+HARDEN ?= 1
+ifeq ($(HARDEN),1)
+CFLAGS += -fstack-protector-strong -fstack-clash-protection -fPIE
+ifeq ($(ARCH),x86_64)
+CFLAGS += -fcf-protection
+endif
+ifeq ($(ARCH),aarch64)
+CFLAGS += -mbranch-protection=standard
+endif
+ifeq ($(SAN)$(TSAN),)
+CFLAGS += -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3
+endif
+LDFLAGS += -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
+endif
 ifdef SAN
-CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
+CFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
 LDFLAGS += -fsanitize=address,undefined
 endif
 ifdef TSAN
@@ -35,7 +52,7 @@ CFLAGS += -fsanitize=thread -fno-omit-frame-pointer
 LDFLAGS += -fsanitize=thread
 endif
 
-LIB_SRC := src/akv.c src/server.c src/client.c src/proto_mc.c src/proto_resp.c src/snapshot.c src/aof.c
+LIB_SRC := src/akv.c src/server.c src/client.c src/proto_mc.c src/proto_resp.c src/snapshot.c src/aof.c src/acl.c src/sha256.c
 LIB_OBJ := $(patsubst src/%.c,$(OUT)/%.o,$(LIB_SRC))
 LIB := $(OUT)/libarenakv.a
 TESTS := $(patsubst tests/%.c,$(OUT)/%,$(wildcard tests/test_*.c))
@@ -90,7 +107,7 @@ install: $(OUT)/arenakvd $(OUT)/akv_bench $(OUT)/akv_cli
 	install -D -m 755 $(OUT)/akv_bench $(DESTDIR)$(PREFIX)/bin/akv_bench
 
 format:
-	clang-format -i src/*.c src/*.h include/*.h tools/*.c tests/*.c
+	clang-format -i src/*.c src/*.h include/*.h tools/*.c tests/*.c tests/fuzz/*.c
 
 clean:
 	rm -rf build
@@ -99,6 +116,34 @@ clean:
 compat: $(OUT)/arenakvd
 	tests/compat.sh $(OUT)
 
-.PHONY: all test install compat format clean FORCE
+# Coverage-guided fuzzing with libFuzzer (clang): make fuzz [FUZZ_TIME=seconds per harness, default 60].
+# -print_funcs=0: libFuzzer would otherwise start the symbolizer for every newly covered function, and the
+# sanitizer runtime closes every possible descriptor (up to RLIMIT_NOFILE) before it starts a process.
+# Each harness in tests/fuzz runs on a copy of its seed corpus (tests/fuzz/corpus/<name>) under
+# AddressSanitizer and UndefinedBehaviorSanitizer; a crash, a leak or a sanitizer report stops the target
+# with the harness output.
+FUZZ_CC ?= clang
+FUZZ_TIME ?= 60
+FUZZ_OUT := build/fuzz
+FUZZ_FLAGS := -std=gnu2x -g -O1 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude -Isrc -I$(DUCT_DIR)/include \
+	-I$(DUCT_DIR)/src -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined
+FUZZ_DUCT := $(DUCT_DIR)/src/hello.c $(DUCT_DIR)/src/duct.c $(DUCT_DIR)/src/tcp.c
+FUZZERS := $(patsubst tests/fuzz/%.c,$(FUZZ_OUT)/%,$(wildcard tests/fuzz/fuzz_*.c))
+
+$(FUZZ_OUT)/fuzz_%: tests/fuzz/fuzz_%.c $(LIB_SRC) $(wildcard src/*.h include/*.h)
+	@mkdir -p $(FUZZ_OUT)
+	$(FUZZ_CC) $(FUZZ_FLAGS) -o $@ $< $(LIB_SRC) $(FUZZ_DUCT) -lpthread
+
+fuzz: $(FUZZERS)
+	@set -e; for f in $(FUZZERS); do \
+		n=$${f##*/fuzz_}; c=$(FUZZ_OUT)/corpus-$$n; log=$(FUZZ_OUT)/$$n.log; mkdir -p $$c; \
+		if [ -d tests/fuzz/corpus/$$n ]; then cp tests/fuzz/corpus/$$n/* $$c/; fi; \
+		echo "== fuzz_$$n ($(FUZZ_TIME) s)"; \
+		if ! $$f -max_total_time=$(FUZZ_TIME) -timeout=10 -rss_limit_mb=4096 -print_funcs=0 -print_final_stats=1 -artifact_prefix=$(FUZZ_OUT)/$$n- $$c >$$log 2>&1; then \
+			tail -n 80 $$log; exit 1; fi; \
+		grep -E '^stat::(number_of_executed_units|peak_rss_mb|new_units_added)' $$log | tr '\n' ' '; echo; \
+	done
+
+.PHONY: all test install compat format clean fuzz FORCE
 
 FORCE:

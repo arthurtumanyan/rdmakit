@@ -8,8 +8,25 @@ PREFIX ?= /usr/local
 
 CFLAGS ?= -O2 -g
 CFLAGS += -std=gnu2x -Wall -Wextra -Werror -D_GNU_SOURCE -DPACE_GIT=\"$(GIT)\" -Isrc
+# Hardening (HARDEN=0 disables): fortified libc calls (not with the sanitizers, whose runtimes replace
+# them), stack protector, stack clash protection, control-flow protection (x86-64: CET; aarch64: PAC and
+# BTI), position-independent executables, read-only relocations resolved at start, non-executable stack.
+HARDEN ?= 1
+ifeq ($(HARDEN),1)
+CFLAGS += -fstack-protector-strong -fstack-clash-protection -fPIE
+ifeq ($(ARCH),x86_64)
+CFLAGS += -fcf-protection
+endif
+ifeq ($(ARCH),aarch64)
+CFLAGS += -mbranch-protection=standard
+endif
+ifeq ($(SAN)$(TSAN),)
+CFLAGS += -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3
+endif
+LDFLAGS += -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
+endif
 ifdef SAN
-CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
+CFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
 LDFLAGS += -fsanitize=address,undefined
 endif
 LDLIBS += -lpthread -lm

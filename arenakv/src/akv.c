@@ -203,9 +203,13 @@ static uint64_t now_ms(const akv *s) {
     return (uint64_t)(ms < 0 ? 0 : ms) + 1;
 }
 
-/* Expiry time for a time to live (> 0), relative to now. */
+/* Expiry time for a time to live (> 0), relative to now; times to live above AKV_TTL_MAX are clamped, so
+ * expiry times stay below 2^63 and every later conversion is free of overflow. */
 static uint64_t expiry_of(uint64_t now, int64_t ttl_ms) {
-    return ttl_ms > 0 ? now + (uint64_t)ttl_ms : 0;
+    if (ttl_ms <= 0) {
+        return 0;
+    }
+    return now + (uint64_t)(ttl_ms < AKV_TTL_MAX ? ttl_ms : AKV_TTL_MAX);
 }
 
 static int64_t ttl_left(uint64_t expiry, uint64_t now) {
@@ -430,7 +434,7 @@ static int index_insert(akv *s, struct shard *sh, int no_evict, uint64_t h, uint
             return -ENOMEM;
         }
         /* Window full at the bound: drop the oldest live entry of the window. */
-        struct bucket *fb = NULL;
+        struct bucket *fb = bucket_at(sh, h, 0); /* replaced below: every age is below UINT64_MAX */
         unsigned fslot = 0;
         uint64_t best_age = UINT64_MAX;
         for (unsigned n = 0; n < WINDOW; n++) {
@@ -445,10 +449,11 @@ static int index_insert(akv *s, struct shard *sh, int no_evict, uint64_t h, uint
                 }
             }
         }
+        struct entry_hdr *dropped = entry_at(sh, (slot_get(fb, fslot) - 1) * 8);
         fb->tags[fslot] = 0;
         sh->st.index_evictions++;
         sh->st.entries--;
-        kill_entry(s, entry_at(sh, (slot_get(fb, fslot) - 1) * 8), AKV_DEL_EVICTED);
+        kill_entry(s, dropped, AKV_DEL_EVICTED);
     }
     sh->st.entries++;
     return 0;
@@ -694,6 +699,9 @@ static int warm_rebuild(akv *s, struct shard *sh, const struct warm_shard *ws, i
             return -1;
         }
         if (e->expiry != 0) {
+            if (e->expiry > (uint64_t)AKV_TTL_MAX * 2) {
+                return -1; /* larger than any expiry the engine writes */
+            }
             int64_t left = (int64_t)e->expiry - (int64_t)old_now - elapsed_ms;
             if (left <= 0) {
                 e->flags |= ENTRY_DEAD;
@@ -724,13 +732,16 @@ static void warm_restore(akv *s) {
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     const struct warm_hdr *w = s->warm;
-    int64_t elapsed = wall_now_ms() - w->wall_ms;
+    int64_t elapsed;
+    if (__builtin_sub_overflow(wall_now_ms(), w->wall_ms, &elapsed) || elapsed > AKV_TTL_MAX) {
+        elapsed = AKV_TTL_MAX; /* a damaged time: every entry with an expiry is treated as expired */
+    }
     if (elapsed < 0) {
         elapsed = 0;
     }
     uint64_t now = now_ms(s);
     s->quiet = 1;
-    int bad = 0;
+    int bad = w->engine_ms > (uint64_t)AKV_TTL_MAX * 2; /* larger than any engine time */
     for (uint32_t i = 0; i < s->nshards && !bad; i++) {
         bad = warm_rebuild(s, &s->shards[i], &w->sh[i], elapsed, w->engine_ms, now) != 0;
     }
@@ -1366,6 +1377,10 @@ int akv_foreach(akv *s, int (*fn)(void *arg, const akv_record *r), void *arg) {
         uint64_t now = now_ms(s);
         /* Copy live entries in log order; ttl is stored in the expiry field as the remaining time + 1. */
         size_t need = (size_t)(sh->head - sh->tail);
+        if (need == 0) {
+            sh_unlock(s, sh);
+            continue;
+        }
         if (need > copy_cap) {
             uint8_t *p = realloc(copy, need);
             if (p == NULL) {
@@ -1445,8 +1460,11 @@ static uint64_t engine_expiry(const akv *s, int64_t expire_unix_ms) {
     if (expire_unix_ms == 0) {
         return 0;
     }
-    int64_t e = expire_unix_ms - s->wall_epoch_ms + 1;
-    return e >= 1 ? (uint64_t)e : 1;
+    int64_t e;
+    if (__builtin_sub_overflow(expire_unix_ms, s->wall_epoch_ms - 1, &e)) {
+        e = expire_unix_ms < 0 ? 1 : AKV_TTL_MAX; /* records from a damaged source */
+    }
+    return e < 1 ? 1 : (uint64_t)(e < AKV_TTL_MAX ? e : AKV_TTL_MAX);
 }
 
 /* Sets the expiry of the entry of key (engine clock) under the shard lock; 0 when present, -ENOENT. */

@@ -85,7 +85,7 @@ cluster-aware clients, or the memcached binary protocol.
 | RAMCloud, MICA | research systems that introduced log-structured memory and partitioned hash tables (FAST 2014, NSDI 2014) | the original designs and papers are of interest |
 | Mooncake Store, LMCache and similar | KV-cache storage integrated with inference serving engines | connectors to a serving engine are required |
 
-What `arenakv` provides: a small cache (about 8,600 lines including the server, three protocols, persistence and the
+What `arenakv` provides: a small cache (about 10,200 lines including the server, three protocols, persistence, access control and the
 client) that combines a log-structured arena, a growing bucketed hash index whose tags are compared with vector
 instructions (SSE2, NEON), and second-chance eviction, with a tested guarantee that a lookup never returns a stale
 value. The server speaks the memcached text and meta protocol and RESP2, so existing clients work, plus a native

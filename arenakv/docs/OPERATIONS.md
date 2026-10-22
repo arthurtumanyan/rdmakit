@@ -10,7 +10,7 @@ protocol are described in [`USAGE.md`](USAGE.md).
 - [Sizing](#sizing)
 - [Threads, CPUs and connections](#threads-cpus-and-connections)
 - [Eviction and expiry](#eviction-and-expiry)
-- [Authentication](#authentication)
+- [Authentication and access control](#authentication-and-access-control)
 - [TLS](#tls)
 - [Network exposure](#network-exposure)
 - [Persistence](#persistence)
@@ -110,31 +110,101 @@ Each instance needs its own ports, snapshot file and log file. Bind them to sepa
   (absolute times are converted when the command arrives). Across a restart from a snapshot the wall-clock time
   between saving and loading counts towards expiry ([Persistence](#persistence)).
 
-## Authentication
+## Authentication and access control
 
-`--auth-file FILE` enables authentication for every protocol. The file holds one credential per line:
+Two options enable authentication for every protocol; they exclude each other.
 
-```
-# user:password, or a bare password for the user "default"
-app:9f6c3e1b7a2d4e58
-ops:4a71c0d2e9b35f86
-0d5b8e2f6a9c1347
-```
-
-Empty lines and lines starting with `#` are ignored; everything after the first `:` is the password. A file without
-any credential stops the start (it would otherwise silently disable authentication). The file is read once at
-start; changes take effect after a restart. Keep it readable by the server user only (`chmod 600`, owner
-`arenakv`).
-
-| Protocol | How a client authenticates | Before authentication |
+| Option | File content | Permissions |
 |---|---|---|
-| RESP | `AUTH password` (user `default`), `AUTH user password`, or `HELLO 2 AUTH user password`; `redis-cli --user app --pass ...`, `redis.Redis(username=..., password=...)` | `NOAUTH Authentication required.` |
-| memcached | first command `set <any key> 0 0 <n>` with the data `<user> <password>`, answered `STORED` (the scheme of memcached `-Y`) | `CLIENT_ERROR unauthenticated` |
-| native | `AKVP_AUTH` with `user:password` or a password; `akv_cli --auth app:...`, `akvc_auth()` | status `AKVP_NOAUTH` |
+| `--aclfile FILE` | users with passwords and rules, in a subset of the Valkey ACL file syntax | per user: commands, categories, key patterns, channels |
+| `--auth-file FILE` | `user:password` per line, or a bare password for the user `default` (the format of earlier versions) | every user may do everything |
 
-Passwords are compared in constant time per entry; failed attempts are counted (`auth_errors`). There are no
-per-user permissions: an authenticated client can read, overwrite and delete every key, and run `FLUSHALL`.
-Credentials travel in clear text unless the connection uses TLS.
+### ACL file
+
+```
+# /etc/arenakv/users.acl, mode 600, owner arenakv
+user default off
+user admin on >9f6c3e1b7a2d4e58 allkeys allchannels +@all
+user app on >4a71c0d2e9b35f86 ~app:* %R~shared:* &app.events +@all -@dangerous -@admin
+user reader on #5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 ~* -@all +@read +@connection
+user metrics on >0d5b8e2f6a9c1347 -@all +info +dbsize
+```
+
+One user per line, `user <name>` followed by rules applied from left to right. A user starts disabled, without a
+password and without permissions.
+
+| Rule | Meaning |
+|---|---|
+| `on`, `off` | enable or disable the user |
+| `>password`, `<password` | add or remove a password, written in clear text in the file; the server keeps only its SHA-256 hash, which `ACL LIST` shows |
+| `#hash`, `!hash` | add or remove a password by its SHA-256 hash (64 hexadecimal digits), for files that must not contain passwords: `printf '%s' 'the password' \| sha256sum` |
+| `nopass`, `resetpass` | accept any password / remove all passwords |
+| `~pattern` | keys matching the glob pattern (`*`, `?`, `[...]`, `\`) may be read and written |
+| `%R~pattern`, `%W~pattern`, `%RW~pattern` | read only, write only, both |
+| `allkeys`, `resetkeys` | `~*` / remove all key patterns |
+| `&pattern`, `allchannels`, `resetchannels` | pub/sub channels the user may use |
+| `+@category`, `-@category` | allow or deny all commands of a category; `@all` is every command |
+| `+command`, `-command` | allow or deny one RESP command |
+| `allcommands`, `nocommands` | `+@all` / `-@all` |
+| `reset` | `off resetpass resetkeys resetchannels nocommands` |
+
+Rules are applied in order: `+@all -@dangerous` allows everything except the dangerous commands, while `-@dangerous
++@all` allows everything. Categories (`ACL CAT` lists them, `ACL CAT write` the commands of one):
+
+| Category | Commands |
+|---|---|
+| `read` | reading values: `GET`, `MGET`, `STRLEN`, `EXISTS`, `TTL`; memcached `get`, `gets`, `mg`; native `GET`, `GETM`, `MGET`, `HAS` |
+| `write` | changing values: `SET`, `DEL`, `INCR`, `EXPIRE`, `APPEND`; memcached storage, `delete`, `incr`, `touch`, `ms`, `md`, `ma`; native stores, `DEL`, `INCR`, `TOUCH` |
+| `keyspace` | commands about keys rather than values: `DEL`, `EXISTS`, `EXPIRE`, `KEYS`, `SCAN`, `DBSIZE`, `TYPE` |
+| `admin` | `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `CONFIG`, `ACL`, `REPLICAOF`, `CLUSTER` |
+| `dangerous` | `FLUSHALL`, `FLUSHDB`, `KEYS`, `INFO`, `CONFIG`, `ACL`, the persistence commands; memcached `flush_all`, `stats`; native `FLUSH`, `STATS` |
+| `pubsub` | `SUBSCRIBE`, `PUBLISH` and the other pub/sub commands |
+| `transaction` | `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH` |
+| `connection` | `AUTH`, `HELLO`, `PING`, `ECHO`, `QUIT`, `SELECT`, `CLIENT`, `COMMAND`, `TIME`; always allowed, so that a client can authenticate and leave |
+| `replication` | the replication link of a replica (native `REPLSYNC`) |
+
+`+command` and `-command` name RESP commands; memcached and native commands follow the categories. Every key a
+command names must match a key pattern of the user for the kind of access: reading commands need read access,
+writing commands write access, and commands that read and change a value (`INCR`, `GETSET`, `GETDEL`, memcached
+`incr`, `gat`) both. `KEYS` and `SCAN` take a pattern rather than key names and are governed by their categories
+only.
+
+When the file defines a user `default` that is `on` with `nopass`, connections start logged in as that user;
+otherwise every connection must authenticate first. A file without users, an unknown rule or category, or a user
+defined twice stops the start with the file name and line number:
+
+```
+[error] access control list: /etc/arenakv/users.acl: line 3: '+@writes': unknown category
+```
+
+### Authenticating
+
+| Protocol | How a client authenticates | Before authentication | Denied command |
+|---|---|---|---|
+| RESP | `AUTH password` (user `default`), `AUTH user password`, `HELLO 2 AUTH user password`; `redis-cli --user app --pass ...` | `-NOAUTH Authentication required.` | `-NOPERM User app has no permissions to run the 'flushall' command`, `-NOPERM No permissions to access a key` |
+| memcached | first command `set <any key> 0 0 <n>` with the data `<user> <password>`, answered `STORED` (the scheme of memcached `-Y`) | `CLIENT_ERROR unauthenticated` | `CLIENT_ERROR permission denied` |
+| native | `AKVP_AUTH` with `user:password` or a password; `akv_cli --auth app:...`, `akvc_auth()` | status `AKVP_NOAUTH` | status `AKVP_NOPERM` |
+
+A wrong password answers `-WRONGPASS invalid username-password pair or user is disabled.` (RESP), `CLIENT_ERROR
+authentication failure` (memcached) or `AKVP_NOAUTH`, and counts in `auth_errors`. The hash of the given password is
+compared with every stored hash of the user without stopping at the first match. Credentials travel in clear text
+unless the connection uses TLS.
+
+### Inspecting and reloading
+
+| Command | Result |
+|---|---|
+| `ACL WHOAMI` | the user of the connection |
+| `ACL USERS` | all user names |
+| `ACL LIST` | every user in canonical form: `user app on #4f1d... ~app:* %R~shared:* &app.events +@all -@dangerous -@admin` |
+| `ACL GETUSER name` | flags, password hashes, command rules, key patterns and channels of one user |
+| `ACL CAT [category]` | the categories, or the RESP commands of one |
+| `ACL DRYRUN user command [arg ...]` | `OK` when the user may run the command, or the reason it may not |
+| `ACL LOAD` | reads the file again; a file with an error is refused and the previous rules stay in force |
+
+After `ACL LOAD`, connections whose user was removed or disabled are closed; other connections continue with the
+new rules of their user. `ACL SETUSER`, `ACL DELUSER` and `ACL SAVE` are not provided: the file is the only source
+of users, so it can be managed with the rest of the configuration.
 
 ## TLS
 
@@ -419,7 +489,9 @@ snapshot writes, TLS files that cannot be loaded.
 | `warm restart: memory discarded (...)` | crash, changed `--capacity`/`--shards`/`--max-entry`, or another version | expected after a crash; the log or snapshot is loaded instead |
 | `aof_last_write_status:err` | the disk refuses writes (full, read-only) | free space; with `always`, clients wait until writes succeed again |
 | `TLS options need a build with TLS=1` | TLS listener options on a build without TLS | build with `make TLS=1` |
-| clients get `NOAUTH` / `CLIENT_ERROR unauthenticated` / `AKVP_NOAUTH` | `--auth-file` is set | authenticate first ([Authentication](#authentication)) |
+| clients get `NOAUTH` / `CLIENT_ERROR unauthenticated` / `AKVP_NOAUTH` | `--aclfile` or `--auth-file` is set | authenticate first ([Authentication](#authentication-and-access-control)) |
+| `NOPERM ...` / `CLIENT_ERROR permission denied` / `AKVP_NOPERM` | the user's rules do not allow the command or key | `ACL DRYRUN user command args` names the reason; change the ACL file and run `ACL LOAD` |
+| `access control list: FILE: line N: ...` at start | an error in the ACL file | the message names the rule; `--auth-file` and `--aclfile` together are refused as well |
 | `SERVER_ERROR object too large for cache`, `ERR string exceeds maximum allowed size`, `AKVP_TOOBIG` | entry above `min(max-entry, capacity / shards / 2)`, or a native message above `--max-msg` | raise `--max-entry` or `--max-msg`, or lower `--shards` |
 | `SERVER_ERROR out of memory storing object`, `OOM ...`, `AKVP_NOMEM` | full cache with `--no-evict` | delete entries, raise `--capacity`, or allow eviction |
 | hit ratio falls although keys were stored | eviction (see `evictions`) or expiry (`expired`) | raise `--capacity` or the times to live |

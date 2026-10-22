@@ -71,7 +71,7 @@ static const char *const stat_names[AKVP_STATS_FIELDS] = {
 
 static const char *status_name(int rc) {
     static const char *const names[] = {"OK",     "NOTFOUND", "BADREQ", "TOOBIG", "ERROR",
-                                        "EXISTS", "NOMEM",    "NOAUTH", "NOTNUM"};
+                                        "EXISTS", "NOMEM",    "NOAUTH", "NOTNUM", "NOPERM"};
     if (rc >= 0 && rc < (int)(sizeof(names) / sizeof(names[0]))) {
         return names[rc];
     }

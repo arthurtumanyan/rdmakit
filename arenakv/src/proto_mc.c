@@ -50,6 +50,9 @@ int64_t mc_exptime_to_ttl(int64_t exptime) {
     }
     if (exptime > MC_RELATIVE_LIMIT) {
         int64_t left = exptime - (int64_t)time(NULL);
+        if (left > INT64_MAX / 1000) {
+            left = INT64_MAX / 1000; /* the engine bounds times to live further (AKV_TTL_MAX) */
+        }
         return left > 0 ? left * 1000 : -1;
     }
     return exptime * 1000;
@@ -703,15 +706,45 @@ static void do_auth(akvd *d, struct session *ss, const uint8_t *data, size_t dle
     int ok = 0;
     if (sp != NULL) {
         size_t ulen = (size_t)(sp - data);
-        ok = akvd_auth_check(d, (const char *)data, ulen, (const char *)sp + 1, dlen - ulen - 1);
-    }
-    if (ok) {
-        ss->authed = 1;
-        reply(out, 0, "STORED\r\n");
+        ok = akvd_login(d, ss, (const char *)data, ulen, (const char *)sp + 1, dlen - ulen - 1);
     } else {
         SRV_COUNT(d, auth_failures, 1);
+    }
+    if (ok) {
+        reply(out, 0, "STORED\r\n");
+    } else {
         reply(out, 0, "CLIENT_ERROR authentication failure\r\n");
     }
+}
+
+/*
+ * Permission check of a memcached command (tokens t[0, nt)) for the session's user. Retrievals name
+ * their keys from the first (gat, gats: second) argument to the last; other commands name one key in
+ * argument 1. Returns 1 when the command may run, else replies with CLIENT_ERROR and returns 0.
+ */
+static int mc_permitted(const struct session *ss, const struct tok *t, int nt, struct obuf *out) {
+    if (ss->user == NULL || acl_unrestricted(ss->user)) {
+        return 1;
+    }
+    int id = acl_cmd_find(ACL_MC, t[0].p, t[0].n);
+    if (id < 0) {
+        return 1; /* unknown: answered ERROR */
+    }
+    int ok = acl_cmd_allowed(ss->user, (unsigned)id);
+    const acl_cmd *k = acl_cmd_at((unsigned)id);
+    if (ok && k->first > 0) {
+        int last = k->last < 0 ? nt + k->last : k->last;
+        if (t[nt - 1].n == 7 && memcmp(t[nt - 1].p, "noreply", 7) == 0 && k->last < 0) {
+            last--;
+        }
+        for (int i = k->first; ok && i <= last && i < nt; i++) {
+            ok = acl_key_allowed(ss->user, t[i].p, t[i].n, k->access);
+        }
+    }
+    if (!ok) {
+        reply(out, 0, "CLIENT_ERROR permission denied\r\n");
+    }
+    return ok;
 }
 
 /*
@@ -880,6 +913,9 @@ size_t mc_execute(akvd *d, struct session *ss, const uint8_t *in, size_t len, st
                 }
                 continue;
             }
+            if (akvd_session_refresh(d, ss) != 0 || !mc_permitted(ss, t, nt, out)) {
+                continue;
+            }
             if (is_ms) {
                 cmd_ms(d, t, nt, data, (size_t)bytes, out);
                 continue;
@@ -898,6 +934,9 @@ size_t mc_execute(akvd *d, struct session *ss, const uint8_t *in, size_t len, st
         }
         if (!ss->authed) {
             reply(out, 0, "CLIENT_ERROR unauthenticated\r\n");
+            continue;
+        }
+        if (akvd_session_refresh(d, ss) != 0 || !mc_permitted(ss, t, nt, out)) {
             continue;
         }
         if (tok_eq(c, "get")) {

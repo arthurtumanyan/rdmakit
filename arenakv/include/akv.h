@@ -124,6 +124,9 @@ typedef struct akv_meta {
     int64_t ttl_ms; /* remaining time to live in milliseconds, -1 when the entry does not expire */
 } akv_meta;
 
+/* Largest time to live in milliseconds (2^62 ms, about 146 million years); larger values are clamped. */
+#define AKV_TTL_MAX (INT64_C(1) << 62)
+
 /* Value of akv_get_meta()'s touch_ttl_ms that leaves the expiry unchanged. */
 #define AKV_TTL_KEEP INT64_MIN
 

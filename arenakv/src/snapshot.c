@@ -220,10 +220,14 @@ int snap_load(akv *s, const char *path, uint64_t *records) {
         fclose(f);
         return -EBADMSG;
     }
-    /* Wall-clock milliseconds since the file was created; a clock set back counts as no time. */
-    int64_t created = (int64_t)get64(hdr + 16);
-    int64_t now = (int64_t)time(NULL);
-    int64_t elapsed_ms = now > created ? (now - created) * 1000 : 0;
+    /*
+     * Wall-clock milliseconds since the file was created; a clock set back (or a creation time in the
+     * future) counts as no time. The difference is bounded so that a damaged header cannot overflow it.
+     */
+    uint64_t created = get64(hdr + 16);
+    uint64_t now = (uint64_t)time(NULL);
+    uint64_t elapsed_s = now > created ? now - created : 0;
+    int64_t elapsed_ms = elapsed_s > (uint64_t)(INT64_MAX / 1000) ? INT64_MAX : (int64_t)elapsed_s * 1000;
     uint8_t *buf = NULL;
     size_t cap = 0;
     uint64_t loaded = 0;
