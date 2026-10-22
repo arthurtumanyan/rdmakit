@@ -1,6 +1,8 @@
 /*
  * fuzz_glob.c - libFuzzer harness: glob matching (acl_glob); the input is split into pattern and subject
- * at its first zero byte. The result is compared with a recursive reference matcher on short inputs.
+ * at its first zero byte. The result is compared with a recursive reference matcher on short inputs. The
+ * reference memoizes its result per (pattern offset, subject offset): without that its cost is exponential in
+ * the number of stars (11 stars against 23 bytes exceeded the 10 s unit timeout).
  */
 #include <string.h>
 
@@ -8,8 +10,23 @@
 
 #include <stdlib.h>
 
-/* Reference: the exponential recursive definition of the same pattern language. */
+#define REF_PMAX 12u
+#define REF_SMAX 24u
+
+/* Memo of ref(): 0 unknown, 1 no match, 2 match; indexed by the remaining pattern and subject lengths. */
+static unsigned char memo[REF_PMAX + 1][REF_SMAX + 1];
+
+static int ref_raw(const char *p, size_t pn, const char *s, size_t sn);
+
+/* Reference: the recursive definition of the same pattern language, memoized (inputs within the limits). */
 static int ref(const char *p, size_t pn, const char *s, size_t sn) {
+    if (memo[pn][sn] == 0) {
+        memo[pn][sn] = (unsigned char)(1 + ref_raw(p, pn, s, sn));
+    }
+    return memo[pn][sn] - 1;
+}
+
+static int ref_raw(const char *p, size_t pn, const char *s, size_t sn) {
     if (pn == 0) {
         return sn == 0;
     }
@@ -64,8 +81,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t n) {
     const char *s = z != NULL ? (const char *)z + 1 : "";
     size_t slen = z != NULL ? n - plen - 1 : 0;
     int got = acl_glob((const char *)data, plen, s, slen);
-    if (plen <= 12 && slen <= 24 && got != ref((const char *)data, plen, s, slen)) {
-        abort();
+    if (plen <= REF_PMAX && slen <= REF_SMAX) {
+        memset(memo, 0, sizeof(memo));
+        if (got != ref((const char *)data, plen, s, slen)) {
+            abort();
+        }
     }
     return 0;
 }
