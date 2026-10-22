@@ -258,13 +258,17 @@ static void test_rewrite_under_load(void) {
     for (unsigned i = 0; i < THREADS; i++) {
         pthread_join(th[i], NULL);
     }
+    /*
+     * Waits until the log is quiet: nothing pending and no rewrite running, seen twice 20 ms apart. The writer
+     * drains the last records up to 10 ms after the writers stopped, and that drain may start an automatic
+     * rewrite; closing during one leaves a third (consistent) file.
+     */
     aof_info ai;
-    for (int i = 0; i < 500; i++) {
+    int quiet = 0;
+    for (int i = 0; i < 500 && quiet < 2; i++) {
         aof_info_get(a, &ai);
-        if (!ai.rewrite_running) {
-            break;
-        }
-        sleep_ms(10);
+        quiet = ai.pending == 0 && !ai.rewrite_running ? quiet + 1 : 0;
+        sleep_ms(20);
     }
     target = NULL;
     EXPECT(aof_close(a) == 0, "close");
