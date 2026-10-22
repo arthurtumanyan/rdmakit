@@ -109,8 +109,13 @@ typedef struct aof_info {
 int aof_open(const aof_config *cfg, akv *s, int load, aof **out, aof_load_info *info);
 
 /* Appends a change record. Called from the change feed (shard lock held); never blocks on the disk,
- * but waits while more than 256 MiB are pending (the writer cannot keep up). */
+ * but waits while more than 256 MiB are pending (the writer cannot keep up). Does not wake the writer, which
+ * drains every 10 ms (see aof.c). */
 void aof_append(aof *a, const akv_change *c);
+
+/* Asks the writer to write and, with always, sync the pending records now: called by a worker whose replies
+ * wait for durability. Cheap when a request is already pending. */
+void aof_kick(aof *a);
 
 /* Appends the end record of transaction txn. */
 void aof_append_txn_end(aof *a, uint64_t txn);

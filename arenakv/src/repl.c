@@ -21,6 +21,7 @@
 struct repl_backlog {
     pthread_mutex_t m;
     pthread_cond_t cv;
+    unsigned deep_waiters; /* readers in the long wait of repl_backlog_read(): appends wake them */
     uint8_t *ring;
     size_t size;
     uint64_t first;
@@ -29,6 +30,15 @@ struct repl_backlog {
     char id2[REPL_ID_LEN];
     uint64_t second_off; /* id2 is valid for offsets up to this one; 0 = no second id */
 };
+
+/*
+ * Readers that have caught up first wait SHALLOW_WAITS times SHALLOW_MS without being woken, so that a stream of
+ * appends costs at most one reader wake-up per SHALLOW_MS instead of one per record (each a context switch when
+ * the worker and the feed thread share a CPU); only then do they wait until an append wakes them. An idle
+ * replica therefore receives the first change at once and a busy one within SHALLOW_MS.
+ */
+#define SHALLOW_WAITS 2
+#define SHALLOW_MS 1
 
 static _Thread_local uint64_t thread_offset;
 /* Encoding buffer of the calling thread. A thread-specific key frees it when the thread exits. */
@@ -120,7 +130,9 @@ uint64_t repl_backlog_append(repl_backlog *b, const akv_change *c) {
     pthread_mutex_lock(&b->m);
     ring_put(b, scratch.p, scratch.len);
     uint64_t end = b->end;
-    pthread_cond_broadcast(&b->cv);
+    if (b->deep_waiters > 0) {
+        pthread_cond_broadcast(&b->cv);
+    }
     pthread_mutex_unlock(&b->m);
     if (scratch.cap > (1u << 20)) {
         ob_free(&scratch); /* keep the thread's buffer small after a large value */
@@ -147,22 +159,34 @@ uint64_t repl_thread_offset(void) {
     return thread_offset;
 }
 
+/* Absolute CLOCK_REALTIME time ms milliseconds from now, for pthread_cond_timedwait(). */
+static struct timespec after_ms(int ms) {
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    t.tv_sec += ms / 1000;
+    t.tv_nsec += (long)(ms % 1000) * 1000000;
+    if (t.tv_nsec >= 1000000000) {
+        t.tv_sec++;
+        t.tv_nsec -= 1000000000;
+    }
+    return t;
+}
+
 long repl_backlog_read(repl_backlog *b, uint64_t off, uint8_t *out, size_t cap, int timeout_ms) {
     pthread_mutex_lock(&b->m);
     if (off == b->end && timeout_ms > 0) {
-        struct timespec until;
-        clock_gettime(CLOCK_REALTIME, &until);
-        until.tv_sec += timeout_ms / 1000;
-        until.tv_nsec += (long)(timeout_ms % 1000) * 1000000;
-        if (until.tv_nsec >= 1000000000) {
-            until.tv_sec++;
-            until.tv_nsec -= 1000000000;
+        struct timespec until = after_ms(timeout_ms);
+        for (int i = 0; i < SHALLOW_WAITS && off == b->end; i++) {
+            struct timespec t = after_ms(SHALLOW_MS);
+            pthread_cond_timedwait(&b->cv, &b->m, &t); /* not woken by appends */
         }
+        b->deep_waiters++;
         while (off == b->end) {
             if (pthread_cond_timedwait(&b->cv, &b->m, &until) != 0) {
                 break;
             }
         }
+        b->deep_waiters--;
     }
     long rc;
     if (off < b->first || off > b->end) {

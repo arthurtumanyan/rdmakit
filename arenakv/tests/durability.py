@@ -6,7 +6,8 @@
 Checks:
   always     a client writes with a pipeline of 16 and counts acknowledged replies; the server is killed
              with SIGKILL; after a restart from the append-only log every acknowledged key is present
-  everysec   the same; keys lost must have been acknowledged within the last 2 seconds before the kill
+  everysec   the same; keys lost must have been acknowledged within the last 0.25 s before the kill (the log
+             is written every 10 ms; the margin covers the kill and the client's own timing)
   rewrite    SIGKILL while BGREWRITEAOF runs under a write load; every acknowledged key is present
   warm       values written, SIGTERM, restart from the warm-restart file: identical contents (digest of all
              values) and the restart time
@@ -181,9 +182,9 @@ def crash_case(name, workdir, fsync, rewrite=False):
         check(f"{name}: no acknowledged write lost after SIGKILL", lost == 0,
               f"{acked} acknowledged, {got} present; {per_sync:.1f} writes per fdatasync (group commit)")
     else:
-        recent = acked - max([n for t, n in history if t < killed_at - 2.0] or [0])
-        check(f"{name}: losses limited to the last 2 seconds", 0 <= lost <= recent,
-              f"{acked} acknowledged, {lost} lost, {recent} acknowledged in the last 2 s")
+        recent = acked - max([n for t, n in history if t < killed_at - 0.25] or [0])
+        check(f"{name}: losses limited to the last 0.25 s", 0 <= lost <= recent,
+              f"{acked} acknowledged, {lost} lost, {recent} acknowledged in the last 0.25 s")
     return log
 
 

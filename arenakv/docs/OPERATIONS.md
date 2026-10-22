@@ -285,7 +285,7 @@ and one-sided rdmaduct operations are not available on encrypted endpoints; the 
 |---|---|---|---|---|
 | none | | nothing | everything at a stop or crash | none |
 | snapshot | `--snapshot FILE` | the content at the last save | changes since the last `SAVE`, `BGSAVE`, periodic save or clean stop | a copy of the whole content per save |
-| append-only log | `--appendonly DIR` | every change written to the log | `always`: nothing that was acknowledged; `everysec`: up to about one second; `no`: what the kernel had not written | one record per change, and the fsync policy |
+| append-only log | `--appendonly DIR` | every change written to the log | `always`: nothing that was acknowledged; `everysec`: up to about one second (tens of milliseconds when only the process is killed); `no`: what the kernel had not written | one record per change, and the fsync policy |
 | warm restart | `--warm-restart FILE` | the cache memory across a stop and start of the process (upgrade, configuration change) | everything after a crash or a reboot (the memory is then not trusted) | none (the memory is a file on tmpfs) |
 
 The mechanisms combine. At start the server takes the warm-restart memory when it is valid, otherwise the
@@ -319,14 +319,17 @@ upgrades uses `--warm-restart`; one that must also survive crashes adds `--appen
   file with the current content (for example the content loaded from a snapshot).
 - fsync policies, with the semantics of Valkey's `appendfsync`:
 
-  | `--appendfsync` | A reply to a change is sent | Lost in a crash of the machine |
-  |---|---|---|
-  | `always` | after the change is on disk; changes of many connections share one `fdatasync` | nothing that was acknowledged |
-  | `everysec` (default) | at once; the log is synced about once per second | up to about one second of changes |
-  | `no` | at once; the kernel writes when it decides | what was not yet written by the kernel |
+  | `--appendfsync` | A reply to a change is sent | Lost when the process is killed | Lost in a crash of the machine |
+  |---|---|---|---|
+  | `always` | after the change is on disk; changes of many connections share one `fdatasync` | nothing that was acknowledged | nothing that was acknowledged |
+  | `everysec` (default) | at once; the log is written every 10 ms and synced about once per second | the changes not yet written: the last 10 ms, plus a batch being written and scheduling delays | up to about one second of changes |
+  | `no` | at once; the log is written every 10 ms, the kernel syncs when it decides | as with `everysec` | what the kernel had not yet written |
 
-  A crash of the process alone (not of the machine) loses nothing that was handed to the log under any policy,
-  because written data stays in the kernel's page cache; `tests/durability.py` checks this with `SIGKILL`.
+  The log writer collects changes for 10 ms (or 1 MiB) before it writes them, instead of waking for every change:
+  a wake-up per change costs a context switch per write, which cost a server on one CPU a third of its throughput under 50 % writes.
+  Valkey writes its log before it replies, so a killed Valkey process loses nothing with `everysec`.
+  `tests/durability.py` kills a writing server with `SIGKILL` and checks that with `always` nothing acknowledged is
+  lost, and with `everysec` nothing acknowledged earlier than 0.25 s before the kill; it prints the number lost.
 - Rewriting: `BGREWRITEAOF`, or automatically when the log grew by `--aof-rewrite-percentage` of its base and is at
   least `--aof-rewrite-min-size`. The server switches to a new increment file, writes a new base from the current
   content in the background, then replaces the manifest and removes the old files. Changes continue during the

@@ -5,6 +5,13 @@
  * protects the manifest state (file numbers). aof_append() runs with an engine shard lock held and takes
  * `m` only; the writer and the rewrite thread never call the engine while holding either lock, so there
  * is no lock-order cycle with the shard locks.
+ *
+ * Wake-ups: appends never wake the writer, because a wake-up per record costs a context switch per write
+ * (with the worker and the writer on one CPU, 832,267 switches in 3 s under 50 % writes against 139 without
+ * the log). The writer drains the buffer every WRITE_INTERVAL_MS, sooner when it holds WAKE_BYTES, and at once
+ * after aof_kick(), which a worker calls when replies wait for an fsync (always). A process that is killed
+ * therefore loses the acknowledged changes not yet written with everysec and no: those of the last
+ * WRITE_INTERVAL_MS, plus a batch being written and scheduling delays (tests/durability.py bounds it at 0.25 s).
  */
 #include "aof.h"
 
@@ -30,6 +37,8 @@
 #define BLOCK_TARGET (4u << 20)
 #define BLOCK_MAX (64u << 20)
 #define PENDING_MAX (256ull << 20)
+#define WRITE_INTERVAL_MS 10
+#define WAKE_BYTES (1u << 20)
 #define BLOCK_MAGIC 0x31474c41u /* "ALG1" */
 #define KIND_BASE 0u
 #define KIND_INCR 1u
@@ -48,6 +57,7 @@ struct aof {
     struct obuf spare;
     uint64_t seq;
     int writer_idle;
+    int kicked; /* aof_kick() since the last drain */
     int stop;
     int rotate_req;
     uint64_t rotate_gen;
@@ -745,23 +755,30 @@ static void *writer_main(void *arg) {
     int dirty = 0;
     pthread_mutex_lock(&a->m);
     for (;;) {
-        while (a->cur.len == 0 && !a->stop && !a->rotate_req) {
+        /* Waits for a drain reason: stop, rotation, a kick, a full buffer, or WRITE_INTERVAL_MS with data. */
+        while (!a->stop && !a->rotate_req && !a->kicked && a->cur.len < WAKE_BYTES) {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
             if (dirty && a->cfg.fsync == AOF_FSYNC_EVERYSEC && now.tv_sec > last_sync.tv_sec) {
                 break; /* one second passed with unsynced data */
             }
+            if (a->cur.len > 0 && a->writer_idle) {
+                break; /* the interval passed with data waiting */
+            }
             struct timespec until;
             clock_gettime(CLOCK_REALTIME, &until);
-            until.tv_nsec += 200000000;
+            until.tv_nsec += (a->cur.len > 0 ? WRITE_INTERVAL_MS : 200) * 1000000L;
             if (until.tv_nsec >= 1000000000) {
                 until.tv_sec++;
                 until.tv_nsec -= 1000000000;
             }
             a->writer_idle = 1;
-            pthread_cond_timedwait(&a->cv, &a->m, &until);
-            a->writer_idle = 0;
+            if (pthread_cond_timedwait(&a->cv, &a->m, &until) != 0 && a->cur.len == 0) {
+                a->writer_idle = 0; /* timed out empty: wait again from the top */
+            }
         }
+        a->writer_idle = 0;
+        a->kicked = 0;
         struct obuf batch = a->cur;
         a->cur = a->spare;
         a->spare = (struct obuf){0};
@@ -945,11 +962,20 @@ void aof_append(aof *a, const akv_change *c) {
         atomic_store(&a->last_write_ok, 0); /* the log misses this change; INFO reports the error */
     }
     thread_seq = ++a->seq;
-    if (a->writer_idle) {
+    if (a->cur.len >= WAKE_BYTES && a->writer_idle) {
         pthread_cond_signal(&a->cv);
     }
     pthread_mutex_unlock(&a->m);
     atomic_fetch_add(&a->appended, 1);
+}
+
+void aof_kick(aof *a) {
+    pthread_mutex_lock(&a->m);
+    if (!a->kicked) {
+        a->kicked = 1;
+        pthread_cond_signal(&a->cv);
+    }
+    pthread_mutex_unlock(&a->m);
 }
 
 void aof_append_txn_end(aof *a, uint64_t txn) {

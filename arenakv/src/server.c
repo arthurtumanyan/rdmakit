@@ -1361,6 +1361,7 @@ static void park(struct worker *w, struct conn *c, uint64_t seq) {
         c->epmask = 0;
     }
     atomic_store(&w->has_parked, 1);
+    aof_kick(w->d->aof); /* the writer does not wake on appends */
     if (aof_durable(w->d->aof) >= seq) {
         /* became durable meanwhile: the writer may have looked at has_parked before the store above */
         uint64_t one = 1;
