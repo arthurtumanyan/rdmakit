@@ -137,6 +137,7 @@ that names the option and the accepted range.
 | `--aof-rewrite-min-size SIZE` | 64M | ... and the log is at least SIZE |
 | `--aof-load-damaged` | off | start with the records before a damaged block instead of refusing to start |
 | `--warm-restart FILE` | | keep the cache memory in FILE (on tmpfs, normally under `/dev/shm`) so that a restart of the process keeps the entries ([OPERATIONS.md](OPERATIONS.md#warm-restart)) |
+| `--pubsub-output-limit SIZE` | 32M | unread messages of a subscriber before it is disconnected (the pubsub client-output-buffer-limit of Valkey) |
 | `--log-level error\|warn\|info\|debug` | info | |
 | `--log-file FILE` | standard error | reopened on `SIGHUP` |
 | `--stats SECONDS` | 0 (off) | log a statistics line periodically |
@@ -173,11 +174,12 @@ cannot start server: Address already in use
 `SIGHUP` reopens the log file. The server runs in the foreground; use systemd or a container runtime to run it in
 the background ([OPERATIONS.md](OPERATIONS.md#deployment)).
 
-## 4. Querying with the Redis protocol (RESP2)
+## 4. Querying with the Redis protocol (RESP2, RESP3)
 
 Any Redis or Valkey client can be used: `redis-cli`, `valkey-cli`, and client libraries of any language. Requests
-may be pipelined. The server answers RESP2; clients that ask for RESP3 (`HELLO 3`) receive `NOPROTO` and fall back
-to RESP2.
+may be pipelined. A connection speaks RESP2 until it sends `HELLO 3`; RESP3 then returns nulls as `_`, maps for
+`HELLO`, `CONFIG GET`, `PUBSUB NUMSUB` and `ACL GETUSER`, `INFO` as a verbatim string, and pub/sub messages as push
+frames.
 
 ### Example session
 
@@ -219,11 +221,61 @@ r = redis.Redis(host="127.0.0.1", port=16379)          # add password=..., usern
 r.set("session:42", b"\x00\x01payload", ex=600)       # values are binary-safe
 print(r.get("session:42"), r.ttl("session:42"))      # b'\x00\x01payload' 600
 print(r.incr("visits"), r.incr("visits", 10))        # 1 11
-p = r.pipeline(transaction=False)                    # pipelining; MULTI/EXEC transactions are not supported
+p = r.pipeline(transaction=False)                    # pipelining
 for i in range(3):
     p.set(f"k{i}", i)
 p.mget("k0", "k1", "k2")
 print(p.execute())                                   # [True, True, True, [b'0', b'1', b'2']]
+t = r.pipeline(transaction=True)                     # MULTI ... EXEC
+t.incr("a")
+t.incr("b")
+print(t.execute())                                   # [1, 1]
+ps = r.pubsub()
+ps.subscribe("events")
+r.publish("events", "hello")                         # 1 (one receiver)
+```
+
+### Transactions
+
+`MULTI` starts a transaction; the following commands answer `QUEUED` and run on `EXEC`, which returns their replies
+in an array. No other client reads or changes the keys of a transaction while it runs, and the append-only log
+replays a transaction completely or not at all. An unknown command, or one the user's ACL refuses, while queueing
+makes `EXEC` answer `EXECABORT` and run nothing. A command that fails while it runs (for example `INCR` of a
+non-number) returns its error in its place, and the other commands run. `WATCH key ...` before `MULTI` makes `EXEC`
+return a null array when another client changed one of the keys in between (or the key expired); `UNWATCH` and
+`DISCARD` drop the watches.
+
+```
+$ valkey-cli -p 16379 SET balance 100
+OK
+$ printf 'WATCH balance\nMULTI\nDECRBY balance 30\nINCRBY spent 30\nEXEC\n' | valkey-cli -p 16379
+OK
+OK
+QUEUED
+QUEUED
+1) (integer) 70
+2) (integer) 30
+```
+
+### Publish and subscribe
+
+`SUBSCRIBE channel ...` and `PSUBSCRIBE pattern ...` (glob patterns) deliver every `PUBLISH channel message` sent on
+any connection; `PUBLISH` returns the number of receivers. A RESP2 connection with subscriptions accepts only the
+pub/sub commands, `PING`, `QUIT` and `RESET`; a RESP3 connection accepts every command. A subscriber whose unread
+messages exceed `--pubsub-output-limit` (default 32 MiB) is disconnected. Messages are not stored: a subscriber
+receives only what is published while it is subscribed.
+
+```
+$ valkey-cli -p 16379 SUBSCRIBE events            # in one terminal
+1) "subscribe"
+2) "events"
+3) (integer) 1
+1) "message"
+2) "events"
+3) "block-17 evicted"
+
+$ valkey-cli -p 16379 PUBLISH events "block-17 evicted"   # in another
+(integer) 1
 ```
 
 ### Command reference
@@ -233,15 +285,15 @@ Command names are case-insensitive. Values and keys are byte strings; the engine
 | Command | Reply | Notes |
 |---|---|---|
 | `GET key` | value or nil | |
-| `SET key value [NX\|XX] [GET] [EX s\|PX ms\|EXAT unix-s\|PXAT unix-ms\|KEEPTTL]` | `OK`; nil when NX/XX prevented the store; with `GET` the old value | an expiry in the past deletes the key; `SET ... GET` is not atomic |
+| `SET key value [NX\|XX] [GET] [EX s\|PX ms\|EXAT unix-s\|PXAT unix-ms\|KEEPTTL]` | `OK`; nil when NX/XX prevented the store; with `GET` the old value | an expiry in the past deletes the key |
 | `SETNX key value` | 1 stored, 0 present | |
 | `SETEX key seconds value`, `PSETEX key ms value` | `OK` | |
-| `GETSET key value` | old value or nil | not atomic |
-| `GETDEL key` | value or nil | not atomic |
+| `GETSET key value` | old value or nil | |
+| `GETDEL key` | value or nil | |
 | `GETEX key [EX s\|PX ms\|EXAT\|PXAT\|PERSIST]` | value or nil | reads and changes the expiry |
 | `MGET key [key ...]` | array | |
-| `MSET key value [key value ...]` | `OK` | keys are stored one after another, not atomically |
-| `APPEND key value` | new length | creates the key when absent; not atomic in that case |
+| `MSET key value [key value ...]` | `OK` | atomic: no reader sees some keys stored and others not |
+| `APPEND key value` | new length | creates the key when absent |
 | `STRLEN key` | length, 0 when absent | |
 | `INCR`, `DECR key`; `INCRBY`, `DECRBY key delta` | new value | 64-bit signed; absent key counts as 0; errors for non-integers and overflow |
 | `DEL key [key ...]`, `UNLINK ...` | number removed | |
@@ -256,7 +308,12 @@ Command names are case-insensitive. Values and keys are byte strings; the engine
 | `FLUSHALL`, `FLUSHDB` | `OK` | removes all entries; `ASYNC`/`SYNC` arguments are ignored |
 | `PING [message]`, `ECHO message` | `PONG` or the message | |
 | `AUTH [user] password` | `OK` or `WRONGPASS` | error when no ACL or credentials file is configured |
-| `HELLO [2] [AUTH user password] [SETNAME name]` | server information | protocol 3 answers `NOPROTO` |
+| `HELLO [2\|3] [AUTH user password] [SETNAME name]` | server information (a map in RESP3) | selects RESP2 or RESP3 for the connection |
+| `RESET` | `RESET` | ends a transaction, drops watches and subscriptions, returns to RESP2 and to the default user |
+| `MULTI`, `EXEC`, `DISCARD`, `WATCH key ...`, `UNWATCH` | see [Transactions](#transactions) | |
+| `SUBSCRIBE channel ...`, `UNSUBSCRIBE [channel ...]`, `PSUBSCRIBE pattern ...`, `PUNSUBSCRIBE [pattern ...]` | one confirmation per channel with the number of subscriptions | see [Publish and subscribe](#publish-and-subscribe) |
+| `PUBLISH channel message` | number of receivers | |
+| `PUBSUB CHANNELS [pattern]`, `PUBSUB NUMSUB [channel ...]`, `PUBSUB NUMPAT` | channels with subscribers; subscribers per channel; distinct patterns | |
 | `SELECT 0` | `OK` | only database 0 exists |
 | `CLIENT SETNAME name`, `CLIENT GETNAME`, `CLIENT ID`, `CLIENT SETINFO ...` | | |
 | `COMMAND`, `COMMAND COUNT` | empty array, 0 | for client compatibility |
@@ -275,8 +332,8 @@ Error replies follow Redis: `ERR unknown command '...'`, `ERR wrong number of ar
 memory > 'maxmemory'.` when the server runs with `--no-evict` and is full, and `ERR string exceeds maximum allowed
 size` when key + value exceed the entry limit.
 
-Not supported: lists, hashes, sets, sorted sets, streams, bitmaps, HyperLogLog, transactions (`MULTI`/`EXEC`),
-scripting, pub/sub, cluster mode, replication, keyspace notifications and ACL management commands.
+Not supported: lists, hashes, sets, sorted sets, streams, bitmaps, HyperLogLog, scripting, sharded pub/sub,
+keyspace notifications and the ACL commands that change users (`ACL SETUSER`, `DELUSER`, `SAVE`).
 
 ## 5. Querying with the memcached protocol
 

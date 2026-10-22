@@ -54,8 +54,9 @@ below show where `arenakv` is in the same range, where it is better, and where i
 | Memory layout | log-structured arena per shard | slab allocator | per-object allocation (jemalloc) | per-object allocation (mimalloc) |
 | Eviction | second chance in write order | segmented LRU | approximate LRU / LFU policies | cache mode (2Q-based) |
 | Network transport | TCP, TLS, RDMA reliable connections | TCP, UDP, Unix sockets, TLS | TCP, Unix sockets, TLS | TCP, Unix sockets, TLS |
-| Protocols | memcached text and meta, RESP2, native binary ([PROTOCOL.md](docs/PROTOCOL.md)) | text, meta, binary | RESP2, RESP3 | RESP2, RESP3, memcached text |
+| Protocols | memcached text and meta, RESP2 and RESP3, native binary ([PROTOCOL.md](docs/PROTOCOL.md)) | text, meta, binary | RESP2, RESP3 | RESP2, RESP3, memcached text |
 | Expiry, CAS, conditional stores, increments | yes | yes | yes | yes |
+| Transactions, pub/sub | MULTI/EXEC/WATCH, SUBSCRIBE/PSUBSCRIBE/PUBLISH (RESP) | no | yes | yes |
 | Data types | strings | strings | strings, lists, hashes, sets, sorted sets, streams | as Valkey |
 | Authentication | ACL users with per-user commands, categories and key patterns (subset of the Valkey ACL file syntax) | SASL, ASCII auth | ACL users | ACL users |
 | Persistence | snapshots, append-only log (fsync always, everysec or no), warm restart | warm restart | RDB, AOF | snapshots |
@@ -242,6 +243,7 @@ and clang on x86-64 and arm64.
 | `test_feed` | change feed replayed into a second engine gives the identical state (with eviction, expiry, flush, index-window drops); transaction ids; lock sets under concurrency; warm restart round trip, expiry across the downtime, changed configuration, missing detach, damaged header |
 | `test_aof` | append-only log round trip, rewrites while four threads write, automatic rewrites, torn and zero-filled tails, damage before the end, incomplete transactions, durable sequence numbers |
 | `durability.py` | `SIGKILL` of a writing server with `always` (no acknowledged write lost) and `everysec` (losses only from the last 2 s), `SIGKILL` during a rewrite, warm restart with identical contents |
+| `test_resp_net` | pub/sub over real sockets with four workers: RESP2 and RESP3 frames, patterns, subscriber mode, PUBSUB, removal on close and RESET, disconnection of a slow subscriber, 8 publishers to 64 subscribers; transactions and MSET on concurrent connections are never seen half applied |
 | `test_server` | native protocol round trips, malformed requests, size limits, concurrent clients, shutdown with clients connected; over TCP, and over RDMA when `DUCT_TEST_ADDR` is set |
 
 ## Run the server
@@ -281,6 +283,7 @@ END
 | `--max-conns N`, `--idle-timeout SEC` | unlimited, never | connection limits |
 | `--auth-file FILE` | none | credentials (`user:password` or a password per line), every user with all rights |
 | `--aclfile FILE` | none | users with per-user rights; reloaded by `ACL LOAD` |
+| `--pubsub-output-limit SIZE` | 32M | pending messages of a subscriber before it is disconnected |
 | `--snapshot FILE`, `--save-interval SEC`, `--no-save-on-stop` | none, off, save at stop | snapshots |
 | `--appendonly DIR`, `--appendfsync always\|everysec\|no` | none, everysec | append-only log |
 | `--warm-restart FILE` | none | keep the cache memory (on tmpfs) across restarts |

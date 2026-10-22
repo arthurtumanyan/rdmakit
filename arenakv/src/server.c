@@ -30,6 +30,11 @@
  * Request handling of the native protocol: see akvproto.h. Stores answer with the new CAS version as an
  * 8-byte payload.
  *
+ * Publish/subscribe (pubsub.h): a PUBLISH, on any worker, appends each frame to the inbox of the worker
+ * that serves the subscriber and wakes it through its eventfd when the inbox was empty. The worker moves
+ * the frames to the subscribers' output buffers, finding each connection by id in its subscriber map, and
+ * disconnects a subscriber whose pending output exceeds pubsub_output_limit.
+ *
  * Durability: the engine's change feed goes to the append-only log (aof.h). With fsync policy "always" a
  * connection whose commands changed data in a turn is parked: its replies stay queued and its descriptor
  * is removed from the epoll interest until the log's durable sequence number reaches the last record the
@@ -127,6 +132,13 @@ struct worker {
     size_t nparked;
     size_t parked_cap;
     atomic_int has_parked;
+    unsigned index;
+    /* pub/sub: frames for subscribers (8-byte connection id, 4-byte length, frame), and the subscribers */
+    pthread_mutex_t inbox_lock;
+    struct obuf inbox;
+    struct conn **subs; /* open addressing by connection id; NULL free, SUB_GONE removed */
+    size_t subs_cap;
+    size_t subs_used;
 };
 
 struct akvd {
@@ -148,6 +160,7 @@ struct akvd {
     unsigned next_worker;
     struct srv_counters counters;
     atomic_ullong next_id;
+    atomic_ullong next_txn;
     /* access control: the current list, older lists (still referenced by sessions), the generation */
     _Atomic(acl *) acl;
     acl **retired;
@@ -170,6 +183,7 @@ struct akvd {
     pthread_cond_t saver_cond;
     uint64_t saved_puts;
     aof *aof; /* append-only log, NULL when not configured */
+    pubsub *ps;
 #ifdef AKV_HAVE_TLS
     SSL_CTX *tls;
 #endif
@@ -373,6 +387,16 @@ int akvd_aof_info(akvd *d, aof_info *out) {
     }
     aof_info_get(d->aof, out);
     return 0;
+}
+
+uint64_t akvd_next_txn(akvd *d) {
+    return atomic_fetch_add(&d->next_txn, 1) + 1;
+}
+
+void akvd_txn_end(akvd *d, uint64_t txn) {
+    if (d->aof != NULL) {
+        aof_append_txn_end(d->aof, txn);
+    }
 }
 
 const char *akvd_appendfsync(const akvd *d) {
@@ -599,6 +623,201 @@ static uint64_t mono_s(void) {
     return (uint64_t)ts.tv_sec;
 }
 
+/* ---- pub/sub ------------------------------------------------------------------------------------------ */
+
+static struct conn sub_gone_marker;
+#define SUB_GONE (&sub_gone_marker)
+
+static size_t sub_slot(uint64_t id, size_t cap) {
+    return (size_t)((id * 0x9e3779b97f4a7c15ull) >> 32) & (cap - 1);
+}
+
+static struct conn *sub_find(struct worker *w, uint64_t id) {
+    if (w->subs_cap == 0) {
+        return NULL;
+    }
+    for (size_t i = sub_slot(id, w->subs_cap);; i = (i + 1) & (w->subs_cap - 1)) {
+        struct conn *c = w->subs[i];
+        if (c == NULL) {
+            return NULL;
+        }
+        if (c != SUB_GONE && c->ss.id == id) {
+            return c;
+        }
+    }
+}
+
+/* Adds c to the subscriber map of its worker (idempotent). Returns 0 or -ENOMEM. */
+static int sub_add(struct worker *w, struct conn *c) {
+    if (sub_find(w, c->ss.id) == c) {
+        return 0;
+    }
+    if ((w->subs_used + 1) * 2 > w->subs_cap) {
+        size_t cap = w->subs_cap ? w->subs_cap * 2 : 64;
+        struct conn **tab = calloc(cap, sizeof(*tab));
+        if (tab == NULL) {
+            return -ENOMEM;
+        }
+        size_t used = 0;
+        for (size_t i = 0; i < w->subs_cap; i++) {
+            struct conn *o = w->subs[i];
+            if (o != NULL && o != SUB_GONE) {
+                size_t k = sub_slot(o->ss.id, cap);
+                while (tab[k] != NULL) {
+                    k = (k + 1) & (cap - 1);
+                }
+                tab[k] = o;
+                used++;
+            }
+        }
+        free(w->subs);
+        w->subs = tab;
+        w->subs_cap = cap;
+        w->subs_used = used;
+    }
+    size_t k = sub_slot(c->ss.id, w->subs_cap);
+    while (w->subs[k] != NULL && w->subs[k] != SUB_GONE) {
+        k = (k + 1) & (w->subs_cap - 1);
+    }
+    if (w->subs[k] == NULL) {
+        w->subs_used++;
+    }
+    w->subs[k] = c;
+    return 0;
+}
+
+static void sub_del(struct worker *w, struct conn *c) {
+    for (size_t i = 0; i < w->subs_cap; i++) {
+        if (w->subs[i] == c) {
+            w->subs[i] = SUB_GONE;
+            return;
+        }
+    }
+}
+
+/* pubsub_deliver_fn: appends a frame to the inbox of worker wi and wakes it when the inbox was empty. */
+static int deliver(void *arg, unsigned wi, uint64_t conn_id, const char *frame, size_t n) {
+    akvd *d = arg;
+    struct worker *w = &d->workers[wi];
+    uint8_t h[12];
+    memcpy(h, &conn_id, 8);
+    uint32_t len = (uint32_t)n;
+    memcpy(h + 8, &len, 4);
+    pthread_mutex_lock(&w->inbox_lock);
+    int was_empty = ob_pending(&w->inbox) == 0;
+    int rc = ob_add(&w->inbox, h, sizeof(h)) == 0 && ob_add(&w->inbox, frame, n) == 0 ? 0 : -ENOMEM;
+    pthread_mutex_unlock(&w->inbox_lock);
+    if (rc == 0 && was_empty) {
+        uint64_t one = 1;
+        if (write(w->evfd, &one, sizeof(one)) < 0) {
+            /* the counter cannot overflow; the next wake-up of the worker drains the inbox */
+        }
+    }
+    return rc;
+}
+
+static void conn_free(struct conn *c);
+static int text_write(struct conn *c);
+
+/* Moves the frames of the inbox to the subscribers' output buffers. */
+static void drain_inbox(struct worker *w) {
+    pthread_mutex_lock(&w->inbox_lock);
+    struct obuf in = w->inbox;
+    w->inbox = (struct obuf){0};
+    pthread_mutex_unlock(&w->inbox_lock);
+    akvd *d = w->d;
+    for (size_t off = in.off; off + 12 <= in.len;) {
+        uint64_t id;
+        uint32_t len;
+        memcpy(&id, in.p + off, 8);
+        memcpy(&len, in.p + off + 8, 4);
+        struct conn *c = sub_find(w, id);
+        if (c != NULL && !c->dead && ob_add(&c->out, in.p + off + 12, len) == 0) {
+            if (ob_pending(&c->out) > d->cfg.pubsub_output_limit) {
+                akvd_log(d, AKVD_LOG_WARN,
+                         "closing subscriber %llu: more than %llu bytes of messages pending",
+                         (unsigned long long)id, (unsigned long long)d->cfg.pubsub_output_limit);
+                conn_free(c);
+            } else if (!c->parked) {
+                schedule(w, c); /* a parked connection sends its output when the log is durable */
+            }
+        }
+        off += 12 + len;
+    }
+    ob_free(&in);
+}
+
+int akvd_subscribe(akvd *d, struct session *ss, const char *name, size_t n, int pattern) {
+    struct conn *c = ss->conn;
+    if (c == NULL) {
+        return -ENOTSUP;
+    }
+    int r = pattern ? pubsub_psubscribe(d->ps, name, n, ss->id, c->w->index, ss->proto == 3)
+                    : pubsub_subscribe(d->ps, name, n, ss->id, c->w->index, ss->proto == 3);
+    if (r == 1) {
+        uint8_t h[5] = {(uint8_t)pattern};
+        uint32_t len = (uint32_t)n;
+        memcpy(h + 1, &len, 4);
+        if (sub_add(c->w, c) != 0 || ob_add(&ss->subs, h, 5) != 0 || ob_add(&ss->subs, name, n) != 0) {
+            if (pattern) {
+                pubsub_punsubscribe(d->ps, name, n, ss->id);
+            } else {
+                pubsub_unsubscribe(d->ps, name, n, ss->id);
+            }
+            return -ENOMEM;
+        }
+        ss->nsubs++;
+    }
+    return r;
+}
+
+int akvd_unsubscribe(akvd *d, struct session *ss, const char *name, size_t n, int pattern) {
+    int r =
+        pattern ? pubsub_punsubscribe(d->ps, name, n, ss->id) : pubsub_unsubscribe(d->ps, name, n, ss->id);
+    for (size_t off = 0; r && off < ss->subs.len;) {
+        uint32_t len;
+        memcpy(&len, ss->subs.p + off + 1, 4);
+        if (ss->subs.p[off] == (uint8_t)pattern && len == n && memcmp(ss->subs.p + off + 5, name, n) == 0) {
+            memmove(ss->subs.p + off, ss->subs.p + off + 5 + len, ss->subs.len - off - 5 - len);
+            ss->subs.len -= 5 + len;
+            ss->nsubs--;
+            break;
+        }
+        off += 5 + len;
+    }
+    if (ss->nsubs == 0 && ss->conn != NULL) {
+        sub_del(((struct conn *)ss->conn)->w, ss->conn);
+    }
+    return r;
+}
+
+void akvd_unsubscribe_all(akvd *d, struct session *ss) {
+    for (size_t off = 0; off < ss->subs.len;) {
+        uint32_t len;
+        memcpy(&len, ss->subs.p + off + 1, 4);
+        const char *name = (const char *)ss->subs.p + off + 5;
+        if (ss->subs.p[off]) {
+            pubsub_punsubscribe(d->ps, name, len, ss->id);
+        } else {
+            pubsub_unsubscribe(d->ps, name, len, ss->id);
+        }
+        off += 5 + len;
+    }
+    ob_free(&ss->subs);
+    ss->nsubs = 0;
+    if (ss->conn != NULL) {
+        sub_del(((struct conn *)ss->conn)->w, ss->conn);
+    }
+}
+
+size_t akvd_publish(akvd *d, const char *ch, size_t cn, const char *msg, size_t mn) {
+    return pubsub_publish(d->ps, ch, cn, msg, mn);
+}
+
+pubsub *akvd_pubsub(akvd *d) {
+    return d->ps;
+}
+
 static void unpark_remove(struct worker *w, struct conn *c) {
     for (size_t i = 0; i < w->nparked; i++) {
         if (w->parked[i] == c) {
@@ -615,6 +834,10 @@ static void conn_free(struct conn *c) {
     if (c->parked) {
         unpark_remove(w, c);
     }
+    if (c->ss.nsubs > 0) {
+        akvd_unsubscribe_all(d, &c->ss); /* before the session's buffers, which list the subscriptions */
+    }
+    resp_session_free(&c->ss);
     if (c->kind == CK_NATIVE) {
         if (c->ep != NULL) {
             epoll_ctl(w->epfd, EPOLL_CTL_DEL, c->fd, NULL);
@@ -1479,6 +1702,8 @@ static void adopt(struct worker *w) {
         }
         w->conns = c;
         c->w = w;
+        c->ss.conn = c;
+        c->ss.worker = w->index;
         c->last_active = mono_s();
         if (c->kind == CK_NATIVE) {
             c->fd = duct_ep_direct_fd(c->ep);
@@ -1525,6 +1750,7 @@ static void *worker_main(void *arg) {
                 }
                 adopt(w);
                 unpark_ready(w);
+                drain_inbox(w);
                 continue;
             }
             serve(w, evs[i].data.ptr);
@@ -1551,6 +1777,7 @@ static void *worker_main(void *arg) {
     free(w->parked);
     w->parked = NULL;
     w->nparked = 0;
+    drain_inbox(w);
     while (w->conns != NULL) {
         struct conn *c = w->conns;
         w->conns = c->next; /* unlinked here, so conn_free() has no list to update */
@@ -1801,6 +2028,9 @@ static void free_all(akvd *d) {
             close(w->evfd);
         }
         pthread_mutex_destroy(&w->qlock);
+        pthread_mutex_destroy(&w->inbox_lock);
+        ob_free(&w->inbox);
+        free(w->subs);
         free(w->resp);
     }
     free(d->workers);
@@ -1808,6 +2038,7 @@ static void free_all(akvd *d) {
     if (d->aof != NULL) {
         aof_close(d->aof);
     }
+    pubsub_destroy(d->ps);
     if (d->store != NULL && d->cfg.store.shm_path != NULL) {
         akv_detach(d->store); /* keeps restored memory when the start fails afterwards */
     } else {
@@ -2037,15 +2268,21 @@ akvd *akvd_start(const akvd_config *cfg, int *err) {
         }
         *tfds[i] = fd;
     }
+    if (d->cfg.pubsub_output_limit == 0) {
+        d->cfg.pubsub_output_limit = 32ull << 20;
+    }
+    d->ps = pubsub_create(deliver, d);
     d->stop_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     d->workers = calloc(d->nworkers, sizeof(*d->workers));
-    if (d->stop_fd < 0 || d->workers == NULL) {
+    if (d->stop_fd < 0 || d->workers == NULL || d->ps == NULL) {
         *err = -ENOMEM;
         goto fail;
     }
     for (unsigned i = 0; i < d->nworkers; i++) {
         struct worker *w = &d->workers[i];
         w->d = d;
+        w->index = i;
+        pthread_mutex_init(&w->inbox_lock, NULL);
         w->epfd = epoll_create1(EPOLL_CLOEXEC);
         w->evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
         pthread_mutex_init(&w->qlock, NULL);

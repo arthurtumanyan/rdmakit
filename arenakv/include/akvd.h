@@ -79,6 +79,9 @@ typedef struct akvd_config {
     unsigned aof_rewrite_percentage; /* rewrite when the log grew by this percentage of its base; 0 = off */
     uint64_t aof_rewrite_min_size;   /* ... and is at least this many bytes (default 64 MiB) */
     int aof_load_damaged; /* start with the records before a damaged block (then rewrite) instead of failing */
+    /* Pending replies of a pub/sub subscriber above which it is disconnected; 0 selects 32 MiB, the
+     * pubsub client-output-buffer-limit of Valkey. */
+    uint64_t pubsub_output_limit;
     enum akvd_log_level log_level;
     const char *log_path; /* NULL = standard error */
 } akvd_config;

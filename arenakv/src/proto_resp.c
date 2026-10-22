@@ -1,18 +1,32 @@
 /*
- * proto_resp.c - RESP2 (Redis serialization protocol, version 2), executed on the engine.
+ * proto_resp.c - RESP2 and RESP3 (Redis serialization protocol), executed on the engine.
  *
- * Reference: Redis protocol specification (RESP2) and the Redis command reference. Requests are arrays
- * of bulk strings or inline commands (space-separated words on one line). Implemented commands:
- *   connection   PING ECHO AUTH HELLO (protocol 2 only) QUIT SELECT (database 0) CLIENT (SETNAME GETNAME
- *                ID SETINFO) COMMAND (COUNT DOCS INFO, empty) CONFIG GET (empty)
+ * Reference: Redis protocol specification (RESP2, RESP3) and the Redis command reference. Requests are
+ * arrays of bulk strings or inline commands (space-separated words on one line). A session speaks RESP2
+ * until HELLO 3; RESP3 then changes the reply types of nulls (_), maps (HELLO, CONFIG GET, ACL GETUSER)
+ * and INFO (verbatim string). Implemented commands:
+ *   connection   PING ECHO AUTH HELLO (protocols 2 and 3) QUIT RESET SELECT (database 0) CLIENT (SETNAME
+ *                GETNAME ID SETINFO) COMMAND (COUNT DOCS INFO, empty) CONFIG GET
+ *   transactions MULTI EXEC DISCARD WATCH UNWATCH
+ *   pub/sub      SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE PUBLISH PUBSUB (CHANNELS NUMSUB NUMPAT); a RESP2
+ *                session with subscriptions accepts only these, PING, QUIT and RESET (RESP3 accepts all)
  *   strings      GET SET (EX PX EXAT PXAT NX XX KEEPTTL GET) SETNX SETEX PSETEX GETSET GETDEL GETEX
  *                MGET MSET APPEND STRLEN INCR INCRBY DECR DECRBY
  *   keys         DEL UNLINK EXISTS TYPE EXPIRE PEXPIRE EXPIREAT PEXPIREAT TTL PTTL PERSIST KEYS SCAN
  *   server       DBSIZE FLUSHALL FLUSHDB INFO SAVE BGSAVE LASTSAVE TIME
  * Values are strings; the engine has no other data types (commands of other types answer "unknown
- * command"). Composite commands that read and then write (SET ... GET, GETSET, GETDEL, APPEND on a missing
- * key) are not atomic with respect to concurrent clients. SCAN returns all matching keys in one reply
+ * command"). Composite commands that read and then write (SET ... GET, GETSET, GETDEL, GETEX, APPEND on a missing
+ * key, MSET) run under a lock set on their keys, so they are atomic as in Redis. SCAN returns all matching keys in one reply
  * with cursor 0, which satisfies its guarantees; KEYS and SCAN copy each shard while its lock is held.
+ *
+ * Transactions: commands after MULTI are queued (answered QUEUED). EXEC locks the engine shards of every
+ * key of the queued commands and of the watched keys (all shards when a queued command has no key
+ * positions and uses the engine), compares the CAS versions recorded by WATCH, runs the queue, and
+ * releases the locks: no other client observes or changes those keys in between, so the transaction is
+ * atomic and isolated, and its change records are applied together by the append-only log. As in Valkey,
+ * an unknown or refused command while queueing aborts the transaction (EXECABORT), while a command that
+ * fails during EXEC reports its error in its place and the others still run. WATCH compares CAS
+ * versions: a key that is created and removed again between WATCH and EXEC is not seen as changed.
  */
 #include <ctype.h>
 #include <errno.h>
@@ -91,8 +105,50 @@ static void r_bulk_str(struct obuf *o, const char *s) {
     r_bulk(o, s, strlen(s));
 }
 
+/* RESP protocol of the session whose request is being executed (resp_execute sets it per call). */
+static __thread int tl_resp3;
+
+/* Set while this thread holds an engine lock set for a command (EXEC or a composite command). */
+static __thread int tl_locked;
+
 static void r_null(struct obuf *o) {
-    ob_add(o, "$-1\r\n", 5);
+    if (tl_resp3) {
+        ob_add(o, "_\r\n", 3);
+    } else {
+        ob_add(o, "$-1\r\n", 5);
+    }
+}
+
+/* The null array of RESP2 (an aborted EXEC); RESP3 has one null. */
+/* An out-of-band frame: RESP3 push, RESP2 array (pub/sub confirmations). */
+static void r_push(struct obuf *o, long long n) {
+    ob_printf(o, "%c%lld\r\n", tl_resp3 ? '>' : '*', n);
+}
+
+static void r_null_array(struct obuf *o) {
+    if (tl_resp3) {
+        ob_add(o, "_\r\n", 3);
+    } else {
+        ob_add(o, "*-1\r\n", 5);
+    }
+}
+
+/* A map of n pairs: RESP3 map, RESP2 array of 2n elements. */
+static void r_map(struct obuf *o, long long n) {
+    ob_printf(o, tl_resp3 ? "%%%lld\r\n" : "*%lld\r\n", tl_resp3 ? n : 2 * n);
+}
+
+/* Text for humans (INFO): RESP3 verbatim string of format "txt", RESP2 bulk string. */
+static void r_verbatim(struct obuf *o, const void *p, size_t n) {
+    if (tl_resp3) {
+        ob_printf(o, "=%zu\r\ntxt:", n + 4);
+        ob_add(o, p, n);
+        ob_add(o, "\r\n", 2);
+    } else {
+        ob_printf(o, "$%zu\r\n", n);
+        ob_add(o, p, n);
+        ob_add(o, "\r\n", 2);
+    }
 }
 
 static void r_array(struct obuf *o, long long n) {
@@ -395,7 +451,7 @@ static void cmd_info(akvd *d, struct obuf *o) {
               "warm_restart:%s\r\nwarm_restart_entries:%llu\r\nwarm_restart_rebuild_us:%llu\r\n\r\n"
               "# Stats\r\ntotal_connections_received:%llu\r\nrejected_connections:%llu\r\n"
               "total_commands_processed:%llu\r\nkeyspace_hits:%llu\r\nkeyspace_misses:%llu\r\n"
-              "evicted_keys:%llu\r\nexpired_keys:%llu\r\n\r\n"
+              "evicted_keys:%llu\r\nexpired_keys:%llu\r\npubsub_channels:%zu\r\npubsub_patterns:%zu\r\n\r\n"
               "# Keyspace\r\ndb0:keys=%llu\r\n",
               AKVD_VERSION, (int)getpid(), (unsigned long long)akvd_uptime(d), akvd_threads(d),
               __atomic_load_n(&c->curr_connections, __ATOMIC_RELAXED),
@@ -409,9 +465,10 @@ static void cmd_info(akvd *d, struct obuf *o) {
               (unsigned long long)wi.entries, (unsigned long long)wi.rebuild_us, LD(total_connections),
               LD(rejected_connections), LD(commands), LD(get_hits), LD(get_misses),
               (unsigned long long)(st.evictions + st.index_evictions), (unsigned long long)st.expired,
+              pubsub_channels(akvd_pubsub(d), NULL, 0, NULL, NULL), pubsub_numpat(akvd_pubsub(d)),
               (unsigned long long)st.entries);
 #undef LD
-    r_bulk(o, b.p, b.len);
+    r_verbatim(o, b.p, b.len);
     ob_free(&b);
 }
 
@@ -448,7 +505,7 @@ static void cmd_config_get(akvd *d, const struct arg *pattern, struct obuf *o) {
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
         count += fnmatch(pat, table[i][0], FNM_CASEFOLD) == 0;
     }
-    r_array(o, (long long)count * 2);
+    r_map(o, (long long)count);
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
         if (fnmatch(pat, table[i][0], FNM_CASEFOLD) == 0) {
             r_bulk_str(o, table[i][0]);
@@ -520,6 +577,400 @@ static int resp_permitted(struct session *ss, const struct arg *a, size_t n, str
 }
 
 static void cmd_acl(akvd *d, struct session *ss, struct arg *a, size_t n, struct obuf *o);
+static void dispatch(akvd *d, struct session *ss, struct arg *a, size_t n, struct obuf *o);
+
+/* ---- transactions ------------------------------------------------------------------------------------ */
+
+/* Largest queue of one transaction; beyond it the transaction is refused. */
+#define TXN_MAX_BYTES (64u << 20)
+
+/* Ends a transaction without running it: drops the queue and the watched keys. */
+static void txn_reset(struct session *ss) {
+    ss->in_multi = 0;
+    ss->multi_error = 0;
+    ss->nqueued = 0;
+    ob_free(&ss->queued);
+    ob_free(&ss->watched);
+}
+
+void resp_session_free(struct session *ss) {
+    txn_reset(ss);
+    ob_free(&ss->subs);
+}
+
+/* Queues a command of a transaction (a copy of its arguments) and answers QUEUED. */
+static void queue_command(struct session *ss, const struct arg *a, size_t n, struct obuf *o) {
+    if (acl_cmd_find(ACL_RESP, a[0].p, a[0].n) < 0) {
+        ob_printf(o, "-ERR unknown command '%.*s'\r\n", a[0].n > 64 ? 64 : (int)a[0].n, a[0].p);
+        ss->multi_error = 1;
+        return;
+    }
+    size_t need = 4;
+    for (size_t i = 0; i < n; i++) {
+        need += 4 + a[i].n;
+    }
+    if (ss->queued.len + need > TXN_MAX_BYTES) {
+        r_err(o, "ERR transaction too large");
+        ss->multi_error = 1;
+        return;
+    }
+    uint8_t *p = ob_reserve(&ss->queued, need);
+    if (p == NULL) {
+        r_err(o, "ERR out of memory");
+        ss->multi_error = 1;
+        return;
+    }
+    uint32_t cnt = (uint32_t)n;
+    memcpy(p, &cnt, 4);
+    p += 4;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t len = (uint32_t)a[i].n;
+        memcpy(p, &len, 4);
+        memcpy(p + 4, a[i].p, a[i].n);
+        p += 4 + a[i].n;
+    }
+    ob_commit(&ss->queued, need);
+    ss->nqueued++;
+    r_raw(o, "+QUEUED\r\n");
+}
+
+/* Commands without key positions that do not use the engine; others need every shard locked in EXEC. */
+static int engine_free(const struct arg *c) {
+    static const char *const names[] = {
+        "PING", "ECHO",    "TIME",   "SELECT",   "CLIENT",   "COMMAND",   "HELLO",  "AUTH",
+        "ACL",  "PUBLISH", "PUBSUB", "LASTSAVE", "READONLY", "READWRITE", "BGSAVE", "BGREWRITEAOF"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (is(c, names[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Decodes queued command `off` into args (capacity cap). Returns the argument count; *next the next offset. */
+static size_t queued_args(const struct obuf *q, size_t off, struct arg *args, size_t cap, size_t *next) {
+    uint32_t cnt;
+    memcpy(&cnt, q->p + off, 4);
+    off += 4;
+    for (uint32_t i = 0; i < cnt; i++) {
+        uint32_t len;
+        memcpy(&len, q->p + off, 4);
+        if (i < cap) {
+            args[i] = (struct arg){.p = (const char *)q->p + off + 4, .n = len};
+        }
+        off += 4 + len;
+    }
+    *next = off;
+    return cnt;
+}
+
+static void cmd_exec(akvd *d, struct session *ss, struct obuf *o) {
+    if (!ss->in_multi) {
+        r_err(o, "ERR EXEC without MULTI");
+        return;
+    }
+    if (ss->multi_error) {
+        txn_reset(ss);
+        r_err(o, "EXECABORT Transaction discarded because of previous errors.");
+        return;
+    }
+    akv *s = akvd_store(d);
+    /* Keys of all queued commands and of the watched keys. */
+    size_t cap = 64;
+    size_t nk = 0;
+    const void **keys = malloc(cap * sizeof(*keys));
+    size_t *lens = malloc(cap * sizeof(*lens));
+    struct arg *args = NULL;
+    size_t args_cap = 0;
+    int all = 0;
+    int oom = keys == NULL || lens == NULL;
+    for (size_t off = 0; off < ss->queued.len && !oom;) {
+        uint32_t cnt;
+        memcpy(&cnt, ss->queued.p + off, 4);
+        if (cnt > args_cap) {
+            struct arg *na = realloc(args, cnt * sizeof(*na));
+            if (na == NULL) {
+                oom = 1;
+                break;
+            }
+            memset(na, 0, cnt * sizeof(*na)); /* queued_args() fills it; zeroed so every element is defined */
+            args = na;
+            args_cap = cnt;
+        }
+        size_t n = queued_args(&ss->queued, off, args, args_cap, &off);
+        if (n == 0 || args == NULL) {
+            continue; /* queue_command() never stores a command without arguments */
+        }
+        int id = acl_cmd_find(ACL_RESP, args[0].p, args[0].n);
+        const acl_cmd *k = id >= 0 ? acl_cmd_at((unsigned)id) : NULL;
+        if (k == NULL || k->first == 0) {
+            all |= !engine_free(&args[0]);
+            continue;
+        }
+        long last = k->last < 0 ? (long)n + k->last : k->last;
+        for (long i = k->first; i <= last && (size_t)i < n && (size_t)i < args_cap && !oom; i += k->step) {
+            if (nk == cap) {
+                cap *= 2;
+                const void **nkeys = realloc(keys, cap * sizeof(*keys));
+                size_t *nlens = nkeys != NULL ? realloc(lens, cap * sizeof(*lens)) : NULL;
+                if (nkeys != NULL) {
+                    keys = nkeys;
+                }
+                if (nlens == NULL) {
+                    oom = 1;
+                    break;
+                }
+                lens = nlens;
+            }
+            keys[nk] = args[i].p;
+            lens[nk++] = args[i].n;
+        }
+    }
+    for (size_t off = 0; off < ss->watched.len && !oom;) {
+        size_t klen = (size_t)(ss->watched.p[off + 8] | (ss->watched.p[off + 9] << 8));
+        if (nk == cap) {
+            cap *= 2;
+            const void **nkeys = realloc(keys, cap * sizeof(*keys));
+            size_t *nlens = nkeys != NULL ? realloc(lens, cap * sizeof(*lens)) : NULL;
+            if (nkeys != NULL) {
+                keys = nkeys;
+            }
+            if (nlens == NULL) {
+                oom = 1;
+                break;
+            }
+            lens = nlens;
+        }
+        keys[nk] = ss->watched.p + off + 10;
+        lens[nk++] = klen;
+        off += 10 + klen;
+    }
+    if (oom) {
+        free(keys);
+        free(lens);
+        free(args);
+        txn_reset(ss);
+        r_err(o, "EXECABORT out of memory");
+        return;
+    }
+    uint64_t txn = akvd_next_txn(d);
+    akv_lockset set;
+    if (all) {
+        akv_lock_all(s, txn, &set);
+    } else {
+        akv_lock_keys(s, keys, lens, nk, txn, &set);
+    }
+    int changed = 0;
+    for (size_t off = 0; off < ss->watched.len && !changed;) {
+        uint64_t cas;
+        memcpy(&cas, ss->watched.p + off, 8);
+        size_t klen = (size_t)(ss->watched.p[off + 8] | (ss->watched.p[off + 9] << 8));
+        changed = akv_cas_of(s, ss->watched.p + off + 10, klen) != cas;
+        off += 10 + klen;
+    }
+    if (changed) {
+        akv_unlock(s, &set);
+        r_null_array(o);
+    } else {
+        unsigned nq = ss->nqueued;
+        ss->in_multi = 0; /* the queued commands run as commands */
+        tl_locked = 1;
+        r_array(o, nq);
+        for (size_t off = 0; off < ss->queued.len;) {
+            uint32_t cnt;
+            memcpy(&cnt, ss->queued.p + off, 4);
+            if (cnt > args_cap) {
+                struct arg *na = realloc(args, cnt * sizeof(*na));
+                if (na == NULL) {
+                    break; /* sized for the largest command above */
+                }
+                args = na;
+                args_cap = cnt;
+            }
+            size_t n = queued_args(&ss->queued, off, args, args_cap, &off);
+            dispatch(d, ss, args, n, o);
+        }
+        akvd_txn_end(d, txn);
+        tl_locked = 0;
+        akv_unlock(s, &set);
+    }
+    free(keys);
+    free(lens);
+    free(args);
+    txn_reset(ss);
+}
+
+/* ---- pub/sub ------------------------------------------------------------------------------------------ */
+
+/* Replies to (P)SUBSCRIBE and (P)UNSUBSCRIBE: one frame per channel with the session's subscription count. */
+static void sub_reply(struct obuf *o, const char *kind, const char *name, size_t n, unsigned count) {
+    r_push(o, 3);
+    r_bulk_str(o, kind);
+    if (name != NULL) {
+        r_bulk(o, name, n);
+    } else {
+        r_null(o);
+    }
+    r_int(o, count);
+}
+
+static void cmd_subscribe(akvd *d, struct session *ss, struct arg *a, size_t n, int pattern, struct obuf *o) {
+    if (n < 2) {
+        r_arity(o, &a[0]);
+        return;
+    }
+    for (size_t i = 1; i < n; i++) {
+        if (ss->user != NULL && !acl_unrestricted(ss->user) &&
+            !(pattern ? acl_channel_pattern_allowed(ss->user, a[i].p, a[i].n)
+                      : acl_channel_allowed(ss->user, a[i].p, a[i].n))) {
+            r_err(o, "NOPERM No permissions to access a channel");
+            return;
+        }
+    }
+    for (size_t i = 1; i < n; i++) {
+        int r = akvd_subscribe(d, ss, a[i].p, a[i].n, pattern);
+        if (r < 0) {
+            r_err(o, r == -ENOTSUP ? "ERR pub/sub needs a connection" : "ERR out of memory");
+            return;
+        }
+        sub_reply(o, pattern ? "psubscribe" : "subscribe", a[i].p, a[i].n, ss->nsubs);
+    }
+}
+
+static void cmd_unsubscribe(akvd *d, struct session *ss, struct arg *a, size_t n, int pattern,
+                            struct obuf *o) {
+    const char *kind = pattern ? "punsubscribe" : "unsubscribe";
+    if (n >= 2) {
+        for (size_t i = 1; i < n; i++) {
+            akvd_unsubscribe(d, ss, a[i].p, a[i].n, pattern);
+            sub_reply(o, kind, a[i].p, a[i].n, ss->nsubs);
+        }
+        return;
+    }
+    /* All channels (or patterns) of the session; one frame with a null name when there are none. */
+    unsigned sent = 0;
+    for (;;) {
+        size_t off = 0;
+        const char *name = NULL;
+        uint32_t len = 0;
+        while (off < ss->subs.len) {
+            memcpy(&len, ss->subs.p + off + 1, 4);
+            if (ss->subs.p[off] == (uint8_t)pattern) {
+                name = (const char *)ss->subs.p + off + 5;
+                break;
+            }
+            off += 5 + len;
+        }
+        if (name == NULL) {
+            break;
+        }
+        char *copy = malloc(len > 0 ? len : 1);
+        if (copy == NULL) {
+            r_err(o, "ERR out of memory");
+            return;
+        }
+        memcpy(copy, name, len);
+        akvd_unsubscribe(d, ss, name, len, pattern);
+        sub_reply(o, kind, copy, len, ss->nsubs);
+        free(copy);
+        sent++;
+    }
+    if (sent == 0) {
+        sub_reply(o, kind, NULL, 0, ss->nsubs);
+    }
+}
+
+struct chan_list {
+    struct obuf b;
+    unsigned n;
+};
+
+static int add_channel(void *arg, const char *ch, size_t n) {
+    struct chan_list *l = arg;
+    r_bulk(&l->b, ch, n);
+    l->n++;
+    return 0;
+}
+
+static void cmd_pubsub(akvd *d, struct arg *a, size_t n, struct obuf *o) {
+    pubsub *ps = akvd_pubsub(d);
+    if (n >= 2 && is(&a[1], "CHANNELS") && n <= 3) {
+        struct chan_list l = {0};
+        pubsub_channels(ps, n == 3 ? a[2].p : NULL, n == 3 ? a[2].n : 0, add_channel, &l);
+        r_array(o, l.n);
+        ob_add(o, l.b.p, l.b.len);
+        ob_free(&l.b);
+    } else if (n >= 2 && is(&a[1], "NUMSUB")) {
+        r_map(o, (long long)n - 2);
+        for (size_t i = 2; i < n; i++) {
+            r_bulk(o, a[i].p, a[i].n);
+            r_int(o, (long long)pubsub_numsub(ps, a[i].p, a[i].n));
+        }
+    } else if (n == 2 && is(&a[1], "NUMPAT")) {
+        r_int(o, (long long)pubsub_numpat(ps));
+    } else {
+        r_err(o, "ERR unknown subcommand or wrong number of arguments for 'pubsub'");
+    }
+}
+
+/* RESP2 subscriber mode: the commands a session with subscriptions may still send. */
+static int allowed_while_subscribed(const struct arg *c) {
+    return is(c, "SUBSCRIBE") || is(c, "PSUBSCRIBE") || is(c, "UNSUBSCRIBE") || is(c, "PUNSUBSCRIBE") ||
+           is(c, "PING") || is(c, "QUIT") || is(c, "RESET");
+}
+
+/* Commands made of several engine operations on their keys (see the file comment). */
+static int composite(const struct arg *a, size_t n) {
+    const struct arg *c = &a[0];
+    if (n < 3) {
+        return 0; /* no key and value: the command reports its arity error */
+    }
+    if (is(c, "GETSET") || is(c, "GETDEL") || is(c, "GETEX") || is(c, "APPEND") || (is(c, "MSET") && n > 3)) {
+        return 1;
+    }
+    if (is(c, "SET")) {
+        for (size_t i = 3; i < n; i++) {
+            if (is(&a[i], "GET")) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Runs a composite command with the shards of its keys locked and its change records grouped. */
+static void run_locked(akvd *d, struct session *ss, struct arg *a, size_t n, struct obuf *o) {
+    akv *s = akvd_store(d);
+    const void *keys[64];
+    size_t lens[64];
+    size_t nk = 0;
+    int all = 0;
+    if (is(&a[0], "MSET")) {
+        for (size_t i = 1; i < n; i += 2) {
+            if (nk == 64) {
+                all = 1; /* many keys: every shard */
+                break;
+            }
+            keys[nk] = a[i].p;
+            lens[nk++] = a[i].n;
+        }
+    } else {
+        keys[nk] = a[1].p;
+        lens[nk++] = a[1].n;
+    }
+    uint64_t txn = akvd_next_txn(d);
+    akv_lockset set;
+    if (all) {
+        akv_lock_all(s, txn, &set);
+    } else {
+        akv_lock_keys(s, keys, lens, nk, txn, &set);
+    }
+    tl_locked = 1;
+    dispatch(d, ss, a, n, o);
+    tl_locked = 0;
+    akvd_txn_end(d, txn);
+    akv_unlock(s, &set);
+}
 
 static void dispatch(akvd *d, struct session *ss, struct arg *a, size_t n, struct obuf *o) {
     akv *s = akvd_store(d);
@@ -533,7 +984,33 @@ static void dispatch(akvd *d, struct session *ss, struct arg *a, size_t n, struc
         r_err(o, "ERR the user of this connection was removed or disabled");
         return;
     }
+    if (ss->nsubs > 0 && ss->proto != 3 && !allowed_while_subscribed(c)) {
+        char name[64];
+        lower_name(c, name, sizeof(name));
+        ob_printf(o,
+                  "-ERR Can't execute '%s': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are "
+                  "allowed in this context\r\n",
+                  name);
+        return;
+    }
+    if (ss->nsubs > 0 && ss->proto != 3 && is(c, "PING")) {
+        r_array(o, 2);
+        r_bulk_str(o, "pong");
+        r_bulk(o, n >= 2 ? a[1].p : "", n >= 2 ? a[1].n : 0);
+        return;
+    }
+    int in_queue = ss->in_multi && !is(c, "EXEC") && !is(c, "DISCARD") && !is(c, "MULTI") &&
+                   !is(c, "WATCH") && !is(c, "QUIT") && !is(c, "RESET");
     if (!resp_permitted(ss, a, n, o)) {
+        ss->multi_error |= in_queue;
+        return;
+    }
+    if (in_queue) {
+        queue_command(ss, a, n, o);
+        return;
+    }
+    if (!tl_locked && composite(a, n)) {
+        run_locked(d, ss, a, n, o);
         return;
     }
     if (is(c, "GET")) {
@@ -803,8 +1280,8 @@ static void dispatch(akvd *d, struct session *ss, struct arg *a, size_t n, struc
             r_err(o, "WRONGPASS invalid username-password pair or user is disabled.");
         }
     } else if (is(c, "HELLO")) {
-        long long ver = 2;
-        if (n >= 2 && (arg_ll(&a[1], &ver) != 0 || ver != 2)) {
+        long long ver = ss->proto == 3 ? 3 : 2;
+        if (n >= 2 && (arg_ll(&a[1], &ver) != 0 || (ver != 2 && ver != 3))) {
             r_err(o, "NOPROTO unsupported protocol version");
             return;
         }
@@ -834,13 +1311,15 @@ static void dispatch(akvd *d, struct session *ss, struct arg *a, size_t n, struc
                   "RESP protocol version at the same time");
             return;
         }
-        r_array(o, 14);
+        ss->proto = (int)ver;
+        tl_resp3 = ver == 3;
+        r_map(o, 7);
         r_bulk_str(o, "server");
         r_bulk_str(o, "arenakv");
         r_bulk_str(o, "version");
         r_bulk_str(o, AKVD_VERSION);
         r_bulk_str(o, "proto");
-        r_int(o, 2);
+        r_int(o, ver);
         r_bulk_str(o, "id");
         r_int(o, (long long)ss->id);
         r_bulk_str(o, "mode");
@@ -918,6 +1397,75 @@ static void dispatch(akvd *d, struct session *ss, struct arg *a, size_t n, struc
         }
     } else if (is(c, "ACL")) {
         cmd_acl(d, ss, a, n, o);
+    } else if (is(c, "SUBSCRIBE") || is(c, "PSUBSCRIBE")) {
+        cmd_subscribe(d, ss, a, n, is(c, "PSUBSCRIBE"), o);
+    } else if (is(c, "UNSUBSCRIBE") || is(c, "PUNSUBSCRIBE")) {
+        cmd_unsubscribe(d, ss, a, n, is(c, "PUNSUBSCRIBE"), o);
+    } else if (is(c, "PUBLISH")) {
+        if (n != 3) {
+            r_arity(o, c);
+        } else if (ss->user != NULL && !acl_unrestricted(ss->user) &&
+                   !acl_channel_allowed(ss->user, a[1].p, a[1].n)) {
+            r_err(o, "NOPERM No permissions to access a channel");
+        } else {
+            r_int(o, (long long)akvd_publish(d, a[1].p, a[1].n, a[2].p, a[2].n));
+        }
+    } else if (is(c, "PUBSUB")) {
+        cmd_pubsub(d, a, n, o);
+    } else if (is(c, "MULTI")) {
+        if (n != 1) {
+            r_arity(o, c);
+        } else if (ss->in_multi) {
+            r_err(o, "ERR MULTI calls can not be nested");
+        } else {
+            ss->in_multi = 1;
+            ss->multi_error = 0;
+            ss->queued.len = ss->queued.off = 0;
+            ss->nqueued = 0;
+            r_ok(o);
+        }
+    } else if (is(c, "EXEC")) {
+        cmd_exec(d, ss, o);
+    } else if (is(c, "DISCARD")) {
+        if (!ss->in_multi) {
+            r_err(o, "ERR DISCARD without MULTI");
+        } else {
+            txn_reset(ss);
+            r_ok(o);
+        }
+    } else if (is(c, "WATCH")) {
+        if (ss->in_multi) {
+            r_err(o, "ERR WATCH inside MULTI is not allowed");
+        } else if (n < 2) {
+            r_arity(o, c);
+        } else {
+            for (size_t i = 1; i < n; i++) {
+                uint8_t h[10];
+                uint64_t cas = akv_cas_of(s, a[i].p, a[i].n);
+                memcpy(h, &cas, 8);
+                h[8] = (uint8_t)a[i].n;
+                h[9] = (uint8_t)(a[i].n >> 8);
+                if (a[i].n > 0xffff || ob_add(&ss->watched, h, 10) != 0 ||
+                    ob_add(&ss->watched, a[i].p, a[i].n) != 0) {
+                    r_err(o, "ERR invalid key or out of memory");
+                    return;
+                }
+            }
+            r_ok(o);
+        }
+    } else if (is(c, "UNWATCH")) {
+        ss->watched.len = ss->watched.off = 0;
+        r_ok(o);
+    } else if (is(c, "RESET")) {
+        txn_reset(ss);
+        if (ss->nsubs > 0) {
+            akvd_unsubscribe_all(d, ss);
+        }
+        ss->proto = 2;
+        tl_resp3 = 0;
+        ss->name[0] = '\0';
+        akvd_session_init(d, ss);
+        r_raw(o, "+RESET\r\n");
     } else if (is(c, "BGREWRITEAOF")) {
         int rc = akvd_aof_rewrite(d);
         if (rc == 0) {
@@ -1042,6 +1590,7 @@ static ssize_t parse_array(akvd *d, const uint8_t *p, size_t left, size_t *nargs
 
 size_t resp_execute(akvd *d, struct session *ss, const uint8_t *in, size_t len, struct obuf *out) {
     size_t used = 0;
+    tl_resp3 = ss->proto == 3;
     while (used < len && !ss->close && ob_pending(out) <= OB_SOFT_LIMIT) {
         size_t nargs = 0;
         ssize_t n = in[used] == '*' ? parse_array(d, in + used, len - used, &nargs)
@@ -1096,7 +1645,7 @@ static void acl_getuser(const acl_user *u, struct obuf *o) {
             ob_printf(&cmds, "%s%s", cmds.len ? " " : "", tok);
         }
     }
-    r_array(o, 10);
+    r_map(o, 5);
     r_bulk_str(o, "flags");
     r_array(o, nflags);
     ob_add(o, flags.p, flags.len);

@@ -17,6 +17,7 @@
 #include "akvd.h"
 #include "acl.h"
 #include "aof.h"
+#include "pubsub.h"
 
 /* Growable output buffer. Bytes [off, len) are pending. */
 struct obuf {
@@ -58,7 +59,23 @@ struct session {
     size_t swallow;   /* memcached: bytes of an oversized data block still to be discarded */
     char name[64];    /* RESP CLIENT SETNAME */
     uint64_t id;      /* connection number (RESP CLIENT ID) */
+    int proto;        /* RESP protocol version: 2 (also when 0) or 3 (HELLO 3) */
+    /* RESP transactions: MULTI ... EXEC */
+    int in_multi;
+    int multi_error; /* a command was refused while queueing: EXEC answers EXECABORT */
+    struct obuf
+        queued; /* queued commands: 4-byte argument count, then 4-byte length and bytes per argument */
+    unsigned nqueued;
+    struct obuf watched; /* WATCH: 8-byte CAS version (0 = absent), 2-byte key length, key */
+    /* pub/sub: the connection that owns the session (NULL when driven without one) and its worker */
+    void *conn;
+    unsigned worker;
+    struct obuf subs; /* subscriptions: 1-byte kind (0 channel, 1 pattern), 4-byte length, name */
+    unsigned nsubs;
 };
+
+/* Frees the buffers of a session (transaction queue, watched keys). */
+void resp_session_free(struct session *ss);
 
 /* Server statistics updated by all threads. */
 struct srv_counters {
@@ -144,8 +161,35 @@ uint64_t akvd_uptime(const akvd *d);
 /* Number of worker threads. */
 unsigned akvd_threads(const akvd *d);
 
+/* A new transaction id (non-zero) for the change records of one EXEC. */
+uint64_t akvd_next_txn(akvd *d);
+
+/*
+ * Marks the end of transaction txn in the append-only log (and, later, the replication stream), so that
+ * its changes are applied together or not at all. Called while the transaction's lock set is held.
+ */
+void akvd_txn_end(akvd *d, uint64_t txn);
+
 /* State of the append-only log. Returns 0, or -EINVAL when no log is configured. */
 int akvd_aof_info(akvd *d, aof_info *out);
+
+/*
+ * Subscribes the session to a channel (pattern = 0) or a channel pattern. Returns 1 when added, 0 when
+ * already subscribed, -ENOTSUP for a session without a connection, or -ENOMEM.
+ */
+int akvd_subscribe(akvd *d, struct session *ss, const char *name, size_t n, int pattern);
+
+/* Removes a subscription. Returns 1 when it existed. */
+int akvd_unsubscribe(akvd *d, struct session *ss, const char *name, size_t n, int pattern);
+
+/* Removes every subscription of the session. */
+void akvd_unsubscribe_all(akvd *d, struct session *ss);
+
+/* Publishes msg on channel ch. Returns the number of receivers. */
+size_t akvd_publish(akvd *d, const char *ch, size_t cn, const char *msg, size_t mn);
+
+/* The pub/sub registry (PUBSUB CHANNELS, NUMSUB, NUMPAT). */
+pubsub *akvd_pubsub(akvd *d);
 
 /* fsync policy of the append-only log as Valkey names it ("always", "everysec", "no"). */
 const char *akvd_appendfsync(const akvd *d);

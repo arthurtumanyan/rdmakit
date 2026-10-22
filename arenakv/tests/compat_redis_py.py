@@ -34,6 +34,38 @@ def main():
     checks.append(("delete", r.delete("k1", "k2", "missing") == 2))
     checks.append(("info", "db0" in r.info()))
     checks.append(("config get", r.config_get("maxmemory").get("maxmemory", "0") != "0"))
+
+    tx = r.pipeline(transaction=True)
+    tx.set("tx", 1)
+    tx.incr("tx")
+    tx.get("tx")
+    checks.append(("multi/exec", tx.execute() == [True, 2, b"2"]))
+    other = redis.Redis(host="127.0.0.1", port=int(sys.argv[1]), socket_timeout=5)
+    watch_error = False
+    with r.pipeline() as w:
+        w.watch("w")
+        other.set("w", "changed")
+        w.multi()
+        w.set("w", "mine")
+        try:
+            w.execute()
+        except redis.WatchError:
+            watch_error = True
+    checks.append(("watch conflict", watch_error and r.get("w") == b"changed"))
+
+    ps = r.pubsub()
+    ps.subscribe("chan")
+    confirm = ps.get_message(timeout=2)
+    delivered = other.publish("chan", "hi")
+    msg = ps.get_message(timeout=2)
+    checks.append(("pubsub", confirm is not None and confirm["type"] == "subscribe" and delivered == 1 and
+                   msg is not None and msg["type"] == "message" and msg["data"] == b"hi"))
+    ps.close()
+
+    if int(redis.__version__.split(".")[0]) >= 5:
+        r3 = redis.Redis(host="127.0.0.1", port=int(sys.argv[1]), socket_timeout=5, protocol=3)
+        checks.append(("resp3", r3.set("r3", "v") and r3.get("r3") == b"v" and r3.get("absent3") is None and
+                       isinstance(r3.config_get("maxmemory"), dict)))
     for name, ok in checks:
         if not ok:
             print(f"failed: {name}")

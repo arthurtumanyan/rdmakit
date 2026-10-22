@@ -408,6 +408,7 @@ reason 1, key length 2, client flags 4, value length 4, absolute expiry in Unix 
 | `keyspace_hits`, `keyspace_misses` | reads of all protocols that found / did not find the key |
 | `evicted_keys` | entries removed to make room (including removals from a full index window) |
 | `expired_keys` | entries removed because their expiry passed |
+| `pubsub_channels`, `pubsub_patterns` | channels with subscribers, distinct subscribed patterns |
 | `db0:keys` | entries, including expired ones not yet reclaimed |
 
 ### memcached stats fields
@@ -499,9 +500,11 @@ snapshot writes, TLS files that cannot be loaded.
 
 ## Compatibility notes
 
-- RESP: string commands only; no lists, hashes, sets, streams, scripting, transactions (`MULTI`), pub/sub or
-  cluster mode. `HELLO 3` (RESP3) is answered with `NOPROTO`, which clients treat as "use RESP2". `SET ... GET`,
-  `GETSET`, `GETDEL` and `APPEND` on a missing key are not atomic with respect to concurrent clients.
+- RESP: string commands only; no lists, hashes, sets, streams, scripting or keyspace notifications. RESP2 and
+  RESP3 (`HELLO 3`); transactions and pub/sub as in Valkey, with two differences: a command whose arguments are
+  invalid is reported inside the `EXEC` reply rather than aborting the transaction when it is queued (unknown and
+  refused commands do abort it), and `WATCH` compares CAS versions, so a key created and removed again between
+  `WATCH` and `EXEC` does not abort the transaction. Sharded pub/sub (`SSUBSCRIBE`) is not provided.
 - memcached: no binary protocol, no delayed `flush_all`, no meta flags `b`, `I`, `E` and no `N` on `mg`. `version`
   reports `1.6.0-arenakv-<version>` (the protocol level of the meta commands).
 - Verified clients (`make compat`, needs Docker): valkey-cli, valkey-benchmark, memtier_benchmark (RESP and memcached

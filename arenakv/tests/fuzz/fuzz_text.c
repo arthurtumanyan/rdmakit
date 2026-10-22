@@ -60,6 +60,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t n) {
     }
     ob_free(&in);
     ob_free(&out);
+    resp_session_free(&ss); /* transaction queue and watched keys */
     akv_flush(akvd_store(d));
     return 0;
 }

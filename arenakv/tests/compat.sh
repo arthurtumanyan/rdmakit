@@ -1,9 +1,10 @@
 #!/bin/bash
 # Compatibility of arenakvd with third-party clients, run in containers on the host network:
-#   valkey-cli         basic commands, expiry, INFO, pipelined input (valkey/valkey image)
+#   valkey-cli         basic commands, expiry, INFO, RESP3, MULTI/EXEC, pipelined input (valkey/valkey image)
 #   valkey-benchmark   SET/GET/INCR/MSET with pipelining (-P 16) and 50 connections
 #   memtier_benchmark  RESP and memcached text protocol, 4 threads x 8 connections, pipeline 4
-#   redis-py           when the Python package `redis` is installed on the host
+#   redis-py           when the Python package `redis` is installed on the host: commands, pipelines,
+#                      transactions and WATCH, pub/sub, RESP3 with redis-py 5 or newer
 #
 #   tests/compat.sh BUILD_DIR
 #
@@ -48,6 +49,11 @@ check "valkey-cli INCRBY" "15" "$(cli SET n 10 >/dev/null; cli INCRBY n 5)"
 check "valkey-cli MGET" "hello 15" "$(cli MGET greeting n | tr '\n' ' ' | sed 's/ $//')"
 check "valkey-cli DEL / EXISTS" "2 0" "$(cli DEL greeting n) $(cli EXISTS greeting)"
 check "valkey-cli INFO keyspace" "1" "$(cli INFO | grep -c '^db0:keys=')"
+check "valkey-cli -3 (RESP3) map and null" "maxmemory-policy allkeys-lru (nil)" \
+    "$(cli -3 --no-raw CONFIG GET maxmemory-policy | tr '\n' ' ' | sed 's/^1# //; s/ => / /; s/"//g; s/ $//') $(cli -3 --no-raw GET absent)"
+check "valkey-cli MULTI/EXEC" "OK QUEUED QUEUED 1 2" \
+    "$(printf 'MULTI\nINCR tx\nINCR tx\nEXEC\n' | docker run --rm -i --network host "$VALKEY" valkey-cli -p "$port_resp" 2>&1 |
+        tr '\n' ' ' | sed 's/[0-9]) //g; s/(integer) //g; s/ $//')"
 check "valkey-cli pipe" "3" "$(printf 'SET p1 a\r\nSET p2 b\r\nSET p3 c\r\n' |
     docker run --rm -i --network host "$VALKEY" valkey-cli -p "$port_resp" --pipe 2>&1 |
     sed -n 's/.*replies: \([0-9]*\).*/\1/p')"

@@ -848,6 +848,16 @@ int acl_channel_allowed(const acl_user *u, const void *ch, size_t n) {
     return 0;
 }
 
+int acl_channel_pattern_allowed(const acl_user *u, const void *pat, size_t n) {
+    for (size_t i = 0; i < u->nchans; i++) {
+        if ((u->chans[i].n == 1 && u->chans[i].p[0] == '*') ||
+            (u->chans[i].n == n && memcmp(u->chans[i].p, pat, n) == 0)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 size_t acl_describe(const acl_user *u, char *out, size_t cap) {
     size_t len = 0;
 #define PUT(...)                                                                                             \

@@ -6,6 +6,9 @@
  * the replies must be identical to those of the whole buffer (incremental parsing). A random fuzz feeds
  * one million inputs mixing valid commands, mutations and noise; the modules must consume no more than
  * offered, never crash (run under the sanitizers as well) and keep the engine consistent.
+ * RESP3 reply types after HELLO 3. Transactions: queued commands, EXECABORT after a refused command, errors
+ * of single commands inside EXEC, WATCH conflicts from another session, nesting errors, a queue that needs
+ * every shard locked.
  * Access control: users of an ACL file with command, category and key restrictions in all three
  * protocols, the ACL subcommands, and ACL LOAD (disabled users lose their connection, a damaged file is
  * refused and the old rules stay in force).
@@ -56,6 +59,7 @@ static char *feed(akvd *d, exec_fn fn, struct session *ss, const char *in, size_
 static char *run(akvd *d, exec_fn fn, const char *in, const char *want, int authed) {
     struct session s1 = {.authed = authed};
     char *whole = feed(d, fn, &s1, in, strlen(in), 0);
+    resp_session_free(&s1);
     if (want != NULL) {
         EXPECT(strcmp(whole, want) == 0, "request %.60s\n  got  [%s]\n  want [%s]", in, whole, want);
     }
@@ -67,6 +71,7 @@ static void run2(akvd *d, exec_fn fn, const char *in, const char *want) {
     char *a = run(d, fn, in, want, 1);
     struct session s2 = {.authed = 1};
     char *b = feed(d, fn, &s2, in, strlen(in), 1);
+    resp_session_free(&s2);
     EXPECT(strcmp(a, b) == 0, "incremental feed differs for %.60s\n  whole [%s]\n  bytes [%s]", in, a, b);
     free(a);
     free(b);
@@ -217,7 +222,7 @@ static void test_resp(akvd *d) {
     run2(d, r, "GET\r\n", "-ERR wrong number of arguments for 'GET' command\r\n");
     run2(d, r, "FOO bar\r\n", "-ERR unknown command 'FOO'\r\n");
     run2(d, r, "SELECT 0\r\nSELECT 1\r\n", "+OK\r\n-ERR DB index is out of range\r\n");
-    run2(d, r, "HELLO 3\r\n", "-NOPROTO unsupported protocol version\r\n");
+    run2(d, r, "HELLO 4\r\n", "-NOPROTO unsupported protocol version\r\n");
     free(run(d, r, "FLUSHALL\r\nSET k1 v\r\nSET k2 v\r\nSET x v\r\nDBSIZE\r\n",
              "+OK\r\n+OK\r\n+OK\r\n+OK\r\n:3\r\n", 1));
     x = run(d, r, "KEYS k*\r\n", NULL, 1);
@@ -352,6 +357,67 @@ static void write_text(const char *path, const char *text) {
     fclose(f);
 }
 
+static void test_resp3_and_transactions(akvd *d) {
+    exec_fn r = resp_execute;
+    akv_flush(akvd_store(d));
+    struct session s3 = {.authed = 1};
+    char *hello = feed(d, r, &s3, "HELLO 3\r\n", 9, 0);
+    EXPECT(strncmp(hello, "%7\r\n$6\r\nserver\r\n", strlen("%7\r\n$6\r\nserver\r\n")) == 0 &&
+               strstr(hello, "$5\r\nproto\r\n:3\r\n") != NULL,
+           "HELLO 3 answers a map: %s", hello);
+    free(hello);
+    sess(d, r, &s3, "GET absent\r\n", "_\r\n");
+    sess(d, r, &s3, "CONFIG GET maxmemory-policy\r\n",
+         "%1\r\n$16\r\nmaxmemory-policy\r\n$11\r\nallkeys-lru\r\n");
+    char *info = feed(d, r, &s3, "INFO\r\n", 6, 0);
+    EXPECT(info[0] == '=' && strstr(info, "\r\ntxt:# Server") != NULL, "INFO is a verbatim string in RESP3");
+    free(info);
+    free(feed(d, r, &s3, "HELLO 2\r\n", 9, 0));
+    sess(d, r, &s3, "GET absent\r\n", "$-1\r\n"); /* HELLO 2 switches back (its reply was read above) */
+    resp_session_free(&s3);
+
+    free(run(d, r, "MULTI\r\nSET t1 a\r\nINCR c\r\nGET t1\r\nEXEC\r\n",
+             "+OK\r\n+QUEUED\r\n+QUEUED\r\n+QUEUED\r\n*3\r\n+OK\r\n:1\r\n$1\r\na\r\n", 1));
+    free(run(d, r, "MULTI\r\nNOSUCH\r\nSET x 1\r\nEXEC\r\nEXISTS x\r\n",
+             "+OK\r\n-ERR unknown command 'NOSUCH'\r\n+QUEUED\r\n-EXECABORT Transaction discarded because of "
+             "previous "
+             "errors.\r\n:0\r\n",
+             1));
+    free(run(d, r, "MULTI\r\nSET s abc\r\nINCR s\r\nGET s\r\nEXEC\r\n",
+             "+OK\r\n+QUEUED\r\n+QUEUED\r\n+QUEUED\r\n*3\r\n+OK\r\n-ERR value is not an integer or out of "
+             "range\r\n$3\r\nabc\r\n",
+             1));
+    run2(d, r, "EXEC\r\nDISCARD\r\n", "-ERR EXEC without MULTI\r\n-ERR DISCARD without MULTI\r\n");
+    free(run(d, r, "MULTI\r\nMULTI\r\nWATCH k\r\nDISCARD\r\n",
+             "+OK\r\n-ERR MULTI calls can not be nested\r\n-ERR WATCH inside MULTI is not allowed\r\n+OK\r\n",
+             1));
+    free(run(d, r, "MULTI\r\nSET a 1\r\nDBSIZE\r\nFLUSHALL\r\nDBSIZE\r\nEXEC\r\n",
+             "+OK\r\n+QUEUED\r\n+QUEUED\r\n+QUEUED\r\n+QUEUED\r\n*4\r\n+OK\r\n:4\r\n+OK\r\n:0\r\n",
+             1)); /* t1 c s a */
+
+    /* WATCH: a change by another session between WATCH and EXEC aborts; without one, EXEC runs */
+    struct session w1 = {.authed = 1};
+    struct session w2 = {.authed = 1};
+    sess(d, r, &w1, "SET w v0\r\nWATCH w\r\n", "+OK\r\n+OK\r\n");
+    sess(d, r, &w2, "SET w other\r\n", "+OK\r\n");
+    sess(d, r, &w1, "MULTI\r\nSET w mine\r\nEXEC\r\nGET w\r\n", "+OK\r\n+QUEUED\r\n*-1\r\n$5\r\nother\r\n");
+    sess(d, r, &w1, "WATCH w\r\nMULTI\r\nSET w mine\r\nEXEC\r\nGET w\r\n",
+         "+OK\r\n+OK\r\n+QUEUED\r\n*1\r\n+OK\r\n$4\r\nmine\r\n");
+    sess(d, r, &w1, "WATCH absent\r\n", "+OK\r\n");
+    sess(d, r, &w2, "SET absent now\r\n", "+OK\r\n");
+    sess(d, r, &w1, "MULTI\r\nGET absent\r\nEXEC\r\n", "+OK\r\n+QUEUED\r\n*-1\r\n"); /* created since WATCH */
+    sess(d, r, &w1, "WATCH w\r\nUNWATCH\r\n", "+OK\r\n+OK\r\n");
+    sess(d, r, &w2, "SET w again\r\n", "+OK\r\n");
+    sess(d, r, &w1, "MULTI\r\nGET w\r\nEXEC\r\n", "+OK\r\n+QUEUED\r\n*1\r\n$5\r\nagain\r\n");
+    free(feed(d, r, &w1, "HELLO 3\r\n", 9, 0));
+    sess(d, r, &w1, "WATCH w\r\n", "+OK\r\n");
+    sess(d, r, &w2, "DEL w\r\n", ":1\r\n");
+    sess(d, r, &w1, "MULTI\r\nGET w\r\nEXEC\r\n",
+         "+OK\r\n+QUEUED\r\n_\r\n"); /* the RESP3 null of an aborted EXEC */
+    resp_session_free(&w1);
+    resp_session_free(&w2);
+}
+
 static void test_acl_protocols(akvd *d, const char *path) {
     exec_fn r = resp_execute;
     exec_fn m = mc_execute;
@@ -373,6 +439,10 @@ static void test_acl_protocols(akvd *d, const char *path) {
     sess(d, r, &app, "FLUSHALL\r\n", "-NOPERM User app has no permissions to run the 'flushall' command\r\n");
     sess(d, r, &app, "ACL LIST\r\n", "-NOPERM User app has no permissions to run the 'acl' command\r\n");
     sess(d, r, &app, "PING\r\n", "+PONG\r\n");
+    sess(d, r, &app, "MULTI\r\nSET app:t 1\r\nFLUSHALL\r\nEXEC\r\n",
+         "+OK\r\n+QUEUED\r\n-NOPERM User app has no permissions to run the 'flushall' command\r\n-EXECABORT "
+         "Transaction "
+         "discarded because of previous errors.\r\n");
 
     struct session adm = {0};
     akvd_session_init(d, &adm);
@@ -459,6 +529,7 @@ int main(void) {
     if (d != NULL) {
         test_memcached(d);
         test_resp(d);
+        test_resp3_and_transactions(d);
         static const char *const mc_seeds[] = {"get a b\r\n",
                                                "set a 1 0 3\r\nabc\r\n",
                                                "incr a 1\r\n",

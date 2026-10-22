@@ -39,6 +39,7 @@
  *   --aof-rewrite-percentage N, --aof-rewrite-min-size SIZE   automatic rewrite (default: 100, 64M)
  *   --aof-load-damaged          start with the records before a damaged block instead of failing
  *   --warm-restart FILE         keep the cache memory in FILE (under /dev/shm) across restarts
+ *   --pubsub-output-limit SIZE  pending messages of a subscriber before it is disconnected (default: 32M)
  *   --log-level error|warn|info|debug, --log-file FILE (reopened on SIGHUP)
  *   --stats SECONDS             log a statistics line every SECONDS seconds
  *   -h, --help, -V, --version   print the usage text or the version and exit
@@ -113,6 +114,8 @@ static const char usage[] =
     "  --aof-rewrite-min-size SIZE ... and is at least SIZE (default: 64M)\n"
     "  --aof-load-damaged          start with the records before a damaged block instead of failing\n"
     "  --warm-restart FILE         keep the cache memory in FILE (under /dev/shm) across restarts\n"
+    "  --pubsub-output-limit SIZE  pending messages of a subscriber before it is disconnected\n"
+    "                              (default: 32M)\n"
     "  --log-level error|warn|info|debug   (default: info)\n"
     "  --log-file FILE             log destination (default: standard error); reopened on SIGHUP\n"
     "  --stats SECONDS             log a statistics line every SECONDS seconds\n"
@@ -248,6 +251,7 @@ static const struct option lo[] = {
     {"aof-load-damaged", no_argument, NULL, 1017},
     {"warm-restart", required_argument, NULL, 1018},
     {"aclfile", required_argument, NULL, 1019},
+    {"pubsub-output-limit", required_argument, NULL, 1020},
     {"help", no_argument, NULL, 'h'},
     {"version", no_argument, NULL, 'V'},
     {NULL, 0, NULL, 0},
@@ -592,6 +596,12 @@ int main(int argc, char **argv) {
             break;
         case 1019:
             cfg.acl_file = optarg;
+            break;
+        case 1020:
+            cfg.pubsub_output_limit = parse_size(optarg);
+            if (cfg.pubsub_output_limit == 0) {
+                return bad_value(name, optarg, "a size such as 32M");
+            }
             break;
         default:
             fprintf(stderr, "Try 'arenakvd --help' for the list of options.\n");

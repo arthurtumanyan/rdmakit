@@ -135,6 +135,12 @@ int acl_key_allowed(const acl_user *u, const void *key, size_t n, unsigned acces
 /* 1 when u may use channel. */
 int acl_channel_allowed(const acl_user *u, const void *ch, size_t n);
 
+/*
+ * 1 when u may subscribe to the channel pattern pat: u has all channels, or one of its channel patterns is
+ * exactly pat (as Valkey checks PSUBSCRIBE).
+ */
+int acl_channel_pattern_allowed(const acl_user *u, const void *pat, size_t n);
+
 /* Writes the rules of u in canonical form ("user <name> on #<hash> ~<pattern> ... <command rules>"). */
 size_t acl_describe(const acl_user *u, char *out, size_t cap);
 

@@ -152,9 +152,9 @@ engine and server tests under ThreadSanitizer (`make TSAN=1 test`).
 
 ## Not implemented
 
-- Replication, clustering on the server side, per-user permissions.
-- Data types other than strings (lists, hashes, sets, sorted sets, streams), scripting, transactions, pub/sub.
-- memcached binary protocol; RESP3.
+- Replication, clustering on the server side.
+- Data types other than strings (lists, hashes, sets, sorted sets, streams), scripting.
+- memcached binary protocol.
 - Zero-copy GET from the registered arena and a one-sided GET path (the transport provides the operations; the
   engine's entry layout and locking would have to support remote readers).
 - Incremental index rehashing (growth pauses one shard for the duration of its rehash).
