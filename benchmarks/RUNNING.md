@@ -145,7 +145,7 @@ DIR/env.json            machine, kernel, compiler, governors, NIC, RDMA devices,
                         git commit and uncommitted files, running containers, load average
 DIR/manifest.json       one entry per run: suite, parameters, command line, status, wall time, result file
 DIR/<suite>/*.json      raw results, one file per run (kvpace, akv_bench, duct_bench or memtier format)
-DIR/<suite>/*.err       standard error of runs that failed
+DIR/<suite>/*.err       output of runs that failed (standard error) or had operation errors (kvpace summary)
 ```
 
 | Status in the manifest | Meaning |

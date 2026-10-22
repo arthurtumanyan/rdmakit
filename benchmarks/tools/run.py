@@ -32,7 +32,7 @@ new runs are appended to manifest.json. Output layout:
     DIR/env.json            machine, toolchain, software versions, git state
     DIR/manifest.json       one entry per run (parameters, command, status, wall time)
     DIR/<suite>/*.json      raw results, one file per run
-    DIR/<suite>/*.err       standard error of failed runs
+    DIR/<suite>/*.err       output of failed runs (standard error) and of runs with operation errors (kvpace summary)
 """
 import argparse
 import json
