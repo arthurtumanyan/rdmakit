@@ -1,0 +1,6 @@
+driver=resp threads=8 scenario=kvcache block=16384B groups=16 shared-blocks=32 turn-blocks=8 active-conv=256 max-turns=16
+ops=140292 (gets=58094 puts=82198 misses=1724 errors=42221) in 10.00 s -> 14029 ops/s
+kvcache: 1724 requests, reuse 40.7% of needed blocks, probe hit rate 97.0% (56370 of 58094), 82198 blocks recomputed and written, read 92.4 MB/s, write 134.7 MB/s, corrupt 0
+server: 9.990 CPU s during run (71.21 us/op), RSS 292.9 MiB
+service latency us: mean 4605.8  p50 4259.8  p90 7536.6  p99 9240.6  p99.9 10747.9  p99.99 11380.0  max 11380.0
+request latency us: mean 4605.8  p50 4259.8  p90 7536.6  p99 9240.6  p99.9 10747.9  p99.99 11380.0  max 11380.0
