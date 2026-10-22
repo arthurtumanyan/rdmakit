@@ -228,6 +228,28 @@ static int write_blocks(int fd, const uint8_t *p, size_t n, uint64_t *written) {
     return 0;
 }
 
+int aof_record_encode(struct obuf *b, const akv_change *c) {
+    return encode(b, c->kind, c->reason, c->key, c->klen, c->val, c->vlen, c->flags, c->expire_unix_ms,
+                  c->txn);
+}
+
+size_t aof_record_size(const uint8_t *p) {
+    return rec_size(p);
+}
+
+static void decode(const uint8_t *p, akv_change *c);
+
+int aof_record_decode(const uint8_t *p, akv_change *c) {
+    decode(p, c);
+    if (c->kind == (enum akv_change_kind)AOF_TXN_END) {
+        return 0;
+    }
+    if (c->kind < AKV_CHG_PUT || c->kind > AKV_CHG_FLUSH || (c->kind != AKV_CHG_FLUSH && c->klen == 0)) {
+        return -EBADMSG;
+    }
+    return 0;
+}
+
 /* ---- manifest ----------------------------------------------------------------------------------------- */
 
 /* Replaces the manifest with the current state (mlock held). Returns 0 or -errno. */

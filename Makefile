@@ -17,13 +17,17 @@ all:
 	$(MAKE) -C kvpace
 	-$(MAKE) -C lab
 
+# Every project is built before any suite runs: arenakv's cluster test drives the kvpace of the same build.
 test:
+	for p in $(PROJECTS); do $(MAKE) -C $$p || exit 1; done
 	for p in $(PROJECTS); do $(MAKE) -C $$p test || exit 1; done
 
 test-tcp:
+	for p in $(PROJECTS); do $(MAKE) -C $$p RDMA=0 || exit 1; done
 	for p in $(PROJECTS); do $(MAKE) -C $$p RDMA=0 test || exit 1; done
 
 sanitize:
+	for p in $(PROJECTS); do $(MAKE) -C $$p SAN=1 || exit 1; done
 	for p in $(PROJECTS); do $(MAKE) -C $$p SAN=1 test || exit 1; done
 
 format:

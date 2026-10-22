@@ -132,6 +132,13 @@ void duct_ep_close(duct_ep *ep) {
     }
 }
 
+int duct_ep_peer_addr(const duct_ep *ep, char *buf, size_t n) {
+    if (ep == NULL || buf == NULL || n == 0) {
+        return -EINVAL;
+    }
+    return ep->ops->peer_addr(ep, buf, n);
+}
+
 uint32_t duct_ep_peer_max_msg(const duct_ep *ep) {
     return ep->peer_max_msg;
 }

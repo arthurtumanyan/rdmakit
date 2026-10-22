@@ -45,6 +45,20 @@ enum aof_fsync {
 /* Record kind of a transaction end; written by the server while it holds the transaction's lock set. */
 #define AOF_TXN_END 100
 
+/* Size of a record header (see the format above). */
+#define AOF_REC_HDR 28u
+
+struct obuf;
+
+/* Appends the encoding of c to b. Returns 0 or -ENOMEM. The replication stream uses the same encoding. */
+int aof_record_encode(struct obuf *b, const akv_change *c);
+
+/* Size of the record starting at p (at least AOF_REC_HDR bytes available). */
+size_t aof_record_size(const uint8_t *p);
+
+/* Decodes the record at p (pointers into p). Returns 0, or -EBADMSG for an unknown kind or a keyless store. */
+int aof_record_decode(const uint8_t *p, akv_change *c);
+
 typedef struct aof aof;
 
 typedef struct aof_config {

@@ -146,6 +146,7 @@ static const acl_cmd CMDS[] = {
     {ACL_NATIVE, "AUTH", CN, 0, 0, 0, 0},
     {ACL_NATIVE, "NOOP", CN, 0, 0, 0, 0},
     {ACL_NATIVE, "REPLSYNC", RP, 0, 0, 0, 0},
+    {ACL_NATIVE, "ROLE", CN, 0, 0, 0, 0},
 };
 
 #define NCMDS (sizeof(CMDS) / sizeof(CMDS[0]))

@@ -144,6 +144,9 @@ void duct_ep_close(duct_ep *ep);
  */
 uint32_t duct_ep_peer_max_msg(const duct_ep *ep);
 
+/* Writes the peer's address as "ipv4:port" (NUL-terminated) into buf. Returns 0 or a negative error. */
+int duct_ep_peer_addr(const duct_ep *ep, char *buf, size_t n);
+
 /*
  * Sends one message (len <= duct_ep_peer_max_msg()). The data is copied; the caller's buffer is
  * reusable on return. Blocks while all send buffers are in use. Returns 0, -EMSGSIZE if the

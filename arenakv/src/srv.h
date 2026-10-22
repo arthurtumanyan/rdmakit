@@ -18,6 +18,8 @@
 #include "acl.h"
 #include "aof.h"
 #include "pubsub.h"
+#include "cluster.h"
+#include "repl.h"
 
 /* Growable output buffer. Bytes [off, len) are pending. */
 struct obuf {
@@ -72,6 +74,15 @@ struct session {
     unsigned worker;
     struct obuf subs; /* subscriptions: 1-byte kind (0 channel, 1 pattern), 4-byte length, name */
     unsigned nsubs;
+    /* AKVP_REPLSYNC: the request; the connection is handed over to a replication feed */
+    struct obuf handoff;
+    int handing_off;
+    /* RESP WAIT: the reply is due when `wait_n` replicas acknowledged wait_off or at wait_deadline_ms */
+    int readonly; /* RESP READONLY: a replica in cluster mode may serve reads of its primary's slots */
+    int waiting;
+    uint64_t wait_off;
+    long long wait_n;
+    int64_t wait_deadline_ms; /* CLOCK_MONOTONIC; 0 = no deadline */
 };
 
 /* Frees the buffers of a session (transaction queue, watched keys). */
@@ -190,6 +201,55 @@ size_t akvd_publish(akvd *d, const char *ch, size_t cn, const char *msg, size_t 
 
 /* The pub/sub registry (PUBSUB CHANNELS, NUMSUB, NUMPAT). */
 pubsub *akvd_pubsub(akvd *d);
+
+/* ---- replication (replication.c) ---- */
+
+struct repl;
+
+struct repl *repl_create(akvd *d, size_t backlog);
+void repl_destroy(struct repl *r);
+repl_backlog *repl_backlog_of(struct repl *r);
+
+/* Starts a feed thread that owns ep (the request of AKVP_REPLSYNC in req). Returns 0 or a negative error. */
+int repl_feed_start(struct repl *r, duct_ep *ep, const uint8_t *req, size_t len);
+
+/* Follows the primary host:port, or (host == NULL) stops following and becomes a primary. */
+int repl_follow(struct repl *r, const char *host, const char *port);
+
+int repl_is_replica(struct repl *r);
+
+/* 1 on the thread that applies the stream of a primary (its changes are not put into the backlog). */
+int repl_link_thread(void);
+
+/* Replicas that acknowledged offset off. */
+size_t repl_acked(struct repl *r, uint64_t off);
+
+/* Appends the "# Replication" fields of INFO. */
+void repl_info(struct repl *r, struct obuf *o);
+
+/* The cluster map (NULL outside cluster mode); valid until the server stops. */
+const cluster *akvd_cluster(akvd *d);
+
+/* Reloads the cluster map file. Returns 0 or -EBADMSG (message in err). */
+int akvd_cluster_reload(akvd *d, char *err, size_t errlen);
+
+/* The server's configuration. */
+const akvd_config *akvd_cfg(const akvd *d);
+
+/* Transport options of the server's native listener (for the replication client). */
+void akvd_duct_opts(const akvd *d, struct duct_opts *o);
+
+/* The replication state, created when the server starts. */
+struct repl *akvd_repl(akvd *d);
+
+/* 1 when client writes must be refused (a read-only replica). */
+int akvd_read_only(const akvd *d);
+
+/* Makes the backlog record changes from now on (the first replica or REPLICAOF). */
+void akvd_repl_activate(akvd *d);
+
+/* Wakes workers with connections in WAIT (a replica acknowledged an offset or disconnected). */
+void akvd_wake_waiters(akvd *d);
 
 /* fsync policy of the append-only log as Valkey names it ("always", "everysec", "no"). */
 const char *akvd_appendfsync(const akvd *d);

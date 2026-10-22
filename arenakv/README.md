@@ -20,10 +20,13 @@ instructions, and evicts with a second chance.
   Every file block is CRC-checked.
 - Sharded engine: operations on different shards run in parallel. Tag comparison with SSE2 (x86-64) or NEON
   (aarch64), with a portable fallback.
-- Client library (`akvclient.h`) with pipelining and consistent hashing over several servers, and a native driver
-  for [`kvpace`](../kvpace).
+- Replication over the native transport (TCP or RDMA): replicas continue from their offset after a reconnect or a
+  promotion; read-only replicas; `WAIT`; the Redis Cluster protocol with a fixed slot map (`MOVED`, `CLUSTER SLOTS`).
+- Client library (`akvclient.h`) with pipelining, consistent hashing over several servers and failover to a
+  promoted replica, and a native driver for [`kvpace`](../kvpace).
 
-**Status:** experimental, not for production use. No replication; strings only.
+**Status:** experimental, not for production use (see [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for what is
+missing). Strings only.
 
 ## Why this exists
 
@@ -60,7 +63,7 @@ below show where `arenakv` is in the same range, where it is better, and where i
 | Data types | strings | strings | strings, lists, hashes, sets, sorted sets, streams | as Valkey |
 | Authentication | ACL users with per-user commands, categories and key patterns (subset of the Valkey ACL file syntax) | SASL, ASCII auth | ACL users | ACL users |
 | Persistence | snapshots, append-only log (fsync always, everysec or no), warm restart | warm restart | RDB, AOF | snapshots |
-| Replication, cluster | no (client-side consistent hashing) | no (client-side hashing) | yes | replication, cluster mode |
+| Replication, cluster | asynchronous replication over TCP or RDMA with partial resynchronization and manual failover; Redis Cluster protocol with a fixed slot map | no (client-side hashing) | yes | replication, cluster mode |
 | Hash index | grows from a small size | grows | grows | grows |
 | Production use | not recommended | widely deployed | widely deployed | deployed |
 
@@ -244,6 +247,8 @@ and clang on x86-64 and arm64.
 | `test_aof` | append-only log round trip, rewrites while four threads write, automatic rewrites, torn and zero-filled tails, damage before the end, incomplete transactions, durable sequence numbers |
 | `durability.py` | `SIGKILL` of a writing server with `always` (no acknowledged write lost) and `everysec` (losses only from the last 2 s), `SIGKILL` during a rewrite, warm restart with identical contents |
 | `test_resp_net` | pub/sub over real sockets with four workers: RESP2 and RESP3 frames, patterns, subscriber mode, PUBSUB, removal on close and RESET, disconnection of a slow subscriber, 8 publishers to 64 subscribers; transactions and MSET on concurrent connections are never seen half applied |
+| `replication.py` | a replica of 20,000 keys equal to its primary, read-only refusal, WAIT, ROLE, partial resynchronization after a link restart, full resynchronization after falling behind the backlog, expiry, failover with partial continuation from the promoted replica |
+| `cluster.py` | slots against the Redis Cluster CRC16, CLUSTER SLOTS/SHARDS/NODES/INFO, MOVED, CROSSSLOT, READONLY reads on a replica, redis-py RedisCluster, `valkey-cli -c`, kvpace `--driver resp-cluster` |
 | `test_server` | native protocol round trips, malformed requests, size limits, concurrent clients, shutdown with clients connected; over TCP, and over RDMA when `DUCT_TEST_ADDR` is set |
 
 ## Run the server
@@ -284,6 +289,8 @@ END
 | `--auth-file FILE` | none | credentials (`user:password` or a password per line), every user with all rights |
 | `--aclfile FILE` | none | users with per-user rights; reloaded by `ACL LOAD` |
 | `--pubsub-output-limit SIZE` | 32M | pending messages of a subscriber before it is disconnected |
+| `--replicaof HOST:PORT`, `--primary-auth USER:PASS` | none | follow a primary (its native port) |
+| `--cluster-config FILE`, `--cluster-node-id ID` | none | Redis Cluster protocol with a fixed slot map |
 | `--snapshot FILE`, `--save-interval SEC`, `--no-save-on-stop` | none, off, save at stop | snapshots |
 | `--appendonly DIR`, `--appendfsync always\|everysec\|no` | none, everysec | append-only log |
 | `--warm-restart FILE` | none | keep the cache memory (on tmpfs) across restarts |

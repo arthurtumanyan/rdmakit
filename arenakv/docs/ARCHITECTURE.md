@@ -152,7 +152,7 @@ engine and server tests under ThreadSanitizer (`make TSAN=1 test`).
 
 ## Not implemented
 
-- Replication, clustering on the server side.
+- Automatic failover, live resharding, and gossip between cluster nodes (the slot map is a file).
 - Data types other than strings (lists, hashes, sets, sorted sets, streams), scripting.
 - memcached binary protocol.
 - Zero-copy GET from the registered arena and a one-sided GET path (the transport provides the operations; the

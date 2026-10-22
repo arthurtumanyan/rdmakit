@@ -57,6 +57,8 @@ Extension: `ttl_ms` (8, signed: > 0 milliseconds, 0 none, < 0 expire at once; `I
 | 16 | MGET | value = keys, each as 2-byte length and bytes | per key: status (1), reserved (3), length (4), value |
 | 17 | AUTH | value = `user:password` or a password | |
 | 18 | NOOP | | |
+| 19 | REPLSYNC | value = replication id (40), offset (8), listening port (2) | none: the connection becomes a replication link ([OPERATIONS.md](OPERATIONS.md#replication)) |
+| 20 | ROLE | | role (1): 0 primary, 1 replica |
 
 Revision 1 consisted of GET, PUT, DEL and STATS without the extension and with a 12-field STATS payload. Revision-1
 requests are valid revision-2 requests; PUT now returns an 8-byte payload, which revision-1 clients ignore.
@@ -74,6 +76,8 @@ requests are valid revision-2 requests; PUT now returns an 8-byte payload, which
 | 6 | `AKVP_NOMEM` | no space and eviction disabled (`--no-evict`) |
 | 7 | `AKVP_NOAUTH` | authentication required or failed |
 | 8 | `AKVP_NOTNUM` | INCR of a non-numeric value, signed overflow |
+| 9 | `AKVP_NOPERM` | the user's ACL rules do not allow the operation or the key |
+| 10 | `AKVP_READONLY` | a write sent to a read-only replica |
 
 A request shorter than 12 bytes is not answered: the server closes the connection. With credentials configured,
 every operation other than AUTH and NOOP answers `AKVP_NOAUTH` until AUTH succeeds.

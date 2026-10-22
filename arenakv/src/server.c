@@ -35,6 +35,13 @@
  * the frames to the subscribers' output buffers, finding each connection by id in its subscriber map, and
  * disconnects a subscriber whose pending output exceeds pubsub_output_limit.
  *
+ * Replication (repl.h, replication.c): the change feed also goes to the replication backlog once
+ * replication is in use (a replica connected, or the server follows a primary). An AKVP_REPLSYNC request
+ * hands the native endpoint over to a feed thread: the worker sends the responses before it, removes the
+ * endpoint from its epoll set and forgets the connection without closing the endpoint. A read-only
+ * replica refuses client writes in every protocol. RESP WAIT parks its connection until enough replicas
+ * acknowledged the offset of the worker's last change, or its timeout; feeds wake the workers.
+ *
  * Durability: the engine's change feed goes to the append-only log (aof.h). With fsync policy "always" a
  * connection whose commands changed data in a turn is parked: its replies stay queued and its descriptor
  * is removed from the epoll interest until the log's durable sequence number reaches the last record the
@@ -139,6 +146,11 @@ struct worker {
     struct conn **subs; /* open addressing by connection id; NULL free, SUB_GONE removed */
     size_t subs_cap;
     size_t subs_used;
+    /* RESP WAIT: connections waiting for replica acknowledgements */
+    struct conn **waits;
+    size_t nwaits;
+    size_t waits_cap;
+    atomic_int has_waits;
 };
 
 struct akvd {
@@ -184,6 +196,11 @@ struct akvd {
     uint64_t saved_puts;
     aof *aof; /* append-only log, NULL when not configured */
     pubsub *ps;
+    struct repl *repl;
+    atomic_int repl_active; /* the backlog records changes */
+    _Atomic(cluster *) cluster;
+    cluster **old_clusters; /* replaced maps, still referenced by running commands; freed at stop */
+    size_t nold_clusters;
 #ifdef AKV_HAVE_TLS
     SSL_CTX *tls;
 #endif
@@ -396,6 +413,75 @@ uint64_t akvd_next_txn(akvd *d) {
 void akvd_txn_end(akvd *d, uint64_t txn) {
     if (d->aof != NULL) {
         aof_append_txn_end(d->aof, txn);
+    }
+    if (atomic_load_explicit(&d->repl_active, memory_order_relaxed) && !repl_link_thread()) {
+        akv_change c = {.kind = (enum akv_change_kind)AOF_TXN_END, .txn = txn};
+        repl_backlog_append(repl_backlog_of(d->repl), &c);
+    }
+}
+
+const cluster *akvd_cluster(akvd *d) {
+    return atomic_load(&d->cluster);
+}
+
+int akvd_cluster_reload(akvd *d, char *err, size_t errlen) {
+    if (d->cfg.cluster_config == NULL) {
+        snprintf(err, errlen, "cluster mode is not configured (cluster-config option)");
+        return -EINVAL;
+    }
+    cluster *n = cluster_load(d->cfg.cluster_config, d->cfg.cluster_node_id, err, errlen);
+    if (n == NULL) {
+        return -EBADMSG;
+    }
+    pthread_mutex_lock(&d->acl_lock);
+    cluster **r = realloc(d->old_clusters, (d->nold_clusters + 1) * sizeof(*r));
+    if (r == NULL) {
+        pthread_mutex_unlock(&d->acl_lock);
+        cluster_free(n);
+        snprintf(err, errlen, "out of memory");
+        return -ENOMEM;
+    }
+    d->old_clusters = r;
+    d->old_clusters[d->nold_clusters++] = atomic_exchange(&d->cluster, n);
+    pthread_mutex_unlock(&d->acl_lock);
+    akvd_log(d, AKVD_LOG_INFO, "cluster map reloaded: %u nodes, %u slots assigned", n->n,
+             cluster_assigned(n));
+    return 0;
+}
+
+const akvd_config *akvd_cfg(const akvd *d) {
+    return &d->cfg;
+}
+
+void akvd_duct_opts(const akvd *d, struct duct_opts *o) {
+    duct_opts_default(o);
+    o->transport = d->cfg.transport;
+    o->wait = d->cfg.wait;
+    o->max_msg = d->cfg.max_msg;
+    o->recv_depth = d->cfg.recv_depth;
+    o->send_depth = d->cfg.send_depth;
+}
+
+struct repl *akvd_repl(akvd *d) {
+    return d->repl;
+}
+
+int akvd_read_only(const akvd *d) {
+    return d->cfg.replica_read_only && repl_is_replica(d->repl);
+}
+
+void akvd_repl_activate(akvd *d) {
+    atomic_store(&d->repl_active, 1);
+}
+
+void akvd_wake_waiters(akvd *d) {
+    for (unsigned i = 0; i < d->nworkers; i++) {
+        if (atomic_load(&d->workers[i].has_waits)) {
+            uint64_t one = 1;
+            if (write(d->workers[i].evfd, &one, sizeof(one)) < 0) {
+                /* the worker checks its waits at least every 100 ms */
+            }
+        }
     }
 }
 
@@ -828,11 +914,16 @@ static void unpark_remove(struct worker *w, struct conn *c) {
     c->parked = 0;
 }
 
+static void wait_remove(struct worker *w, struct conn *c);
+
 static void conn_free(struct conn *c) {
     struct worker *w = c->w;
     akvd *d = w->d;
     if (c->parked) {
         unpark_remove(w, c);
+    }
+    if (c->ss.waiting) {
+        wait_remove(w, c);
     }
     if (c->ss.nsubs > 0) {
         akvd_unsubscribe_all(d, &c->ss); /* before the session's buffers, which list the subscriptions */
@@ -893,20 +984,41 @@ static enum akv_mode store_mode(uint8_t op) {
     }
 }
 
+/* 1 for native operations that change data. */
+static int native_writes(uint8_t op) {
+    switch (op) {
+    case AKVP_PUT:
+    case AKVP_DEL:
+    case AKVP_ADD:
+    case AKVP_REPLACE:
+    case AKVP_APPEND:
+    case AKVP_PREPEND:
+    case AKVP_CAS:
+    case AKVP_INCR:
+    case AKVP_INCRS:
+    case AKVP_TOUCH:
+    case AKVP_FLUSH:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 /* Command-table ids of the native operations (index: operation code), filled on first use. */
-static int native_ids[AKVP_NOOP + 1];
+static int native_ids[AKVP_ROLE + 1];
 static pthread_once_t native_ids_once = PTHREAD_ONCE_INIT;
 
 static void native_ids_init(void) {
-    static const char *const names[AKVP_NOOP + 1] = {
-        [AKVP_GET] = "GET",       [AKVP_PUT] = "PUT",         [AKVP_DEL] = "DEL",
-        [AKVP_STATS] = "STATS",   [AKVP_ADD] = "ADD",         [AKVP_REPLACE] = "REPLACE",
-        [AKVP_APPEND] = "APPEND", [AKVP_PREPEND] = "PREPEND", [AKVP_CAS] = "CAS",
-        [AKVP_INCR] = "INCR",     [AKVP_INCRS] = "INCRS",     [AKVP_TOUCH] = "TOUCH",
-        [AKVP_FLUSH] = "FLUSH",   [AKVP_HAS] = "HAS",         [AKVP_GETM] = "GETM",
-        [AKVP_MGET] = "MGET",     [AKVP_AUTH] = "AUTH",       [AKVP_NOOP] = "NOOP",
+    static const char *const names[AKVP_ROLE + 1] = {
+        [AKVP_GET] = "GET",           [AKVP_PUT] = "PUT",         [AKVP_DEL] = "DEL",
+        [AKVP_STATS] = "STATS",       [AKVP_ADD] = "ADD",         [AKVP_REPLACE] = "REPLACE",
+        [AKVP_APPEND] = "APPEND",     [AKVP_PREPEND] = "PREPEND", [AKVP_CAS] = "CAS",
+        [AKVP_INCR] = "INCR",         [AKVP_INCRS] = "INCRS",     [AKVP_TOUCH] = "TOUCH",
+        [AKVP_FLUSH] = "FLUSH",       [AKVP_HAS] = "HAS",         [AKVP_GETM] = "GETM",
+        [AKVP_MGET] = "MGET",         [AKVP_AUTH] = "AUTH",       [AKVP_NOOP] = "NOOP",
+        [AKVP_REPLSYNC] = "REPLSYNC", [AKVP_ROLE] = "ROLE",
     };
-    for (unsigned i = 0; i <= AKVP_NOOP; i++) {
+    for (unsigned i = 0; i <= AKVP_ROLE; i++) {
         native_ids[i] = names[i] != NULL ? acl_cmd_find(ACL_NATIVE, names[i], strlen(names[i])) : -1;
     }
 }
@@ -917,7 +1029,7 @@ static int native_permitted(const struct session *ss, uint8_t op, const uint8_t 
         return 1;
     }
     pthread_once(&native_ids_once, native_ids_init);
-    int id = op <= AKVP_NOOP ? native_ids[op] : -1;
+    int id = op <= AKVP_ROLE ? native_ids[op] : -1;
     if (id < 0) {
         return 1; /* unknown operation: answered AKVP_BADREQ */
     }
@@ -958,6 +1070,8 @@ size_t akvd_native_execute(akvd *d, struct session *ss, const uint8_t *msg, size
         status = AKVP_NOAUTH;
     } else if (rq.op != AKVP_MGET && !native_permitted(ss, rq.op, key, rq.klen)) {
         status = AKVP_NOPERM;
+    } else if (akvd_read_only(d) && native_writes(rq.op)) {
+        status = AKVP_READONLY;
     } else {
         switch (rq.op) {
         case AKVP_GET:
@@ -1147,6 +1261,23 @@ size_t akvd_native_execute(akvd *d, struct session *ss, const uint8_t *msg, size
         }
         case AKVP_NOOP:
             break;
+        case AKVP_ROLE:
+            pay[0] = repl_is_replica(d->repl) ? 1 : 0;
+            payload = 1;
+            break;
+        case AKVP_REPLSYNC:
+            if (keyed || rq.vlen < REPL_ID_LEN + 8) {
+                status = AKVP_BADREQ;
+                break;
+            }
+            ss->handoff.len = ss->handoff.off = 0;
+            if (ob_add(&ss->handoff, val, rq.vlen) != 0) {
+                status = AKVP_ERROR;
+                break;
+            }
+            ss->handing_off = 1;
+            akvd_repl_activate(d);
+            return 0; /* no response: the connection becomes a replication link */
         case AKVP_STATS: {
             if (keyed || rq.vlen != 0 || room < AKVP_STATS_BYTES) {
                 status = room < AKVP_STATS_BYTES ? AKVP_TOOBIG : AKVP_BADREQ;
@@ -1233,6 +1364,64 @@ static void park(struct worker *w, struct conn *c, uint64_t seq) {
     }
 }
 
+/* Parks a connection whose RESP WAIT cannot be answered yet. */
+static void wait_park(struct worker *w, struct conn *c) {
+    if (w->nwaits == w->waits_cap) {
+        size_t cap = w->waits_cap ? w->waits_cap * 2 : 16;
+        struct conn **p = realloc(w->waits, cap * sizeof(*p));
+        if (p == NULL) {
+            ob_printf(&c->out, ":%zu\r\n", repl_acked(w->d->repl, c->ss.wait_off));
+            c->ss.waiting = 0;
+            schedule(w, c);
+            return;
+        }
+        w->waits = p;
+        w->waits_cap = cap;
+    }
+    w->waits[w->nwaits++] = c;
+    if (c->epmask != 0) {
+        struct epoll_event ev = {.events = 0, .data.ptr = c};
+        epoll_ctl(w->epfd, EPOLL_CTL_MOD, c->fd, &ev);
+        c->epmask = 0;
+    }
+    atomic_store(&w->has_waits, 1);
+}
+
+/* Answers the WAITs that are satisfied or timed out. */
+static void wait_check(struct worker *w) {
+    if (w->nwaits == 0) {
+        return;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    for (size_t i = 0; i < w->nwaits;) {
+        struct conn *c = w->waits[i];
+        size_t have = repl_acked(w->d->repl, c->ss.wait_off);
+        if ((long long)have >= c->ss.wait_n ||
+            (c->ss.wait_deadline_ms != 0 && now >= c->ss.wait_deadline_ms)) {
+            ob_printf(&c->out, ":%zu\r\n", have);
+            c->ss.waiting = 0;
+            w->waits[i] = w->waits[--w->nwaits];
+            schedule(w, c);
+        } else {
+            i++;
+        }
+    }
+    if (w->nwaits == 0) {
+        atomic_store(&w->has_waits, 0);
+    }
+}
+
+static void wait_remove(struct worker *w, struct conn *c) {
+    for (size_t i = 0; i < w->nwaits; i++) {
+        if (w->waits[i] == c) {
+            w->waits[i] = w->waits[--w->nwaits];
+            break;
+        }
+    }
+}
+
 /* Schedules parked connections whose replies are durable now. */
 static void unpark_ready(struct worker *w) {
     if (w->nparked == 0) {
@@ -1273,10 +1462,42 @@ static void on_change(void *arg, const akv_change *c) {
     if (d->aof != NULL) {
         aof_append(d->aof, c);
     }
+    if (atomic_load_explicit(&d->repl_active, memory_order_relaxed) && !repl_link_thread()) {
+        repl_backlog_append(repl_backlog_of(d->repl), c);
+    }
 }
 
 static void aof_log_sink(void *arg, int level, const char *msg) {
     akvd_log(arg, level == 0 ? AKVD_LOG_ERROR : level == 1 ? AKVD_LOG_WARN : AKVD_LOG_INFO, "%s", msg);
+}
+
+static int native_flush(struct conn *c);
+
+/*
+ * Turns a native connection into a replication link: sends the responses queued before the request
+ * (blocking, with a timeout), removes the endpoint from the worker and starts a feed that owns it.
+ */
+static void hand_off(struct worker *w, struct conn *c, unsigned nb) {
+    akvd *d = w->d;
+    int rc = nb > 0 ? duct_send_batch(c->ep, w->bmsg, nb, 10000) : 0;
+    while (rc == 0 && ob_pending(&c->pend) > 0) {
+        const uint8_t *p = c->pend.p + c->pend.off;
+        uint32_t len = akvp_get32(p);
+        rc = duct_send(c->ep, p + 4, len, 10000);
+        c->pend.off += 4 + (size_t)len;
+    }
+    epoll_ctl(w->epfd, EPOLL_CTL_DEL, c->fd, NULL);
+    duct_ep *ep = c->ep;
+    c->ep = NULL;
+    if (rc == 0) {
+        rc = repl_feed_start(d->repl, ep, c->ss.handoff.p, c->ss.handoff.len);
+    }
+    if (rc != 0) {
+        akvd_log(d, AKVD_LOG_WARN, "replication request of connection %llu failed: %s",
+                 (unsigned long long)c->ss.id, duct_strerror(rc));
+        duct_ep_close(ep);
+    }
+    conn_free(c);
 }
 
 /* Sends queued native responses. Returns 0 (queue empty), 1 (blocked), or a negative error. */
@@ -1389,6 +1610,13 @@ static int native_serve(struct worker *w, struct conn *c) {
                         n = 0; /* the user was removed or disabled by an ACL reload */
                     }
                     duct_rx_release(c->ep, &rx[j]);
+                    if (n == 0 && c->ss.handing_off) {
+                        for (unsigned q = j + 1; q < k; q++) {
+                            duct_rx_release(c->ep, &rx[q]);
+                        }
+                        hand_off(w, c, nb);
+                        return -1;
+                    }
                     if (n == 0) {
                         conn_free(c);
                         return -1;
@@ -1609,6 +1837,10 @@ static int text_serve(struct worker *w, struct conn *c) {
                 park(w, c, hold);
                 return 0;
             }
+            if (c->ss.waiting) {
+                wait_park(w, c);
+                return 0;
+            }
             if (used > 0) {
                 continue; /* replies may be pending: write them, then read again */
             }
@@ -1741,7 +1973,7 @@ static void *worker_main(void *arg) {
     struct epoll_event evs[128];
     uint64_t last_scan = mono_s();
     while (!atomic_load(&d->stopping)) {
-        int n = epoll_wait(w->epfd, evs, 128, w->nready > 0 ? 0 : 1000);
+        int n = epoll_wait(w->epfd, evs, 128, w->nready > 0 ? 0 : w->nwaits > 0 ? 100 : 1000);
         for (int i = 0; i < n; i++) {
             if (evs[i].data.ptr == NULL) {
                 uint64_t v;
@@ -1755,6 +1987,7 @@ static void *worker_main(void *arg) {
             }
             serve(w, evs[i].data.ptr);
         }
+        wait_check(w);
         if (w->nready > 0) {
             run_ready(w);
         }
@@ -1777,6 +2010,9 @@ static void *worker_main(void *arg) {
     free(w->parked);
     w->parked = NULL;
     w->nparked = 0;
+    free(w->waits);
+    w->waits = NULL;
+    w->nwaits = 0;
     drain_inbox(w);
     while (w->conns != NULL) {
         struct conn *c = w->conns;
@@ -1978,6 +2214,7 @@ void akvd_config_default(akvd_config *cfg) {
     cfg->send_depth = 16;
     cfg->log_level = AKVD_LOG_INFO;
     cfg->aof_fsync = AOF_FSYNC_EVERYSEC;
+    cfg->replica_read_only = 1;
     cfg->aof_rewrite_percentage = 100;
     cfg->aof_rewrite_min_size = 64ull << 20; /* Valkey's auto-aof-rewrite-min-size default */
 }
@@ -2039,11 +2276,17 @@ static void free_all(akvd *d) {
         aof_close(d->aof);
     }
     pubsub_destroy(d->ps);
+    repl_destroy(d->repl);
     if (d->store != NULL && d->cfg.store.shm_path != NULL) {
         akv_detach(d->store); /* keeps restored memory when the start fails afterwards */
     } else {
         akv_destroy(d->store);
     }
+    cluster_free(atomic_load(&d->cluster));
+    for (size_t i = 0; i < d->nold_clusters; i++) {
+        cluster_free(d->old_clusters[i]);
+    }
+    free(d->old_clusters);
     acl_free(atomic_load(&d->acl));
     for (size_t i = 0; i < d->nretired; i++) {
         acl_free(d->retired[i]);
@@ -2138,6 +2381,23 @@ akvd *akvd_start(const akvd_config *cfg, int *err) {
             goto fail;
         }
         atomic_store(&d->acl, a);
+    }
+    if (d->cfg.cluster_config != NULL) {
+        char msg[512];
+        cluster *cl = cluster_load(d->cfg.cluster_config, d->cfg.cluster_node_id, msg, sizeof(msg));
+        if (cl == NULL) {
+            akvd_log(d, AKVD_LOG_ERROR, "cluster map: %s", msg);
+            *err = -EINVAL;
+            goto fail;
+        }
+        atomic_store(&d->cluster, cl);
+        if (d->cfg.replicaof_host == NULL && cl->self >= 0 && !cl->nodes[cl->self].primary) {
+            static char port[16];
+            const struct cluster_node *pn = &cl->nodes[cl->nodes[cl->self].primary_of];
+            snprintf(port, sizeof(port), "%d", pn->native_port);
+            d->cfg.replicaof_host = pn->host;
+            d->cfg.replicaof_port = port;
+        }
     }
     d->cfg.store.on_change = on_change;
     d->cfg.store.on_change_arg = d;
@@ -2272,9 +2532,10 @@ akvd *akvd_start(const akvd_config *cfg, int *err) {
         d->cfg.pubsub_output_limit = 32ull << 20;
     }
     d->ps = pubsub_create(deliver, d);
+    d->repl = repl_create(d, d->cfg.repl_backlog_size != 0 ? d->cfg.repl_backlog_size : (64u << 20));
     d->stop_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     d->workers = calloc(d->nworkers, sizeof(*d->workers));
-    if (d->stop_fd < 0 || d->workers == NULL || d->ps == NULL) {
+    if (d->stop_fd < 0 || d->workers == NULL || d->ps == NULL || d->repl == NULL) {
         *err = -ENOMEM;
         goto fail;
     }
@@ -2319,6 +2580,12 @@ akvd *akvd_start(const akvd_config *cfg, int *err) {
         goto fail;
     }
     d->accept_started = 1;
+    if (d->cfg.replicaof_host != NULL) {
+        akvd_repl_activate(d);
+        if ((*err = repl_follow(d->repl, d->cfg.replicaof_host, d->cfg.replicaof_port)) != 0) {
+            akvd_log(d, AKVD_LOG_ERROR, "replication cannot start: %s", duct_strerror(*err));
+        }
+    }
     if (d->cfg.snapshot_path != NULL && d->cfg.save_interval_s > 0 &&
         pthread_create(&d->saver, NULL, saver_main, d) == 0) {
         d->saver_started = 1;
@@ -2359,6 +2626,9 @@ void akvd_stop(akvd *d) {
         d->bg_joinable = 0;
     }
     pthread_mutex_unlock(&d->saver_lock);
+    /* Replication threads use the engine and the log: end them first. */
+    repl_destroy(d->repl);
+    d->repl = NULL;
     if (d->aof != NULL) {
         if (aof_close(d->aof) != 0) {
             akvd_log(d, AKVD_LOG_ERROR, "append-only log: the last write failed before the stop");

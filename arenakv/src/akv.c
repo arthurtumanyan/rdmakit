@@ -974,7 +974,7 @@ static int store_locked(akv *s, struct shard *sh, uint64_t h, const void *key, s
     if (old != NULL && old->total == total) {
         /* Same size: overwrite in place; no log space is consumed and no dead entry is left. */
         uint8_t *v = entry_val(old);
-        if (parts[0] != v) {
+        if (plen[0] > 0 && parts[0] != v) { /* an empty value may come without a buffer (replayed records) */
             memmove(v, parts[0], plen[0]);
         }
         if (plen[1] > 0) {

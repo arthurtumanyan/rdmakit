@@ -91,7 +91,7 @@ Statements about other systems reflect their public documentation at the time of
 | Data types | strings | strings | strings, lists, hashes, sets, sorted sets, streams | as Valkey |
 | Authentication | ACL users with per-user commands, categories and key patterns (subset of the Valkey ACL file syntax) | SASL, ASCII auth | ACL users | ACL users |
 | Persistence | snapshots, append-only log (fsync always, everysec or no), warm restart | warm restart | RDB, AOF | snapshots |
-| Replication, cluster | no (client-side consistent hashing) | no (client-side hashing) | yes | replication, cluster mode |
+| Replication, cluster | asynchronous replication over TCP or RDMA with partial resynchronization and manual failover; Redis Cluster protocol with a fixed slot map | no (client-side hashing) | yes | replication, cluster mode |
 | Hash index | grows from a small size | grows | grows | grows |
 | Source size | about 10,200 lines (engine, server, protocols, persistence, access control, client) | large | large | large |
 | Production use | not recommended | widely deployed | widely deployed | deployed |

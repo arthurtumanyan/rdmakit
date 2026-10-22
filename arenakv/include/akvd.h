@@ -82,6 +82,23 @@ typedef struct akvd_config {
     /* Pending replies of a pub/sub subscriber above which it is disconnected; 0 selects 32 MiB, the
      * pubsub client-output-buffer-limit of Valkey. */
     uint64_t pubsub_output_limit;
+    /*
+     * Replication: replicaof_host and replicaof_port name the native listener of a primary to follow
+     * (NULL: none); primary_auth is "user:password" (or a password) for it; replica_read_only refuses
+     * client writes while following (default 1); repl_backlog_size bounds how far a replica may fall
+     * behind and still continue (0 selects 64 MiB).
+     */
+    /*
+     * Cluster protocol (src/cluster.h): the slot map file shared by all nodes and this node's id. A replica
+     * in the map follows its primary unless replicaof_host is set. NULL disables cluster mode.
+     */
+    const char *cluster_config;
+    const char *cluster_node_id;
+    const char *replicaof_host;
+    const char *replicaof_port;
+    const char *primary_auth;
+    int replica_read_only;
+    size_t repl_backlog_size;
     enum akvd_log_level log_level;
     const char *log_path; /* NULL = standard error */
 } akvd_config;

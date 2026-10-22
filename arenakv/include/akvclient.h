@@ -15,7 +15,10 @@
  *
  * akvc_pool distributes keys over several servers with consistent hashing (160 points per server on a
  * 64-bit ring, as in libketama; the hash function is arenakv's own, so the placement differs from
- * libketama clients). Adding or removing a server moves about 1/n of the keys.
+ * libketama clients). Adding or removing a server moves about 1/n of the keys. A server entry may list a
+ * primary and its replicas ("host:port,host:port,..."): the entry is placed on the ring by its whole text,
+ * writes go to whichever of its servers reports itself as primary (akvc_role), and after a failure
+ * akvc_pool_reconnect() finds the new primary once one of the replicas has been promoted.
  */
 #ifndef AKVCLIENT_H
 #define AKVCLIENT_H
@@ -127,15 +130,36 @@ int akvc_arm(akvc *c);
 int akvc_direct_fd(akvc *c);
 uint32_t akvc_wait_events(const akvc *c);
 
+/* Role of the server: *replica = 0 for a primary, 1 for a replica. Returns AKVP_OK or an error. */
+int akvc_role(akvc *c, int *replica);
+
 /* ---- several servers ----------------------------------------------------------------------------------- */
 
 typedef struct akvc_pool akvc_pool;
 
-/* Connects to n servers given as "host:port". Returns 0 or the error of the first failed connection. */
+/*
+ * Connects to n server entries, each "host:port" or "host:port,host:port,..." (a primary and its replicas,
+ * in any order). For every entry the pool connects to the server that reports itself as primary, or to the
+ * first reachable server when none does. Returns 0, or the error of an entry none of whose servers is
+ * reachable.
+ */
 int akvc_pool_create(akvc_pool **out, const struct duct_opts *opts, const char *const *servers, unsigned n);
 
-/* Returns the client of the server that owns key. */
+/* Returns the client of the entry that owns key (its primary when one was found). */
 akvc *akvc_pool_pick(akvc_pool *p, const void *key, size_t klen);
+
+/*
+ * For reads that may be served by a replica: a client connected to a replica of the entry that owns key,
+ * or the client of akvc_pool_pick() when the entry has no reachable replica. Replica data lags the primary.
+ */
+akvc *akvc_pool_pick_read(akvc_pool *p, const void *key, size_t klen);
+
+/*
+ * After a transport error of the client of the entry that owns key: closes it and connects to the server
+ * of the entry that reports itself as primary. Returns 0, or -ENOTCONN when no server of the entry is a
+ * reachable primary (the previous client is gone; call again after a promotion).
+ */
+int akvc_pool_reconnect(akvc_pool *p, const void *key, size_t klen);
 
 /* Index of the server that owns key (0 .. n-1). */
 unsigned akvc_pool_index(const akvc_pool *p, const void *key, size_t klen);

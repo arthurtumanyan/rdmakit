@@ -68,7 +68,7 @@ generation, HTTP. See
 | Server CPU time and memory per operation | yes (`--server-pid`) | no | no |
 | Hardware and software environment in every result file | yes | no | no |
 | Multi-host load generation | synchronized start, `kvpace merge` of the result files | no | separate client processes |
-| Cluster-aware clients | no | Redis Cluster | per binding |
+| Cluster-aware clients | Redis Cluster (`--driver resp-cluster`, one connection per thread) | Redis Cluster | per binding |
 
 Statements about other systems reflect their public documentation at the time of writing.
 

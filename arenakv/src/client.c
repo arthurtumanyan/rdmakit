@@ -1,5 +1,6 @@
 /* client.c - client for the native arenakv protocol, see akvclient.h. */
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -299,6 +300,18 @@ int akvc_flush(akvc *c) {
     return call(c, AKVP_FLUSH, NULL, 0, NULL, 0, NULL, &r);
 }
 
+int akvc_role(akvc *c, int *replica) {
+    struct akvc_resp r;
+    int rc = call(c, AKVP_ROLE, NULL, 0, NULL, 0, NULL, &r);
+    if (rc == AKVP_OK) {
+        if (r.len < 1) {
+            return AKVP_ERROR;
+        }
+        *replica = r.payload[0] != 0;
+    }
+    return rc;
+}
+
 int akvc_stats(akvc *c, uint64_t out[AKVP_STATS_FIELDS]) {
     struct akvc_resp r;
     int rc = call(c, AKVP_STATS, NULL, 0, NULL, 0, NULL, &r);
@@ -353,12 +366,73 @@ struct point {
     unsigned server;
 };
 
+/* One ring entry: its servers ("host:port" each), the client of its primary, and a replica client. */
+struct shard {
+    char **addrs;
+    unsigned naddrs;
+    akvc *cur;
+    unsigned cur_idx;
+    akvc *reader;
+    int reader_tried;
+};
+
 struct akvc_pool {
-    akvc **clients;
+    struct duct_opts opts;
+    struct shard *shards;
     unsigned n;
     struct point *ring;
     size_t npoints;
 };
+
+/* Connects to "host:port". Returns 0 or an error. */
+static int connect_addr(const struct duct_opts *o, const char *addr, akvc **out) {
+    char host[256];
+    const char *colon = strrchr(addr, ':');
+    if (colon == NULL || (size_t)(colon - addr) >= sizeof(host)) {
+        return -EINVAL;
+    }
+    memcpy(host, addr, (size_t)(colon - addr));
+    host[colon - addr] = '\0';
+    return akvc_connect(out, o, host, colon + 1);
+}
+
+/*
+ * Connects s->cur to the server of the entry that reports itself as primary, skipping `skip` (an index,
+ * or UINT_MAX). With `any`, the first reachable server is taken when none is primary. Returns 0, or
+ * -ENOTCONN when no server qualifies.
+ */
+static int find_primary(const struct duct_opts *o, struct shard *s, unsigned skip, int any) {
+    akvc *fallback = NULL;
+    unsigned fallback_idx = 0;
+    for (unsigned i = 0; i < s->naddrs; i++) {
+        if (i == skip) {
+            continue;
+        }
+        akvc *c;
+        if (connect_addr(o, s->addrs[i], &c) != 0) {
+            continue;
+        }
+        int replica = 1;
+        if (akvc_role(c, &replica) == AKVP_OK && !replica) {
+            akvc_close(fallback);
+            s->cur = c;
+            s->cur_idx = i;
+            return 0;
+        }
+        if (any && fallback == NULL) {
+            fallback = c;
+            fallback_idx = i;
+        } else {
+            akvc_close(c);
+        }
+    }
+    if (fallback != NULL) {
+        s->cur = fallback;
+        s->cur_idx = fallback_idx;
+        return 0;
+    }
+    return -ENOTCONN;
+}
 
 static int cmp_point(const void *a, const void *b) {
     const struct point *x = a;
@@ -374,30 +448,49 @@ int akvc_pool_create(akvc_pool **out, const struct duct_opts *opts, const char *
     if (p == NULL) {
         return -ENOMEM;
     }
-    p->clients = calloc(n, sizeof(*p->clients));
+    p->opts = *opts;
+    p->shards = calloc(n, sizeof(*p->shards));
     p->ring = calloc((size_t)n * POOL_POINTS, sizeof(*p->ring));
-    if (p->clients == NULL || p->ring == NULL) {
+    if (p->shards == NULL || p->ring == NULL) {
         akvc_pool_close(p);
         return -ENOMEM;
     }
     p->n = n;
     for (unsigned i = 0; i < n; i++) {
-        char host[256];
-        const char *colon = strrchr(servers[i], ':');
-        if (colon == NULL || (size_t)(colon - servers[i]) >= sizeof(host)) {
+        struct shard *s = &p->shards[i];
+        for (const char *a = servers[i]; *a != '\0';) {
+            size_t len = strcspn(a, ",");
+            char **na = realloc(s->addrs, (s->naddrs + 1) * sizeof(*na));
+            char *copy = len > 0 ? malloc(len + 1) : NULL;
+            if (na == NULL || (len > 0 && copy == NULL)) {
+                free(copy);
+                if (na != NULL) {
+                    s->addrs = na;
+                }
+                akvc_pool_close(p);
+                return -ENOMEM;
+            }
+            s->addrs = na;
+            if (len > 0) {
+                memcpy(copy, a, len);
+                copy[len] = '\0';
+                s->addrs[s->naddrs++] = copy;
+            }
+            a += len + (a[len] == ',');
+        }
+        if (s->naddrs == 0) {
             akvc_pool_close(p);
             return -EINVAL;
         }
-        memcpy(host, servers[i], (size_t)(colon - servers[i]));
-        host[colon - servers[i]] = '\0';
-        int rc = akvc_connect(&p->clients[i], opts, host, colon + 1);
+        int rc =
+            s->naddrs == 1 ? connect_addr(opts, s->addrs[0], &s->cur) : find_primary(opts, s, UINT_MAX, 1);
         if (rc != 0) {
             akvc_pool_close(p);
             return rc;
         }
-        /* Points depend on the server's name only, so every client computes the same ring. */
+        /* Points depend on the entry's text only, so every client computes the same ring. */
         for (unsigned k = 0; k < POOL_POINTS; k++) {
-            char label[300];
+            char label[1100];
             int len = snprintf(label, sizeof(label), "%s-%u", servers[i], k);
             p->ring[p->npoints++] =
                 (struct point){.pos = akv_hash64(label, (size_t)len, POOL_SEED), .server = i};
@@ -424,17 +517,53 @@ unsigned akvc_pool_index(const akvc_pool *p, const void *key, size_t klen) {
 }
 
 akvc *akvc_pool_pick(akvc_pool *p, const void *key, size_t klen) {
-    return p->clients[akvc_pool_index(p, key, klen)];
+    return p->shards[akvc_pool_index(p, key, klen)].cur;
+}
+
+akvc *akvc_pool_pick_read(akvc_pool *p, const void *key, size_t klen) {
+    struct shard *s = &p->shards[akvc_pool_index(p, key, klen)];
+    if (s->reader == NULL && !s->reader_tried) {
+        s->reader_tried = 1;
+        for (unsigned i = 0; i < s->naddrs && s->reader == NULL; i++) {
+            akvc *c;
+            if (i == s->cur_idx || connect_addr(&p->opts, s->addrs[i], &c) != 0) {
+                continue;
+            }
+            int replica = 0;
+            if (akvc_role(c, &replica) == AKVP_OK && replica) {
+                s->reader = c;
+            } else {
+                akvc_close(c);
+            }
+        }
+    }
+    return s->reader != NULL ? s->reader : s->cur;
+}
+
+int akvc_pool_reconnect(akvc_pool *p, const void *key, size_t klen) {
+    struct shard *s = &p->shards[akvc_pool_index(p, key, klen)];
+    akvc_close(s->cur);
+    s->cur = NULL;
+    akvc_close(s->reader); /* a promoted replica stops being one */
+    s->reader = NULL;
+    s->reader_tried = 0;
+    return find_primary(&p->opts, s, UINT_MAX, 0);
 }
 
 void akvc_pool_close(akvc_pool *p) {
     if (p == NULL) {
         return;
     }
-    for (unsigned i = 0; p->clients != NULL && i < p->n; i++) {
-        akvc_close(p->clients[i]);
+    for (unsigned i = 0; p->shards != NULL && i < p->n; i++) {
+        struct shard *s = &p->shards[i];
+        akvc_close(s->cur);
+        akvc_close(s->reader);
+        for (unsigned k = 0; k < s->naddrs; k++) {
+            free(s->addrs[k]);
+        }
+        free(s->addrs);
     }
-    free(p->clients);
+    free(p->shards);
     free(p->ring);
     free(p);
 }

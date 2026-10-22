@@ -51,7 +51,9 @@
  * allocated once). Connections on other devices are rejected with DUCT_ENODEV.
  */
 #include <endian.h>
+#include <arpa/inet.h>
 #include <errno.h>
+#include <stdio.h>
 #include <fcntl.h>
 #include <infiniband/verbs.h>
 #include <netdb.h>
@@ -943,6 +945,23 @@ static void rdma_close(duct_ep *base) {
     rdma_ep_free((struct rdma_ep *)base);
 }
 
+/* Formats an IPv4 socket address as "a.b.c.d:port". Returns 0 or -EAFNOSUPPORT. */
+static int format_addr(const struct sockaddr *sa, char *buf, size_t n) {
+    if (sa == NULL || sa->sa_family != AF_INET) {
+        return -EAFNOSUPPORT;
+    }
+    const struct sockaddr_in *in = (const struct sockaddr_in *)sa;
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &in->sin_addr, ip, sizeof(ip));
+    snprintf(buf, n, "%s:%u", ip, (unsigned)ntohs(in->sin_port));
+    return 0;
+}
+
+static int rdma_peer_addr(const duct_ep *base, char *buf, size_t n) {
+    const struct rdma_ep *e = (const struct rdma_ep *)base;
+    return format_addr(rdma_get_peer_addr(e->id), buf, n);
+}
+
 static const struct duct_ep_ops rdma_ep_ops = {
     .send = rdma_send,
     .send_batch = rdma_send_batch,
@@ -960,6 +979,7 @@ static const struct duct_ep_ops rdma_ep_ops = {
     .rma = rdma_rma,
     .completed = rdma_completed,
     .wait = rdma_wait,
+    .peer_addr = rdma_peer_addr,
 };
 
 /* Allocates the queue pair, completion queue and registered memory of endpoint e (e->id is set). */

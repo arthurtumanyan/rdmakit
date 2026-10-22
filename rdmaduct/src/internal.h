@@ -141,6 +141,7 @@ struct duct_ep_ops {
     int (*rma)(duct_ep *ep, const struct duct_rma *op, int timeout_ms, uint64_t *seq);
     uint64_t (*completed)(duct_ep *ep);
     int (*wait)(duct_ep *ep, uint64_t seq, int timeout_ms);
+    int (*peer_addr)(const duct_ep *ep, char *buf, size_t n);
 };
 
 struct duct_ep {

@@ -101,7 +101,7 @@ is faster than Valkey and Dragonfly at four server CPUs [C2]. The margins per ro
 server CPU time is spent in the kernel [C28]. Its design targets a transport without kernel TCP overhead, and that
 path has been exercised only on Soft-RoCE, a software implementation [C6], so no claim about RDMA hardware is made.
 
-What it does not do: replication, server-side clustering, data structures beyond byte-string keys and values,
+What it does not do: automatic failover, resharding, data structures beyond byte-string keys and values,
 scripting, the memcached binary protocol, integration with inference serving engines. It is not
 recommended for production use.
 

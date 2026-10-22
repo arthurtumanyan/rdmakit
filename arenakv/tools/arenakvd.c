@@ -39,6 +39,11 @@
  *   --aof-rewrite-percentage N, --aof-rewrite-min-size SIZE   automatic rewrite (default: 100, 64M)
  *   --aof-load-damaged          start with the records before a damaged block instead of failing
  *   --warm-restart FILE         keep the cache memory in FILE (under /dev/shm) across restarts
+ *   --cluster-config FILE, --cluster-node-id ID   cluster protocol with a fixed slot map
+ *   --replicaof HOST:PORT       follow the primary whose native listener is HOST:PORT
+ *   --primary-auth USER:PASSWORD   credentials for the primary
+ *   --replica-read-only yes|no  refuse client writes while following (default: yes)
+ *   --repl-backlog-size SIZE    changes kept for replicas that reconnect (default: 64M)
  *   --pubsub-output-limit SIZE  pending messages of a subscriber before it is disconnected (default: 32M)
  *   --log-level error|warn|info|debug, --log-file FILE (reopened on SIGHUP)
  *   --stats SECONDS             log a statistics line every SECONDS seconds
@@ -114,6 +119,12 @@ static const char usage[] =
     "  --aof-rewrite-min-size SIZE ... and is at least SIZE (default: 64M)\n"
     "  --aof-load-damaged          start with the records before a damaged block instead of failing\n"
     "  --warm-restart FILE         keep the cache memory in FILE (under /dev/shm) across restarts\n"
+    "  --cluster-config FILE       cluster protocol: the slot map shared by all nodes\n"
+    "  --cluster-node-id ID        this node's id in the slot map\n"
+    "  --replicaof HOST:PORT       follow the primary whose native listener is HOST:PORT\n"
+    "  --primary-auth USER:PASSWORD  credentials for the primary\n"
+    "  --replica-read-only yes|no  refuse client writes while following (default: yes)\n"
+    "  --repl-backlog-size SIZE    changes kept for replicas that reconnect (default: 64M)\n"
     "  --pubsub-output-limit SIZE  pending messages of a subscriber before it is disconnected\n"
     "                              (default: 32M)\n"
     "  --log-level error|warn|info|debug   (default: info)\n"
@@ -252,6 +263,12 @@ static const struct option lo[] = {
     {"warm-restart", required_argument, NULL, 1018},
     {"aclfile", required_argument, NULL, 1019},
     {"pubsub-output-limit", required_argument, NULL, 1020},
+    {"replicaof", required_argument, NULL, 1021},
+    {"cluster-config", required_argument, NULL, 1025},
+    {"cluster-node-id", required_argument, NULL, 1026},
+    {"primary-auth", required_argument, NULL, 1022},
+    {"replica-read-only", required_argument, NULL, 1023},
+    {"repl-backlog-size", required_argument, NULL, 1024},
     {"help", no_argument, NULL, 'h'},
     {"version", no_argument, NULL, 'V'},
     {NULL, 0, NULL, 0},
@@ -597,6 +614,39 @@ int main(int argc, char **argv) {
         case 1019:
             cfg.acl_file = optarg;
             break;
+        case 1021: {
+            char *colon = strrchr(optarg, ':');
+            unsigned long pv;
+            if (colon == NULL || colon == optarg || parse_uint(colon + 1, 1, 65535, &pv) != 0) {
+                return bad_value(name, optarg, "HOST:PORT of the primary's native listener");
+            }
+            *colon = '\0';
+            cfg.replicaof_host = optarg;
+            cfg.replicaof_port = colon + 1;
+            break;
+        }
+        case 1022:
+            cfg.primary_auth = optarg;
+            break;
+        case 1025:
+            cfg.cluster_config = optarg;
+            break;
+        case 1026:
+            cfg.cluster_node_id = optarg;
+            break;
+        case 1023:
+            if (strcmp(optarg, "yes") == 0 || strcmp(optarg, "no") == 0) {
+                cfg.replica_read_only = strcmp(optarg, "yes") == 0;
+            } else {
+                return bad_value(name, optarg, "yes or no");
+            }
+            break;
+        case 1024:
+            cfg.repl_backlog_size = (size_t)parse_size(optarg);
+            if (cfg.repl_backlog_size < 4096) {
+                return bad_value(name, optarg, "a size of at least 4K such as 64M");
+            }
+            break;
         case 1020:
             cfg.pubsub_output_limit = parse_size(optarg);
             if (cfg.pubsub_output_limit == 0) {
@@ -627,6 +677,10 @@ int main(int argc, char **argv) {
     if ((cfg.tls_memcached_port != NULL || cfg.tls_resp_port != NULL) &&
         (cfg.tls_cert == NULL || cfg.tls_key == NULL)) {
         fprintf(stderr, "arenakvd: TLS listeners need --tls-cert and --tls-key\n");
+        return 2;
+    }
+    if ((cfg.cluster_config == NULL) != (cfg.cluster_node_id == NULL)) {
+        fprintf(stderr, "arenakvd: --cluster-config and --cluster-node-id are used together\n");
         return 2;
     }
     if (cfg.auth_file != NULL && cfg.acl_file != NULL) {

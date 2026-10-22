@@ -96,6 +96,8 @@ typedef struct pace_driver {
 
 /* RESP2 over TCP or TLS (Redis, Valkey, Dragonfly, arenakv). */
 extern const pace_driver pace_driver_resp;
+/* RESP against a Redis Cluster: requests go to the primary of each key's slot (synchronous runner only). */
+extern const pace_driver pace_driver_resp_cluster;
 /* memcached text protocol over TCP or TLS (INCR uses the meta command ma). */
 extern const pace_driver pace_driver_memcached;
 #ifdef PACE_HAVE_NATIVE

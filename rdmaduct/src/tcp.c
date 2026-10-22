@@ -43,7 +43,9 @@
  * Event loop integration: each endpoint owns an epoll descriptor that contains the socket (POLLIN, and
  * POLLOUT while the send queue is not empty).
  */
+#include <arpa/inet.h>
 #include <errno.h>
+#include <stdio.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -1255,6 +1257,28 @@ static void tcp_close(duct_ep *base) {
     tcp_ep_free(e);
 }
 
+/* Formats an IPv4 socket address as "a.b.c.d:port". Returns 0 or -EAFNOSUPPORT. */
+static int format_addr(const struct sockaddr *sa, char *buf, size_t n) {
+    if (sa == NULL || sa->sa_family != AF_INET) {
+        return -EAFNOSUPPORT;
+    }
+    const struct sockaddr_in *in = (const struct sockaddr_in *)sa;
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &in->sin_addr, ip, sizeof(ip));
+    snprintf(buf, n, "%s:%u", ip, (unsigned)ntohs(in->sin_port));
+    return 0;
+}
+
+static int tcp_peer_addr(const duct_ep *base, char *buf, size_t n) {
+    const struct tcp_ep *e = (const struct tcp_ep *)base;
+    struct sockaddr_in sa = {0};
+    socklen_t sl = sizeof(sa);
+    if (getpeername(e->fd, (struct sockaddr *)&sa, &sl) != 0) {
+        return -errno;
+    }
+    return format_addr((const struct sockaddr *)&sa, buf, n);
+}
+
 static const struct duct_ep_ops tcp_ep_ops = {
     .send = tcp_send,
     .send_batch = tcp_send_batch,
@@ -1272,6 +1296,7 @@ static const struct duct_ep_ops tcp_ep_ops = {
     .rma = tcp_rma,
     .completed = tcp_completed,
     .wait = tcp_wait,
+    .peer_addr = tcp_peer_addr,
 };
 
 /* Exchanges handshakes on a connected, non-blocking socket and builds the endpoint. */

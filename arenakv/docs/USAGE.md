@@ -137,6 +137,11 @@ that names the option and the accepted range.
 | `--aof-rewrite-min-size SIZE` | 64M | ... and the log is at least SIZE |
 | `--aof-load-damaged` | off | start with the records before a damaged block instead of refusing to start |
 | `--warm-restart FILE` | | keep the cache memory in FILE (on tmpfs, normally under `/dev/shm`) so that a restart of the process keeps the entries ([OPERATIONS.md](OPERATIONS.md#warm-restart)) |
+| `--replicaof HOST:PORT` | | follow the primary whose native listener is HOST:PORT ([OPERATIONS.md](OPERATIONS.md#replication)) |
+| `--primary-auth USER:PASSWORD` | | credentials of a user with the `replication` category on the primary |
+| `--replica-read-only yes\|no` | yes | refuse client writes while following a primary |
+| `--repl-backlog-size SIZE` | 64M | changes kept for replicas that reconnect; at least 4K |
+| `--cluster-config FILE`, `--cluster-node-id ID` | | Redis Cluster protocol with the slot map in FILE ([OPERATIONS.md](OPERATIONS.md#cluster-protocol)) |
 | `--pubsub-output-limit SIZE` | 32M | unread messages of a subscriber before it is disconnected (the pubsub client-output-buffer-limit of Valkey) |
 | `--log-level error\|warn\|info\|debug` | info | |
 | `--log-file FILE` | standard error | reopened on `SIGHUP` |
@@ -316,7 +321,12 @@ Command names are case-insensitive. Values and keys are byte strings; the engine
 | `PUBSUB CHANNELS [pattern]`, `PUBSUB NUMSUB [channel ...]`, `PUBSUB NUMPAT` | channels with subscribers; subscribers per channel; distinct patterns | |
 | `SELECT 0` | `OK` | only database 0 exists |
 | `CLIENT SETNAME name`, `CLIENT GETNAME`, `CLIENT ID`, `CLIENT SETINFO ...` | | |
-| `COMMAND`, `COMMAND COUNT` | empty array, 0 | for client compatibility |
+| `COMMAND`, `COMMAND COUNT`, `COMMAND INFO name ...` | name, arity, flags, key positions and ACL categories of every command | cluster clients use the key positions |
+| `REPLICAOF host port`, `REPLICAOF NO ONE` (`SLAVEOF`) | `OK` | follow a primary's native port, or become a primary |
+| `ROLE` | `master`, offset, replicas; or `slave`, host, port, state, offset | |
+| `WAIT numreplicas timeout-ms` | number of replicas that acknowledged | waits for the last change made through the connection's worker; 0 waits without limit |
+| `CLUSTER SLOTS\|SHARDS\|NODES\|INFO\|MYID\|KEYSLOT key\|COUNTKEYSINSLOT slot\|RELOAD` | | cluster mode; `KEYSLOT` works without it |
+| `READONLY`, `READWRITE` | `OK` | cluster mode: a replica serves reads of its primary's slots to this connection |
 | `CONFIG GET pattern` | `maxmemory`, `maxmemory-policy`, `save`, `appendonly` (`yes` with `--appendonly`), `appendfsync`, `databases`, `io-threads` | `CONFIG SET` is refused: use the server options |
 | `ACL WHOAMI\|USERS\|LIST\|CAT [category]\|GETUSER name\|DRYRUN user command [arg ...]\|LOAD` | see [OPERATIONS.md](OPERATIONS.md#inspecting-and-reloading) | `SETUSER`, `DELUSER`, `SAVE` are refused: the ACL file is the only source of users |
 | `INFO [section]` | all sections | fields in [OPERATIONS.md](OPERATIONS.md#monitoring) |
@@ -332,7 +342,8 @@ Error replies follow Redis: `ERR unknown command '...'`, `ERR wrong number of ar
 memory > 'maxmemory'.` when the server runs with `--no-evict` and is full, and `ERR string exceeds maximum allowed
 size` when key + value exceed the entry limit.
 
-Not supported: lists, hashes, sets, sorted sets, streams, bitmaps, HyperLogLog, scripting, sharded pub/sub,
+Not supported: lists, hashes, sets, sorted sets, streams, bitmaps, HyperLogLog, scripting, sharded pub/sub, cluster
+resharding (`CLUSTER ADDSLOTS`, `MIGRATE`, `ASK`),
 keyspace notifications and the ACL commands that change users (`ACL SETUSER`, `DELUSER`, `SAVE`).
 
 ## 5. Querying with the memcached protocol
@@ -512,7 +523,8 @@ Build: compile with `-Iarenakv/include -Irdmaduct/include` and link `arenakv/bui
 | `akvc_del`, `akvc_exists`, `akvc_touch`, `akvc_incr`, `akvc_flush`, `akvc_stats` | |
 | `akvc_post`, `akvc_push`, `akvc_next`, `akvc_window`, `akvc_outstanding` | pipelining: up to `akvc_window()` requests in flight, answered in order |
 | `akvc_fd`, `akvc_arm`, `akvc_direct_fd`, `akvc_wait_events` | integration into an event loop |
-| `akvc_pool_create`, `akvc_pool_pick`, `akvc_pool_index`, `akvc_pool_close` | several servers with consistent hashing |
+| `akvc_pool_create`, `akvc_pool_pick`, `akvc_pool_index`, `akvc_pool_close` | several servers with consistent hashing; an entry `primary,replica,...` names a primary and its replicas |
+| `akvc_pool_pick_read`, `akvc_pool_reconnect`, `akvc_role` | reads from a replica; after a transport error, connect to the entry's server that now reports itself as primary (after `REPLICAOF NO ONE`); the role of a server |
 
 Return values: `AKVP_OK` (0) or another `akvp_status` (positive) when the server answered, a negative error code
 when the transport failed; after a negative result the client must be closed. A client is used by one thread at a

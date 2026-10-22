@@ -73,6 +73,12 @@ enum akvp_op {
     AKVP_MGET = 16,
     AKVP_AUTH = 17, /* value = "user:password" or "password" */
     AKVP_NOOP = 18, /* nothing; answered AKVP_OK (pipeline barrier, keep-alive) */
+    /*
+     * value = 40-byte replication id, 8-byte offset, 2-byte listening port: starts a replication link
+     * (src/repl.h); the connection then carries the replication stream instead of responses.
+     */
+    AKVP_REPLSYNC = 19,
+    AKVP_ROLE = 20, /* [1 byte: 0 primary, 1 replica] */
 };
 
 enum akvp_status {
@@ -81,11 +87,12 @@ enum akvp_status {
     AKVP_BADREQ = 2,
     AKVP_TOOBIG = 3,
     AKVP_ERROR = 4,
-    AKVP_EXISTS = 5, /* ADD of a present key, CAS mismatch */
-    AKVP_NOMEM = 6,  /* no space without eviction (server started with eviction disabled) */
-    AKVP_NOAUTH = 7, /* authentication required or failed */
-    AKVP_NOTNUM = 8, /* INCR of a non-numeric value, signed overflow */
-    AKVP_NOPERM = 9, /* the user may not run the operation or access the key (access control list) */
+    AKVP_EXISTS = 5,    /* ADD of a present key, CAS mismatch */
+    AKVP_NOMEM = 6,     /* no space without eviction (server started with eviction disabled) */
+    AKVP_NOAUTH = 7,    /* authentication required or failed */
+    AKVP_NOTNUM = 8,    /* INCR of a non-numeric value, signed overflow */
+    AKVP_NOPERM = 9,    /* the user may not run the operation or access the key (access control list) */
+    AKVP_READONLY = 10, /* a write sent to a read-only replica */
 };
 
 /*

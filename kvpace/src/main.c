@@ -78,7 +78,7 @@ static const char usage[] =
     "       kvpace merge --out MERGED.json RESULT.json [RESULT.json ...]\n"
     "\n"
     "Connection:\n"
-    "  --driver NAME          protocol driver: resp | memcached | native (default: resp)\n"
+    "  --driver NAME          protocol driver: resp | resp-cluster | memcached | native (default: resp)\n"
     "  --driver-opt K=V       driver option, repeatable (native: transport=tcp|rdma|auto, wait=poll|event,\n"
     "                         max-msg=N, depth=N)\n"
     "  --host HOST, --port PORT   server address (default: 127.0.0.1:6379)\n"

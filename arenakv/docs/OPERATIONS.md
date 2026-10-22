@@ -14,6 +14,7 @@ protocol are described in [`USAGE.md`](USAGE.md).
 - [TLS](#tls)
 - [Network exposure](#network-exposure)
 - [Persistence](#persistence)
+- [Replication](#replication)
 - [Monitoring](#monitoring)
 - [Logging](#logging)
 - [Maintenance](#maintenance)
@@ -376,6 +377,91 @@ reason 1, key length 2, client flags 4, value length 4, absolute expiry in Unix 
 8, key, value). Record kinds: 1 store, 2 delete, 3 expiry change, 4 flush, 100 end of a transaction. Definition:
 `src/aof.h`, `src/aof.c`. Warm-restart file: `src/akv.c` (header `struct warm_hdr`).
 
+## Replication
+
+### Setting up a replica
+
+```
+arenakvd --transport tcp --addr 10.0.0.1 --port 7600 --resp-port 6379 ...                    # primary
+arenakvd --transport tcp --addr 10.0.0.2 --port 7600 --resp-port 6379 --replicaof 10.0.0.1:7600 ... # replica
+```
+
+A replica connects to the native listener of its primary (`--replicaof HOST:PORT`), over the transport of its own
+`--transport` option, so replication runs over RDMA where both hosts have a device. With access control on the
+primary, `--primary-auth USER:PASSWORD` names a user with the `replication` category (`+@replication`). `REPLICAOF
+host port` starts or changes replication at run time, and `REPLICAOF NO ONE` stops it.
+
+### How it works
+
+- The primary keeps every change (stores, deletes, expiry changes, flushes, removals by expiry and eviction) in a
+  backlog of `--repl-backlog-size` bytes (default 64 MiB), addressed by a byte offset under a replication id. The
+  backlog starts recording when the first replica connects or the server follows a primary, so a server without
+  replicas does no replication work.
+- A replica asks for the stream from its replication id and offset. When the primary still holds that offset it
+  continues from there (`replica ...: continuing at offset N` in the primary's log); otherwise it sends a full copy
+  of its content, then the changes from the offset at which the copy started (`full copy, stream from offset N`).
+  A replica that restarts has no offset and receives a full copy.
+- Replication is asynchronous: the primary answers clients before the replicas have the change. `WAIT numreplicas
+  timeout-ms` returns how many replicas acknowledged the last change made through the connection's worker, after at
+  most the timeout (0 waits without limit).
+- A replica applies the changes in order, transactions completely or not at all, and refuses client writes
+  (`READONLY You can't write against a read only replica.`, memcached `CLIENT_ERROR read only replica`, native
+  `AKVP_READONLY`) unless started with `--replica-read-only no`.
+- Expiry: the primary decides. A replica hides entries whose expiry passed but removes them only when the primary's
+  delete arrives, so a change that the primary made before the expiry still applies. Expiry times are absolute, so
+  the clocks of the hosts must agree (NTP); an offset between clocks shifts when entries disappear from the replica.
+- A replica's own eviction is local: a replica with less `--capacity` than its primary evicts earlier and then
+  holds fewer entries.
+- A replica keeps the stream in its own backlog, so other replicas can follow it (chains) and, after a promotion,
+  the replicas of the old primary can continue from their offset.
+
+### Failover
+
+There is no automatic failover. When a primary fails:
+
+1. Choose the replica with the highest `slave_repl_offset` (`INFO replication`).
+2. Promote it: `REPLICAOF NO ONE`. It keeps the old replication id as its second id (`master_replid2`).
+3. Point the other replicas at it: `REPLICAOF <new primary> <native port>`. They continue from their offsets
+   without a full copy, as long as they did not get ahead of the promoted replica.
+4. Point the clients at the new primary. Clients of the native protocol that use an `akvc_pool` entry
+   `primary,replica,...` find it with `akvc_pool_reconnect()`; RESP clients follow their own configuration.
+
+Changes that the old primary acknowledged but had not yet sent are lost; `WAIT` bounds that for the writes that
+need it.
+
+### Cluster protocol
+
+`--cluster-config FILE --cluster-node-id ID` makes the RESP listener speak the Redis Cluster protocol with a slot
+map from FILE, the same file on every node:
+
+```
+# id  host      resp-port native-port role
+node n1 10.0.0.1 6379 7600 primary 0-5460
+node n2 10.0.0.2 6379 7600 primary 5461-10922
+node n3 10.0.0.3 6379 7600 primary 10923-16383
+node r1 10.0.0.4 6379 7600 replica-of n1
+```
+
+- Keys map to the 16384 slots of the Redis Cluster specification (CRC16, hash tags `{...}`). A command for a key of
+  another node's slot answers `MOVED <slot> <host>:<port>`; keys of several slots in one command answer
+  `CROSSSLOT`. Cluster clients (`valkey-cli -c`, redis-py `RedisCluster`, kvpace `--driver resp-cluster`) follow
+  the redirections.
+- A replica in the map follows its primary automatically (through the primary's native port) and serves reads of
+  its primary's slots to connections that send `READONLY`; other commands are redirected to the primary.
+- `CLUSTER SLOTS`, `SHARDS`, `NODES`, `INFO`, `MYID`, `KEYSLOT` and `COUNTKEYSINSLOT` describe the map. There is no
+  gossip, no automatic failover and no resharding: the map changes only when the file is edited and `CLUSTER
+  RELOAD` is sent to every node. To move slots, copy their keys to the new owner first, then reload the edited map
+  everywhere.
+- The memcached and native listeners do not check slots; their clients distribute keys themselves (`akvc_pool`).
+
+### Monitoring replication
+
+`INFO replication` reports `role`, `connected_slaves` with one `slaveN:ip=...,port=...,state=...,offset=...,lag=...`
+line per replica (`lag` in bytes of stream not yet acknowledged), `master_replid`, `master_replid2`,
+`master_repl_offset`, `second_repl_offset` and the backlog (`repl_backlog_size`, `repl_backlog_first_byte_offset`,
+`repl_backlog_histlen`); on a replica also `master_host`, `master_port`, `master_link_status` (`up` once the copy
+is complete), `master_last_io_seconds_ago` and `slave_repl_offset`. `ROLE` gives the same in the form of Redis.
+
 ## Monitoring
 
 ### Interfaces
@@ -489,6 +575,9 @@ snapshot writes, TLS files that cannot be loaded.
 | `append-only log ... cannot be opened (Bad message)` | a damaged block before the end of the log, or log files without a manifest | [Damaged files](#damaged-files) |
 | `warm restart: memory discarded (...)` | crash, changed `--capacity`/`--shards`/`--max-entry`, or another version | expected after a crash; the log or snapshot is loaded instead |
 | `aof_last_write_status:err` | the disk refuses writes (full, read-only) | free space; with `always`, clients wait until writes succeed again |
+| `master_link_status:down` on a replica | the primary is unreachable, or refused the credentials | the replica's log names the reason; it reconnects every second |
+| `replica ...: more than the backlog size behind` | the replica could not keep up (slow network, paused) | it resynchronizes fully; raise `--repl-backlog-size` |
+| `MOVED` / `CROSSSLOT` replies | cluster mode: the key belongs to another node, or the command names keys of several slots | use a cluster client; group keys with hash tags `{...}` |
 | `TLS options need a build with TLS=1` | TLS listener options on a build without TLS | build with `make TLS=1` |
 | clients get `NOAUTH` / `CLIENT_ERROR unauthenticated` / `AKVP_NOAUTH` | `--aclfile` or `--auth-file` is set | authenticate first ([Authentication](#authentication-and-access-control)) |
 | `NOPERM ...` / `CLIENT_ERROR permission denied` / `AKVP_NOPERM` | the user's rules do not allow the command or key | `ACL DRYRUN user command args` names the reason; change the ACL file and run `ACL LOAD` |

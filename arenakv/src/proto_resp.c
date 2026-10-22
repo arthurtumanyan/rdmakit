@@ -433,6 +433,11 @@ static void cmd_info(akvd *d, struct obuf *o) {
     akv_stats_get(akvd_store(d), &st);
     struct srv_counters *c = akvd_counters(d);
     struct obuf b = {0};
+    struct obuf repl = {0};
+    ob_printf(&repl, "# Cluster\r\ncluster_enabled:%d\r\n\r\n", akvd_cluster(d) != NULL);
+    ob_add(&repl, "# Replication\r\n", 15);
+    repl_info(akvd_repl(d), &repl);
+    ob_add(&repl, "\r\n", 3); /* with the terminating zero */
     aof_info ai = {0};
     int aof_on = akvd_aof_info(d, &ai) == 0;
     akv_warm_info wi;
@@ -449,6 +454,7 @@ static void cmd_info(akvd *d, struct obuf *o) {
               "aof_last_bgrewrite_status:%s\r\naof_last_write_status:%s\r\naof_current_size:%llu\r\n"
               "aof_base_size:%llu\r\naof_buffer_length:%llu\r\naof_rewrites:%llu\r\naof_fsyncs:%llu\r\n"
               "warm_restart:%s\r\nwarm_restart_entries:%llu\r\nwarm_restart_rebuild_us:%llu\r\n\r\n"
+              "%s"
               "# Stats\r\ntotal_connections_received:%llu\r\nrejected_connections:%llu\r\n"
               "total_commands_processed:%llu\r\nkeyspace_hits:%llu\r\nkeyspace_misses:%llu\r\n"
               "evicted_keys:%llu\r\nexpired_keys:%llu\r\npubsub_channels:%zu\r\npubsub_patterns:%zu\r\n\r\n"
@@ -462,14 +468,15 @@ static void cmd_info(akvd *d, struct obuf *o) {
               !aof_on || ai.last_write_ok ? "ok" : "err", (unsigned long long)ai.current_size,
               (unsigned long long)ai.base_size, (unsigned long long)ai.pending,
               (unsigned long long)ai.rewrites, (unsigned long long)ai.fsyncs, warm_state[wi.state],
-              (unsigned long long)wi.entries, (unsigned long long)wi.rebuild_us, LD(total_connections),
-              LD(rejected_connections), LD(commands), LD(get_hits), LD(get_misses),
+              (unsigned long long)wi.entries, (unsigned long long)wi.rebuild_us, (const char *)repl.p,
+              LD(total_connections), LD(rejected_connections), LD(commands), LD(get_hits), LD(get_misses),
               (unsigned long long)(st.evictions + st.index_evictions), (unsigned long long)st.expired,
               pubsub_channels(akvd_pubsub(d), NULL, 0, NULL, NULL), pubsub_numpat(akvd_pubsub(d)),
               (unsigned long long)st.entries);
 #undef LD
     r_verbatim(o, b.p, b.len);
     ob_free(&b);
+    ob_free(&repl);
 }
 
 /*
@@ -577,6 +584,24 @@ static int resp_permitted(struct session *ss, const struct arg *a, size_t n, str
 }
 
 static void cmd_acl(akvd *d, struct session *ss, struct arg *a, size_t n, struct obuf *o);
+
+struct slot_count {
+    unsigned slot;
+    size_t n;
+};
+
+static int count_cb(void *arg, const akv_record *r) {
+    struct slot_count *c = arg;
+    c->n += cluster_keyslot(r->key, r->klen) == c->slot;
+    return 0;
+}
+
+/* Keys in a slot (CLUSTER COUNTKEYSINSLOT): a scan of the whole engine. */
+static size_t count_slot(akv *s, unsigned slot) {
+    struct slot_count c = {.slot = slot};
+    akv_foreach(s, count_cb, &c);
+    return c.n;
+}
 static void dispatch(akvd *d, struct session *ss, struct arg *a, size_t n, struct obuf *o);
 
 /* ---- transactions ------------------------------------------------------------------------------------ */
@@ -596,6 +621,7 @@ static void txn_reset(struct session *ss) {
 void resp_session_free(struct session *ss) {
     txn_reset(ss);
     ob_free(&ss->subs);
+    ob_free(&ss->handoff);
 }
 
 /* Queues a command of a transaction (a copy of its arguments) and answers QUEUED. */
@@ -919,6 +945,309 @@ static int allowed_while_subscribed(const struct arg *c) {
            is(c, "PING") || is(c, "QUIT") || is(c, "RESET");
 }
 
+/* ---- COMMAND ------------------------------------------------------------------------------------------ */
+
+/* Arity of the RESP commands as the Redis command reference gives it (negative: at least that many). */
+static const struct {
+    const char *name;
+    int arity;
+} ARITY[] = {
+    {"APPEND", 3},     {"AUTH", -2},     {"BGREWRITEAOF", 1},  {"BGSAVE", -1},     {"CLIENT", -2},
+    {"CLUSTER", -2},   {"COMMAND", -1},  {"CONFIG", -2},       {"DBSIZE", 1},      {"DECR", 2},
+    {"DECRBY", 3},     {"DEL", -2},      {"DISCARD", 1},       {"ECHO", 2},        {"EXEC", 1},
+    {"EXISTS", -2},    {"EXPIRE", -3},   {"EXPIREAT", -3},     {"FLUSHALL", -1},   {"FLUSHDB", -1},
+    {"GET", 2},        {"GETDEL", 2},    {"GETEX", -2},        {"GETSET", 3},      {"HELLO", -1},
+    {"INCR", 2},       {"INCRBY", 3},    {"INFO", -1},         {"KEYS", 2},        {"LASTSAVE", 1},
+    {"MGET", -2},      {"MSET", -3},     {"MULTI", 1},         {"PERSIST", 2},     {"PEXPIRE", -3},
+    {"PEXPIREAT", -3}, {"PING", -1},     {"PSETEX", 4},        {"PSUBSCRIBE", -2}, {"PTTL", 2},
+    {"PUBLISH", 3},    {"PUBSUB", -2},   {"PUNSUBSCRIBE", -1}, {"QUIT", -1},       {"READONLY", 1},
+    {"READWRITE", 1},  {"REPLICAOF", 3}, {"RESET", 1},         {"ROLE", 1},        {"SAVE", 1},
+    {"SCAN", -2},      {"SELECT", 2},    {"SET", -3},          {"SETEX", 4},       {"SETNX", 3},
+    {"SLAVEOF", 3},    {"STRLEN", 2},    {"SUBSCRIBE", -2},    {"TIME", 1},        {"TTL", 2},
+    {"TYPE", 2},       {"UNLINK", -2},   {"UNSUBSCRIBE", -1},  {"UNWATCH", 1},     {"WAIT", 3},
+    {"WATCH", -2},     {"ACL", -2},
+};
+
+/* One COMMAND entry: name, arity, flags, first key, last key, step, ACL categories. */
+static void command_entry(struct obuf *o, const acl_cmd *k) {
+    int arity = -1;
+    for (size_t i = 0; i < sizeof(ARITY) / sizeof(ARITY[0]); i++) {
+        if (strcmp(ARITY[i].name, k->name) == 0) {
+            arity = ARITY[i].arity;
+        }
+    }
+    char name[32];
+    size_t m = strlen(k->name);
+    for (size_t j = 0; j <= m && j < sizeof(name); j++) {
+        name[j] = (char)tolower((unsigned char)k->name[j]);
+    }
+    r_array(o, 7);
+    r_bulk_str(o, name);
+    r_int(o, arity);
+    int write = (k->cats & ACL_CAT_WRITE) != 0;
+    int read = (k->cats & ACL_CAT_READ) != 0;
+    r_array(o, write || read ? 1 : 0);
+    if (write || read) {
+        r_raw(o, write ? "+write\r\n" : "+readonly\r\n");
+    }
+    r_int(o, k->first);
+    r_int(o, k->first == 0 ? 0 : k->last);
+    r_int(o, k->first == 0 ? 0 : k->step);
+    unsigned ncat = 0;
+    for (unsigned i = 0; acl_categories[i] != NULL; i++) {
+        ncat += (k->cats >> i) & 1;
+    }
+    r_array(o, ncat);
+    for (unsigned i = 0; acl_categories[i] != NULL; i++) {
+        if ((k->cats >> i) & 1) {
+            ob_printf(o, "+@%s\r\n", acl_categories[i]);
+        }
+    }
+}
+
+/* COMMAND, COMMAND COUNT, COMMAND INFO name ..., COMMAND DOCS (empty) from the command table. */
+static void cmd_command(struct arg *a, size_t n, struct obuf *o) {
+    unsigned total = 0;
+    for (unsigned i = 0; i < acl_ncmds(); i++) {
+        total += acl_cmd_at(i)->proto == ACL_RESP;
+    }
+    if (n >= 2 && is(&a[1], "COUNT")) {
+        r_int(o, total);
+    } else if (n >= 2 && is(&a[1], "INFO")) {
+        r_array(o, (long long)n - 2);
+        for (size_t i = 2; i < n; i++) {
+            int id = acl_cmd_find(ACL_RESP, a[i].p, a[i].n);
+            if (id < 0) {
+                r_null_array(o);
+            } else {
+                command_entry(o, acl_cmd_at((unsigned)id));
+            }
+        }
+    } else if (n >= 2 && is(&a[1], "DOCS")) {
+        r_map(o, 0);
+    } else {
+        r_array(o, total);
+        for (unsigned i = 0; i < acl_ncmds(); i++) {
+            if (acl_cmd_at(i)->proto == ACL_RESP) {
+                command_entry(o, acl_cmd_at(i));
+            }
+        }
+    }
+}
+
+/* ---- cluster ----------------------------------------------------------------------------------------- */
+
+/*
+ * Cluster mode: answers MOVED for keys of slots this node does not serve, CROSSSLOT for keys of several
+ * slots, CLUSTERDOWN for unassigned slots. A replica serves reads of its primary's slots to connections that
+ * sent READONLY and redirects everything else to the primary. Returns 1 when it replied.
+ */
+static int cluster_redirect(akvd *d, struct session *ss, const struct arg *a, size_t n, struct obuf *o) {
+    const cluster *cl = akvd_cluster(d);
+    if (cl == NULL) {
+        return 0;
+    }
+    int id = acl_cmd_find(ACL_RESP, a[0].p, a[0].n);
+    const acl_cmd *k = id >= 0 ? acl_cmd_at((unsigned)id) : NULL;
+    if (k == NULL || k->first == 0 || (size_t)k->first >= n) {
+        return 0;
+    }
+    long last = k->last < 0 ? (long)n + k->last : k->last;
+    int slot = -1;
+    for (long i = k->first; i <= last && (size_t)i < n; i += k->step) {
+        int s = (int)cluster_keyslot(a[i].p, a[i].n);
+        if (slot >= 0 && s != slot) {
+            r_err(o, "CROSSSLOT Keys in request don't hash to the same slot");
+            return 1;
+        }
+        slot = s;
+    }
+    if (slot < 0) {
+        return 0; /* no key position within the arguments: the command's own arity check answers */
+    }
+    int owner = cl->owner[slot];
+    if (owner < 0) {
+        r_err(o, "CLUSTERDOWN Hash slot not served");
+        return 1;
+    }
+    int mine = cluster_shard_of_self(cl);
+    int replica = cl->self >= 0 && !cl->nodes[cl->self].primary;
+    if (owner == mine && (!replica || (ss->readonly && (k->cats & ACL_CAT_WRITE) == 0))) {
+        return 0;
+    }
+    const struct cluster_node *p = &cl->nodes[owner];
+    ob_printf(o, "-MOVED %d %s:%d\r\n", slot, p->host, p->resp_port);
+    return 1;
+}
+
+/* One node in the form of CLUSTER SLOTS: [host, port, id]. */
+static void slots_node(struct obuf *o, const struct cluster_node *n) {
+    r_array(o, 3);
+    r_bulk_str(o, n->host);
+    r_int(o, n->resp_port);
+    r_bulk_str(o, n->id);
+}
+
+static void cmd_cluster(akvd *d, struct arg *a, size_t n, struct obuf *o) {
+    const cluster *cl = akvd_cluster(d);
+    if (n < 2) {
+        r_arity(o, &a[0]);
+        return;
+    }
+    const struct arg *sub = &a[1];
+    if (is(sub, "KEYSLOT") && n == 3) {
+        r_int(o, (long long)cluster_keyslot(a[2].p, a[2].n));
+        return;
+    }
+    if (cl == NULL) {
+        r_err(o, "ERR This instance has cluster support disabled");
+        return;
+    }
+    if (is(sub, "INFO")) {
+        unsigned assigned = cluster_assigned(cl);
+        unsigned primaries = 0;
+        for (unsigned i = 0; i < cl->n; i++) {
+            primaries += cl->nodes[i].primary;
+        }
+        struct obuf b = {0};
+        ob_printf(
+            &b,
+            "cluster_enabled:1\r\ncluster_state:%s\r\ncluster_slots_assigned:%u\r\ncluster_slots_ok:%u\r\n"
+            "cluster_slots_pfail:0\r\ncluster_slots_fail:0\r\ncluster_known_nodes:%u\r\ncluster_size:%u\r\n"
+            "cluster_current_epoch:1\r\ncluster_my_epoch:1\r\n",
+            assigned == CLUSTER_SLOTS ? "ok" : "fail", assigned, assigned, cl->n, primaries);
+        r_verbatim(o, b.p, b.len);
+        ob_free(&b);
+    } else if (is(sub, "MYID")) {
+        r_bulk_str(o, cl->self >= 0 ? cl->nodes[cl->self].id : "");
+    } else if (is(sub, "SLOTS")) {
+        struct obuf b = {0};
+        unsigned ranges = 0;
+        for (unsigned s = 0; s < CLUSTER_SLOTS;) {
+            int owner = cl->owner[s];
+            unsigned e = s;
+            while (e + 1 < CLUSTER_SLOTS && cl->owner[e + 1] == owner) {
+                e++;
+            }
+            if (owner >= 0) {
+                unsigned replicas = 0;
+                for (unsigned i = 0; i < cl->n; i++) {
+                    replicas += cl->nodes[i].primary_of == owner;
+                }
+                r_array(&b, 3 + replicas);
+                r_int(&b, s);
+                r_int(&b, e);
+                slots_node(&b, &cl->nodes[owner]);
+                for (unsigned i = 0; i < cl->n; i++) {
+                    if (cl->nodes[i].primary_of == owner) {
+                        slots_node(&b, &cl->nodes[i]);
+                    }
+                }
+                ranges++;
+            }
+            s = e + 1;
+        }
+        r_array(o, ranges);
+        ob_add(o, b.p, b.len);
+        ob_free(&b);
+    } else if (is(sub, "NODES")) {
+        struct obuf b = {0};
+        for (unsigned i = 0; i < cl->n; i++) {
+            const struct cluster_node *nd = &cl->nodes[i];
+            ob_printf(&b, "%s %s:%d@%d %s%s %s 0 0 1 connected", nd->id, nd->host, nd->resp_port,
+                      nd->native_port, (int)i == cl->self ? "myself," : "", nd->primary ? "master" : "slave",
+                      nd->primary ? "-" : cl->nodes[nd->primary_of].id);
+            for (unsigned s = 0; nd->primary && s < CLUSTER_SLOTS;) {
+                unsigned e = s;
+                if (cl->owner[s] == (int)i) {
+                    while (e + 1 < CLUSTER_SLOTS && cl->owner[e + 1] == (int)i) {
+                        e++;
+                    }
+                    if (e == s) {
+                        ob_printf(&b, " %u", s);
+                    } else {
+                        ob_printf(&b, " %u-%u", s, e);
+                    }
+                }
+                s = e + 1;
+            }
+            ob_add(&b, "\n", 1);
+        }
+        r_verbatim(o, b.p, b.len);
+        ob_free(&b);
+    } else if (is(sub, "SHARDS")) {
+        unsigned primaries = 0;
+        for (unsigned i = 0; i < cl->n; i++) {
+            primaries += cl->nodes[i].primary;
+        }
+        r_array(o, primaries);
+        for (unsigned i = 0; i < cl->n; i++) {
+            if (!cl->nodes[i].primary) {
+                continue;
+            }
+            unsigned ranges = 0;
+            for (unsigned s = 0; s < CLUSTER_SLOTS; s++) {
+                ranges += cl->owner[s] == (int)i && (s == 0 || cl->owner[s - 1] != (int)i);
+            }
+            r_map(o, 2);
+            r_bulk_str(o, "slots");
+            r_array(o, 2 * ranges);
+            for (unsigned s = 0; s < CLUSTER_SLOTS;) {
+                unsigned e = s;
+                if (cl->owner[s] == (int)i) {
+                    while (e + 1 < CLUSTER_SLOTS && cl->owner[e + 1] == (int)i) {
+                        e++;
+                    }
+                    r_int(o, s);
+                    r_int(o, e);
+                }
+                s = e + 1;
+            }
+            r_bulk_str(o, "nodes");
+            unsigned members = 1;
+            for (unsigned k = 0; k < cl->n; k++) {
+                members += cl->nodes[k].primary_of == (int)i;
+            }
+            r_array(o, members);
+            for (unsigned k = 0; k < cl->n; k++) {
+                const struct cluster_node *nd = &cl->nodes[k];
+                if ((int)k != (int)i && nd->primary_of != (int)i) {
+                    continue;
+                }
+                r_map(o, 6);
+                r_bulk_str(o, "id");
+                r_bulk_str(o, nd->id);
+                r_bulk_str(o, "port");
+                r_int(o, nd->resp_port);
+                r_bulk_str(o, "ip");
+                r_bulk_str(o, nd->host);
+                r_bulk_str(o, "endpoint");
+                r_bulk_str(o, nd->host);
+                r_bulk_str(o, "role");
+                r_bulk_str(o, nd->primary ? "master" : "replica");
+                r_bulk_str(o, "health");
+                r_bulk_str(o, "online");
+            }
+        }
+    } else if (is(sub, "COUNTKEYSINSLOT") && n == 3) {
+        long long slot;
+        if (arg_ll(&a[2], &slot) != 0 || slot < 0 || slot >= (long long)CLUSTER_SLOTS) {
+            r_err(o, "ERR Invalid slot");
+            return;
+        }
+        r_int(o, (long long)count_slot(akvd_store(d), (unsigned)slot));
+    } else if (is(sub, "RELOAD") && n == 2) {
+        char err[512];
+        if (akvd_cluster_reload(d, err, sizeof(err)) == 0) {
+            r_ok(o);
+        } else {
+            ob_printf(o, "-ERR %s\r\n", err);
+        }
+    } else {
+        ob_printf(o, "-ERR unknown subcommand '%.*s'\r\n", (int)(sub->n > 32 ? 32 : sub->n), sub->p);
+    }
+}
+
 /* Commands made of several engine operations on their keys (see the file comment). */
 static int composite(const struct arg *a, size_t n) {
     const struct arg *c = &a[0];
@@ -998,6 +1327,18 @@ static void dispatch(akvd *d, struct session *ss, struct arg *a, size_t n, struc
         r_bulk_str(o, "pong");
         r_bulk(o, n >= 2 ? a[1].p : "", n >= 2 ? a[1].n : 0);
         return;
+    }
+    if (cluster_redirect(d, ss, a, n, o)) {
+        ss->multi_error |= ss->in_multi;
+        return;
+    }
+    if (akvd_read_only(d)) {
+        int id = acl_cmd_find(ACL_RESP, c->p, c->n);
+        if (id >= 0 && (acl_cmd_at((unsigned)id)->cats & ACL_CAT_WRITE) != 0) {
+            r_err(o, "READONLY You can't write against a read only replica.");
+            ss->multi_error |= ss->in_multi;
+            return;
+        }
     }
     int in_queue = ss->in_multi && !is(c, "EXEC") && !is(c, "DISCARD") && !is(c, "MULTI") &&
                    !is(c, "WATCH") && !is(c, "QUIT") && !is(c, "RESET");
@@ -1362,11 +1703,7 @@ static void dispatch(akvd *d, struct session *ss, struct arg *a, size_t n, struc
             r_err(o, "ERR unknown subcommand");
         }
     } else if (is(c, "COMMAND")) {
-        if (n >= 2 && is(&a[1], "COUNT")) {
-            r_int(o, 0);
-        } else {
-            r_array(o, 0);
-        }
+        cmd_command(a, n, o);
     } else if (is(c, "CONFIG")) {
         if (n >= 3 && is(&a[1], "GET")) {
             cmd_config_get(d, &a[2], o);
@@ -1412,6 +1749,115 @@ static void dispatch(akvd *d, struct session *ss, struct arg *a, size_t n, struc
         }
     } else if (is(c, "PUBSUB")) {
         cmd_pubsub(d, a, n, o);
+    } else if (is(c, "CLUSTER")) {
+        cmd_cluster(d, a, n, o);
+    } else if (is(c, "READONLY") || is(c, "READWRITE")) {
+        if (akvd_cluster(d) == NULL) {
+            r_err(o, "ERR This instance has cluster support disabled");
+        } else {
+            ss->readonly = is(c, "READONLY");
+            r_ok(o);
+        }
+    } else if (is(c, "REPLICAOF") || is(c, "SLAVEOF")) {
+        if (n != 3) {
+            r_arity(o, c);
+        } else if (is(&a[1], "NO") && is(&a[2], "ONE")) {
+            repl_follow(akvd_repl(d), NULL, NULL);
+            r_ok(o);
+        } else {
+            char host[256];
+            char port[16];
+            if (a[1].n >= sizeof(host) || a[2].n >= sizeof(port)) {
+                r_err(o, "ERR invalid host or port");
+                return;
+            }
+            memcpy(host, a[1].p, a[1].n);
+            host[a[1].n] = '\0';
+            memcpy(port, a[2].p, a[2].n);
+            port[a[2].n] = '\0';
+            akvd_repl_activate(d);
+            if (repl_follow(akvd_repl(d), host, port) == 0) {
+                r_ok(o);
+            } else {
+                r_err(o, "ERR replication cannot start");
+            }
+        }
+    } else if (is(c, "ROLE")) {
+        struct obuf info = {0};
+        repl_info(akvd_repl(d), &info);
+        ob_add(&info, "", 1);
+        const char *t = (const char *)info.p;
+        long long off = 0;
+        const char *m = strstr(t, "master_repl_offset:");
+        if (m != NULL) {
+            off = atoll(m + 19);
+        }
+        if (repl_is_replica(akvd_repl(d))) {
+            char host[256] = "";
+            char port[16] = "";
+            const char *h = strstr(t, "master_host:");
+            const char *p = strstr(t, "master_port:");
+            if (h != NULL) {
+                sscanf(h + 12, "%255[^\r]", host);
+            }
+            if (p != NULL) {
+                sscanf(p + 12, "%15[^\r]", port);
+            }
+            r_array(o, 5);
+            r_bulk_str(o, "slave");
+            r_bulk_str(o, host);
+            r_int(o, atoll(port));
+            r_bulk_str(o, strstr(t, "master_link_status:up") != NULL ? "connected" : "connecting");
+            r_int(o, off);
+        } else {
+            unsigned count = 0;
+            for (const char *q = t; (q = strstr(q, "\nslave")) != NULL; q++) {
+                count++;
+            }
+            r_array(o, 3);
+            r_bulk_str(o, "master");
+            r_int(o, off);
+            r_array(o, count);
+            for (const char *q = t; (q = strstr(q, "\nslave")) != NULL; q++) {
+                char ip[64] = "";
+                int port = 0;
+                unsigned long long roff = 0;
+                sscanf(q, "\nslave%*u:ip=%63[^,],port=%d,state=%*[^,],offset=%llu", ip, &port, &roff);
+                char *colon = strrchr(ip, ':');
+                if (colon != NULL) {
+                    *colon = '\0'; /* the address carries the connection's own port */
+                }
+                char ps[16];
+                char os[24];
+                snprintf(ps, sizeof(ps), "%d", port);
+                snprintf(os, sizeof(os), "%llu", roff);
+                r_array(o, 3);
+                r_bulk_str(o, ip);
+                r_bulk_str(o, ps);
+                r_bulk_str(o, os);
+            }
+        }
+        ob_free(&info);
+    } else if (is(c, "WAIT")) {
+        long long want;
+        long long timeout;
+        if (n != 3 || arg_ll(&a[1], &want) != 0 || arg_ll(&a[2], &timeout) != 0 || timeout < 0) {
+            r_err(o, "ERR value is not an integer or out of range");
+            return;
+        }
+        uint64_t off = repl_thread_offset();
+        size_t have = repl_acked(akvd_repl(d), off);
+        if ((long long)have >= want || ss->conn == NULL || tl_locked) {
+            r_int(o, (long long)have);
+        } else {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            ss->waiting = 1;
+            ss->wait_off = off;
+            ss->wait_n = want;
+            ss->wait_deadline_ms =
+                timeout == 0 ? 0 : (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000 + timeout;
+        }
     } else if (is(c, "MULTI")) {
         if (n != 1) {
             r_arity(o, c);
@@ -1608,6 +2054,9 @@ size_t resp_execute(akvd *d, struct session *ss, const uint8_t *in, size_t len, 
             continue; /* empty line or empty array */
         }
         dispatch(d, ss, tl_args, nargs, out);
+        if (ss->waiting) {
+            break; /* the worker answers the WAIT; later commands run afterwards */
+        }
     }
     return used;
 }

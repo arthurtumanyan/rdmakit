@@ -10,7 +10,8 @@
  *     BGSAVE and LASTSAVE
  *   - TLS (build with TLS=1): RESP over TLS with a certificate that the test creates
  *   - native protocol revision 2 through the client library: store modes, CAS, metadata, increments,
- *     touch, flush, MGET, authentication, pipelining within the window, consistent hashing over servers
+ *     touch, flush, MGET, authentication, pipelining within the window, consistent hashing over servers,
+ *     failover of a pool entry with a primary and a replica (reads from the replica, promotion, reconnect)
  *   - native batching: a window of 100 requests with values of 1 to 40,000 bytes, so that client staging
  *     is sent by count and by size, and server responses are batched, limited by send space and queued
  */
@@ -35,6 +36,7 @@
 
 #include "akvclient.h"
 #include "akvd.h"
+#include "srv.h"
 
 static int failures;
 
@@ -764,6 +766,71 @@ static void test_pool(void) {
     }
 }
 
+/* Polls a read until it returns want (replication lag), for up to 5 s. */
+static int read_until(akvc *c, const char *key, const char *want) {
+    for (int i = 0; i < 500; i++) {
+        char v[64];
+        size_t n = 0;
+        if (akvc_get(c, key, strlen(key), v, sizeof(v), &n) == AKVP_OK && n == strlen(want) &&
+            memcmp(v, want, n) == 0) {
+            return 1;
+        }
+        struct timespec ts = {.tv_nsec = 10000000};
+        nanosleep(&ts, NULL);
+    }
+    return 0;
+}
+
+static void test_pool_failover(void) {
+    akvd_config cfg;
+    base_config(&cfg);
+    cfg.memcached_port = NULL;
+    cfg.resp_port = NULL;
+    int err;
+    akvd *primary = akvd_start(&cfg, &err);
+    EXPECT(primary != NULL, "primary: %d", err);
+    if (primary == NULL) {
+        return;
+    }
+    char pport[16];
+    snprintf(pport, sizeof(pport), "%d", akvd_port(primary));
+    cfg.replicaof_host = "127.0.0.1";
+    cfg.replicaof_port = pport;
+    akvd *replica = akvd_start(&cfg, &err);
+    EXPECT(replica != NULL, "replica: %d", err);
+    if (replica == NULL) {
+        akvd_stop(primary);
+        return;
+    }
+    char entry[64];
+    snprintf(entry, sizeof(entry), "127.0.0.1:%d,127.0.0.1:%d", akvd_port(primary), akvd_port(replica));
+    const char *servers[1] = {entry};
+    struct duct_opts o = client_opts();
+    akvc_pool *p;
+    EXPECT(akvc_pool_create(&p, &o, servers, 1) == 0, "pool with a primary and a replica");
+    int replica_role = -1;
+    EXPECT(akvc_role(akvc_pool_pick(p, "k", 1), &replica_role) == AKVP_OK && replica_role == 0,
+           "writes go to the primary");
+    EXPECT(akvc_put(akvc_pool_pick(p, "k", 1), "k", 1, "v1", 2) == AKVP_OK, "write before the failure");
+    akvc *reader = akvc_pool_pick_read(p, "k", 1);
+    EXPECT(reader != akvc_pool_pick(p, "k", 1) && akvc_role(reader, &replica_role) == AKVP_OK &&
+               replica_role == 1,
+           "reads may go to the replica");
+    EXPECT(read_until(reader, "k", "v1"), "the replica serves the write");
+    EXPECT(akvc_put(reader, "x", 1, "v", 1) == AKVP_READONLY, "the replica refuses writes");
+
+    akvd_stop(primary);
+    EXPECT(akvc_put(akvc_pool_pick(p, "k", 1), "k", 1, "v2", 2) < 0, "the old primary is gone");
+    EXPECT(akvc_pool_reconnect(p, "k", 1) == -ENOTCONN, "no primary before the promotion");
+    repl_follow(akvd_repl(replica), NULL, NULL);
+    EXPECT(akvc_pool_reconnect(p, "k", 1) == 0, "the promoted replica is found");
+    EXPECT(akvc_put(akvc_pool_pick(p, "k", 1), "k", 1, "v2", 2) == AKVP_OK,
+           "writes continue after the failover");
+    EXPECT(read_until(akvc_pool_pick(p, "k", 1), "k", "v2"), "read after the failover");
+    akvc_pool_close(p);
+    akvd_stop(replica);
+}
+
 int main(void) {
     akvd_config cfg;
     base_config(&cfg);
@@ -781,6 +848,7 @@ int main(void) {
     test_snapshot();
     test_native_auth();
     test_pool();
+    test_pool_failover();
 #ifdef AKV_HAVE_TLS
     test_tls();
 #else

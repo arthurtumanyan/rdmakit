@@ -10,6 +10,9 @@ const pace_driver *pace_driver_find(const char *name) {
     if (strcmp(name, "resp") == 0) {
         return &pace_driver_resp;
     }
+    if (strcmp(name, "resp-cluster") == 0) {
+        return &pace_driver_resp_cluster;
+    }
     if (strcmp(name, "memcached") == 0) {
         return &pace_driver_memcached;
     }

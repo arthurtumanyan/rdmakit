@@ -386,6 +386,9 @@ static void test_transactions(void) {
     put.key = "b";
     aof_append(a, &put);
     aof_append_txn_end(a, 7);
+    akv_change empty = {.kind = AKV_CHG_PUT, .key = "e", .klen = 1}; /* empty value, no buffer */
+    aof_append(a, &empty);
+    aof_append(a, &empty); /* the second replay overwrites in place */
     put.key = "c";
     put.txn = 8; /* never ended */
     aof_append(a, &put);
@@ -397,6 +400,7 @@ static void test_transactions(void) {
     akv *r = reload(dir, &li, &rc, 0);
     EXPECT(rc == 0 && akv_exists(r, "a", 1) && akv_exists(r, "b", 1) && akv_exists(r, "d", 1),
            "complete transaction and plain record applied");
+    EXPECT(akv_exists(r, "e", 1), "record with an empty value replayed");
     EXPECT(!akv_exists(r, "c", 1) && li.dropped_txn == 1, "incomplete transaction dropped (%llu)",
            (unsigned long long)li.dropped_txn);
     akv_destroy(r);

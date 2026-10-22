@@ -722,7 +722,14 @@ static void do_auth(akvd *d, struct session *ss, const uint8_t *data, size_t dle
  * their keys from the first (gat, gats: second) argument to the last; other commands name one key in
  * argument 1. Returns 1 when the command may run, else replies with CLIENT_ERROR and returns 0.
  */
-static int mc_permitted(const struct session *ss, const struct tok *t, int nt, struct obuf *out) {
+static int mc_permitted(akvd *d, const struct session *ss, const struct tok *t, int nt, struct obuf *out) {
+    if (akvd_read_only(d)) {
+        int wid = acl_cmd_find(ACL_MC, t[0].p, t[0].n);
+        if (wid >= 0 && (acl_cmd_at((unsigned)wid)->cats & ACL_CAT_WRITE) != 0) {
+            reply(out, 0, "CLIENT_ERROR read only replica\r\n");
+            return 0;
+        }
+    }
     if (ss->user == NULL || acl_unrestricted(ss->user)) {
         return 1;
     }
@@ -913,7 +920,7 @@ size_t mc_execute(akvd *d, struct session *ss, const uint8_t *in, size_t len, st
                 }
                 continue;
             }
-            if (akvd_session_refresh(d, ss) != 0 || !mc_permitted(ss, t, nt, out)) {
+            if (akvd_session_refresh(d, ss) != 0 || !mc_permitted(d, ss, t, nt, out)) {
                 continue;
             }
             if (is_ms) {
@@ -936,7 +943,7 @@ size_t mc_execute(akvd *d, struct session *ss, const uint8_t *in, size_t len, st
             reply(out, 0, "CLIENT_ERROR unauthenticated\r\n");
             continue;
         }
-        if (akvd_session_refresh(d, ss) != 0 || !mc_permitted(ss, t, nt, out)) {
+        if (akvd_session_refresh(d, ss) != 0 || !mc_permitted(d, ss, t, nt, out)) {
             continue;
         }
         if (tok_eq(c, "get")) {
