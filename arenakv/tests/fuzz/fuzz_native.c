@@ -1,7 +1,8 @@
 /*
  * fuzz_native.c - libFuzzer harness: native protocol requests (akvd_native_execute) on a server without
  * listeners. The first input byte selects whether the session is authenticated and the response
- * capacity; the rest is one request message.
+ * capacity; the rest is one request message. The session is released as a closing connection releases it
+ * (resp_session_free), which frees the buffer that a REPLSYNC request fills for the hand-off.
  */
 #include <stdlib.h>
 
@@ -28,5 +29,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t n) {
     struct session ss = {.authed = (data[0] & 1) == 0};
     size_t cap = (data[0] & 2) ? 64 : (1u << 17);
     akvd_native_execute(d, &ss, data + 1, n - 1, out, cap);
+    resp_session_free(&ss);
     return 0;
 }
