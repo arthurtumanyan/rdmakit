@@ -22,11 +22,14 @@ the published results are in [`README.md`](README.md). Running `kvpace` by hand 
 |---|---|---|
 | Linux x86-64 or aarch64 with at least 16 logical CPUs, or CPU sets chosen for the machine ([section 2](#cpu-sets)) | all suites | `nproc`, `lscpu -e` |
 | the projects built: `make` at the repository root | all suites | `kvpace/build/$(uname -m)/kvpace --version` |
-| Docker, with the images `valkey/valkey:latest`, `docker.dragonflydb.io/dragonflydb/dragonfly:latest`, `memcached:latest`, `redislabs/memtier_benchmark:latest` | matrix, sweep, pipeline, connections, capacity, validation | `docker pull` each image once |
+| Docker, with the images `valkey/valkey:latest`, `docker.dragonflydb.io/dragonflydb/dragonfly:latest`, `memcached:latest`, `redislabs/memtier_benchmark:latest` | matrix, sweep, pipeline, connections, capacity, validation, durability, encryption | `docker pull` each image once |
+| the TLS builds: `make -C arenakv TLS=1` and `make -C kvpace TLS=1` (OpenSSL 3, `libssl-dev`), and `openssl` for the test certificates | encryption | `kvpace/build/$(uname -m)-tls/kvpace --version` |
+| a directory on the disk to measure for the append-only logs, `BENCH_DATA_DIR` (default `/var/tmp/pace-data`; not tmpfs, where fsync returns at once) | durability | `df -T /var/tmp` |
 | an RDMA device (Soft-RoCE suffices) and its interface address in `RDMA_ADDR` | the Soft-RoCE rows of the matrix, the transport suite | `rdma link show` |
 | `BENCH_NIC`: the network interface name, recorded with its speed | environment record | `ip link` |
 | Python 3 with matplotlib | reports and verification | `python3 -c 'import matplotlib'` |
-| free ports 7100 and 7101 on the loopback interface | all servers listen there | `ss -ltn 'sport = :7100'` |
+| free ports 7100, 7101 and 7200 on the loopback interface | servers listen on 7100 (and 7101), replicas on 7200 | `ss -ltn 'sport = :7100'` |
+| `BENCH_REPLICA_CPU`: a logical CPU of a physical core used by neither the one-CPU server set nor the client set (default 2) | the replica of the durability suite | `lscpu -e` |
 
 Soft-RoCE on an Ethernet interface:
 
@@ -128,6 +131,8 @@ Do not build, test or run other benchmarks on the machine while a run is in prog
 | `engine` | in-process engine throughput by thread count, and micro-benchmarks (`akv_bench`) | arenakv engine |
 | `transport` | rdmaduct ping-pong latency and streaming throughput on loopback, TCP and Soft-RoCE (`duct_bench`) | rdmaduct |
 | `validation` | kvpace against memtier_benchmark on the same servers and settings | Valkey, arenakv (memcached protocol) |
+| `durability` | one server CPU, 50% PUT of 64-byte values: no persistence, append-only log with fsync every second and per write, one asynchronous replica | Valkey, arenakv (native protocol over TCP) |
+| `encryption` | one server CPU, 90% GET of 64-byte and 16 KiB values, unencrypted and encrypted | arenakv native (rdmaduct encryption), arenakv RESP (TLS), Valkey (TLS) |
 
 The workloads, server arguments and client options of every suite are defined in
 [`tools/run.py`](tools/run.py) and [`../kvpace/scripts/servers.sh`](../kvpace/scripts/servers.sh); the

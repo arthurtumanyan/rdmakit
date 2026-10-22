@@ -57,6 +57,9 @@ performance-core cluster. The load generator uses CPUs 8,10,12,14. Hyper-thread 
 | arenakv (Soft-RoCE) | same process, RDMA transport on the `rxe0` device | as above |
 | arenakv (memcached protocol) | same process, memcached text protocol on the benchmark port, driven by the memcached driver of kvpace | as above |
 | Dragonfly, eviction flag raised | as Dragonfly | additionally `--max_eviction_per_heartbeat=10000`; used only in the capacity suite, see below |
+| arenakv (RESP) | same process, RESP2 on the benchmark port, driven by the RESP driver of kvpace (encryption suite) | as arenakv |
+| durability variants | Valkey: `--appendonly yes --appendfsync P --dir` on a host directory, or a second container with `--replicaof`; arenakv: `--appendonly DIR --appendfsync P`, or a second `arenakvd` with `--replicaof` | log directory `BENCH_DATA_DIR` on the host disk, emptied before every run; the replica is pinned to `BENCH_REPLICA_CPU` and keeps no log; measurement starts after the replica reports that it streams changes |
+| encryption variants | Valkey: `--tls-port` with the plain port off and `--tls-auth-clients no`; arenakv RESP: `--tls-resp-port`; arenakv native: `--native-tls` | one RSA-2048 server certificate signed by a test CA, created for every run; clients verify it; every run of the suite uses the kvpace of the `TLS=1` build, and every arenakv run the arenakvd of that build, also unencrypted |
 
 Server arguments are set in `tools/run.py` and `kvpace/scripts/servers.sh` (capacity 8 GiB unless the capacity suite
 sets one; memcached additionally `-c 4096` in the pipeline and connections suites, because the connections suite opens
@@ -85,6 +88,7 @@ All workloads use keys of 16 bytes (`k` followed by 15 digits) except the KV-cac
 |---|---|
 | `small` | 100,000 keys preloaded, 64-byte values, uniform key choice, 90% GET / 10% SET |
 | `block` | 20,000 keys preloaded, 16 KiB values, uniform key choice, 90% GET / 10% SET |
+| `update` | as `small` with 50% GET / 50% SET (the mix of YCSB workload A); durability suite |
 | `kvcache` | prefix-chain requests, see [`kvpace/docs/kvcache-scenario.md`](../kvpace/docs/kvcache-scenario.md): 16 KiB blocks, 16 prefix groups of 32 shared blocks, 8 new blocks per turn, 256 conversation slots per connection, 16 turns per conversation, 5% new conversations, Zipf skew 0.9; the cache starts empty |
 
 Value contents are a deterministic function of the key; reads of the KV-cache scenario are verified byte for byte

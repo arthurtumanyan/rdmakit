@@ -25,6 +25,29 @@ docker_ver=$(docker version --format '{{.Server.Version}}' 2>/dev/null | json_st
 containers=$(docker ps -q 2>/dev/null | wc -l)
 loadavg=$(cut -d' ' -f1 /proc/loadavg)
 
+# Directory of the append-only logs of the durability suite: filesystem type and the median time of fsync() after a
+# 128-byte append (200 samples), which bounds how many synced writes per second a server can acknowledge.
+data_dir=${BENCH_DATA_DIR:-/var/tmp/pace-data}
+mkdir -p "$data_dir" 2>/dev/null
+data_fs=$(df -PT "$data_dir" 2>/dev/null | awk 'NR == 2 {print $2}' | json_str)
+fsync_ms=$(python3 - "$data_dir" <<'PY' 2>/dev/null || echo null
+import os, sys, time
+path = os.path.join(sys.argv[1], ".fsync-probe")
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+samples = []
+for _ in range(200):
+    os.write(fd, b"x" * 128)
+    t = time.perf_counter()
+    os.fsync(fd)
+    samples.append(time.perf_counter() - t)
+os.close(fd)
+os.unlink(path)
+samples.sort()
+print("%.2f" % (samples[len(samples) // 2] * 1e3))
+PY
+)
+openssl_ver=$(first openssl version)
+
 image_id() {
     docker image inspect "$1" --format '{{index .RepoDigests 0}}' 2>/dev/null | json_str
 }
@@ -58,6 +81,9 @@ cat <<JSON
   "memcached_version": $(docker run --rm memcached:latest memcached --version 2>/dev/null | json_str),
   "dragonfly_version": $(docker run --rm docker.dragonflydb.io/dragonflydb/dragonfly:latest dragonfly --version 2>&1 | head -1 | sed "s/\x1b\[[0-9;]*m//g" | json_str),
   "git_commit": $git_commit,
-  "git_uncommitted_files": $git_dirty
+  "git_uncommitted_files": $git_dirty,
+  "openssl": $openssl_ver,
+  "data_dir_fs": $data_fs,
+  "data_dir_fsync_p50_ms": $fsync_ms
 }
 JSON

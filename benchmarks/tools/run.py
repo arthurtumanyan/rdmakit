@@ -17,6 +17,10 @@ Suites:
     validation kvpace against memtier_benchmark on Valkey (RESP) and on arenakv (memcached text protocol), with
                the client model of each tool (checks the load generator)
     capacity-evict  capacity suite for Dragonfly with a raised eviction flag (not part of `all`)
+    durability one server CPU, 50 % writes of 64-byte values: no persistence, append-only log with fsync every
+               second and on every write, and one asynchronous replica; arenakv (native) and Valkey
+    encryption one server CPU, 64-byte and 16 KiB values: arenakv native plain and encrypted, arenakv RESP
+               plain and over TLS, Valkey plain and over TLS (kvpace and arenakvd of the TLS=1 builds)
     all        every suite above
 
 Repetitions are interleaved: repetition 1 of every configuration runs before repetition 2 of any
@@ -44,6 +48,8 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 ARCH = platform.machine()
 KVBENCH = ROOT / "kvpace" / "build" / ARCH / "kvpace"
+# TLS=1 build of kvpace (encryption suite): links the TLS builds of arenakv and rdmaduct.
+KVBENCH_TLS = ROOT / "kvpace" / "build" / (ARCH + "-tls") / "kvpace"
 SERVERS_SH = ROOT / "kvpace" / "scripts" / "servers.sh"
 AKV_BENCH = ROOT / "arenakv" / "build" / ARCH / "akv_bench"
 DUCT_BENCH = ROOT / "rdmaduct" / "build" / ARCH / "duct_bench"
@@ -56,6 +62,13 @@ ENV_SH = ROOT / "benchmarks" / "scripts" / "env-info.sh"
 CLIENT_CPUS = os.environ.get("BENCH_CLIENT_CPUS", "8,10,12,14")
 SERVER_CPUS = {"1": os.environ.get("BENCH_SERVER_CPU", "0"), "4": os.environ.get("BENCH_SERVER_CPUS4", "0,2,4,6")}
 PORT = 7100
+# Replicas listen on PORT + REPLICA_OFFSET (kvpace/scripts/servers.sh). The replica's CPU is a physical core that
+# neither the one-CPU server set nor the client set uses.
+REPLICA_OFFSET = 100
+REPLICA_CPUS = os.environ.get("BENCH_REPLICA_CPU", "2")
+# Append-only logs of the durability suite go to this directory; it must be on the disk to measure, not tmpfs.
+DATA_DIR = os.environ.get("BENCH_DATA_DIR", "/var/tmp/pace-data")
+TLS_DIR = os.environ.get("BENCH_TLS_DIR", "/var/tmp/pace-tls")
 
 SYSTEMS = {
     "valkey": {"driver": "resp", "host": "127.0.0.1", "opts": [], "tcp": True},
@@ -66,6 +79,8 @@ SYSTEMS = {
     "kvstore-rdma": {"driver": "native", "host": None, "opts": ["--driver-opt", "transport=rdma"], "tcp": False},
     # arenakv serving the memcached text protocol: the same protocol and driver as the memcached rows.
     "kvstore-mc": {"driver": "memcached", "host": "127.0.0.1", "opts": [], "tcp": True},
+    # arenakv serving RESP2: the same protocol and driver as the valkey rows (encryption suite).
+    "kvstore-resp": {"driver": "resp", "host": "127.0.0.1", "opts": [], "tcp": True},
     # Dragonfly with one eviction flag raised: its default (100 evictions per heartbeat) rejects writes with
     # "Out of memory" under sustained 16 KiB writes at the configured capacities (see METHODOLOGY.md).
     "dragonfly-evict": {"driver": "resp", "host": "127.0.0.1", "opts": [], "tcp": True, "server": "dragonfly",
@@ -139,9 +154,10 @@ def wait_port(host, port, timeout=15.0):
     return False
 
 
-def server_start(name, cpus, capacity=None, extra=None):
+def server_start(name, cpus, capacity=None, extra=None, server_env=None):
     name = SYSTEMS.get(name, {}).get("server", name)
     env = dict(os.environ)
+    env.update(server_env or {})
     if capacity:
         env["CAPACITY"] = capacity
     if extra:
@@ -166,9 +182,27 @@ def server_stop(name):
     time.sleep(0.3)
 
 
+def wait_replica(system, timeout=60.0):
+    """Waits until the replica started by servers.sh (REPLICA_CPUS) has copied the primary and streams changes."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if system == "valkey":
+            p = subprocess.run(["docker", "exec", "pace-valkey-replica", "valkey-cli", "-p", str(PORT + REPLICA_OFFSET),
+                                "info", "replication"], capture_output=True, text=True)
+            if "master_link_status:up" in p.stdout:
+                return
+        else:
+            log = pathlib.Path("/tmp/pace-%s-replica.log" % system)
+            if log.exists() and "copy complete, streaming" in log.read_text():
+                return
+        time.sleep(0.2)
+    raise RuntimeError("the replica of %s did not start streaming" % system)
+
+
 def run_kvpace(rec, suite, name, params, system, cpus, workload_args, extra_args, duration, warmup,
-                capacity=None, threads=16, server_extra=None):
-    """Starts a server, runs kvpace once, stops the server, records the outcome."""
+                capacity=None, threads=16, server_extra=None, server_env=None, kvbench=None):
+    """Starts a server, runs kvpace once, stops the server, records the outcome. server_env: variables for
+    servers.sh (APPENDFSYNC, REPLICA_CPUS, TLS_DIR, AKV_TLS_BUILD); kvbench: the kvpace binary (default KVBENCH)."""
     out = rec.path(suite, name + ".json")
     sysdef = SYSTEMS[system]
     host = sysdef["host"] or rdma_addr()
@@ -177,8 +211,10 @@ def run_kvpace(rec, suite, name, params, system, cpus, workload_args, extra_args
     status, err = "ok", ""
     cmd = []
     try:
-        pid = server_start(system, cpus, capacity, extra)
-        cmd = [str(KVBENCH), "--driver", sysdef["driver"], *sysdef["opts"], "--host", host, "--port", str(PORT),
+        pid = server_start(system, cpus, capacity, extra, server_env)
+        if server_env and server_env.get("REPLICA_CPUS"):
+            wait_replica(system)
+        cmd = [str(kvbench or KVBENCH), "--driver", sysdef["driver"], *sysdef["opts"], "--host", host, "--port", str(PORT),
                "--threads", str(threads), "--warmup", str(warmup), "--duration", str(duration),
                *workload_args, *extra_args, "--pin", CLIENT_CPUS, "--server-pid", pid,
                "--label", "%s %s" % (system, name), "--out", str(out)]
@@ -196,7 +232,8 @@ def run_kvpace(rec, suite, name, params, system, cpus, workload_args, extra_args
         rec.path(suite, name + ".err").write_text(err)
     rec.add({"suite": suite, "file": "%s/%s.json" % (suite, name), "status": status, "params": params,
              "command": cmd, "wall_s": round(time.time() - started, 1),
-             "server": {"system": system, "cpus": cpus, "capacity": capacity, "extra_args": extra}})
+             "server": {"system": system, "cpus": cpus, "capacity": capacity, "extra_args": extra,
+                        "env": server_env or {}}})
     print("[%s] %s %s" % (suite, name, status), flush=True)
 
 
@@ -411,9 +448,72 @@ def suite_validation(rec, reps, quick):
                                 dur, warm, threads=threads)
 
 
+# Durability modes: servers.sh variables of each. "replica" adds one asynchronous replica without a log.
+DURABILITY_MODES = {"none": {}, "everysec": {"APPENDFSYNC": "everysec"}, "always": {"APPENDFSYNC": "always"},
+                    "replica": {"REPLICA_CPUS": REPLICA_CPUS}}
+# 50 % writes (YCSB workload A's mix) of the small workload's keys and values.
+UPDATE_HEAVY = ["--keys", "100000", "--value-size", "64", "--read-ratio", "0.5", "--dist", "uniform"]
+
+
+def suite_durability(rec, reps, quick):
+    """Cost of persistence and replication on the primary: one server CPU, 16 connections, 50 % writes."""
+    dur, warm = (3, 1) if quick else (8, 3)
+    configs = [(s, m) for s in ("valkey", "kvstore") for m in DURABILITY_MODES]
+    for rep, (system, mode) in interleave(configs, reps):
+        env = dict(DURABILITY_MODES[mode])
+        if "APPENDFSYNC" in env:
+            env["DATA_DIR"] = DATA_DIR
+        run_kvpace(rec, "durability", "%s-%s-r%d" % (system, mode, rep),
+                    {"system": system, "mode": mode, "workload": "update", "cpus": 1, "rep": rep}, system,
+                    SERVER_CPUS["1"], UPDATE_HEAVY, [], dur, warm, server_env=env)
+
+
+def make_certs(d):
+    """Writes a CA and a server certificate for localhost and 127.0.0.1 into d (files readable by the server
+    containers). Returns the CA path."""
+    d = pathlib.Path(d)
+    d.mkdir(parents=True, exist_ok=True)
+    def ossl(*args):
+        subprocess.run(["openssl", *args], check=True, capture_output=True)
+    ossl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "30", "-subj", "/CN=benchmark CA",
+         "-keyout", str(d / "ca.key"), "-out", str(d / "ca.crt"))
+    ossl("req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-keyout", str(d / "server.key"),
+         "-out", str(d / "server.csr"))
+    (d / "san.ext").write_text("subjectAltName=DNS:localhost,IP:127.0.0.1\n")
+    ossl("x509", "-req", "-in", str(d / "server.csr"), "-CA", str(d / "ca.crt"), "-CAkey", str(d / "ca.key"),
+         "-CAcreateserial", "-days", "30", "-extfile", str(d / "san.ext"), "-out", str(d / "server.crt"))
+    for f in d.iterdir():
+        f.chmod(0o644)
+    return d / "ca.crt"
+
+
+# Encryption suite: (system, encrypted). arenakv rows use the arenakvd of the TLS build in every case.
+ENCRYPTION_CASES = [("kvstore", False), ("kvstore", True), ("kvstore-resp", False), ("kvstore-resp", True),
+                    ("valkey", False), ("valkey", True)]
+
+
+def suite_encryption(rec, reps, quick):
+    """Cost of encryption: one server CPU, 16 connections, 90 % reads of 64-byte and 16 KiB values."""
+    if not KVBENCH_TLS.exists():
+        sys.exit("missing %s (make -C %s TLS=1)" % (KVBENCH_TLS, ROOT / "kvpace"))
+    dur, warm = (3, 1) if quick else (8, 3)
+    ca = make_certs(TLS_DIR)
+    configs = [(c, w) for c in ENCRYPTION_CASES for w in ("small", "block")]
+    for rep, ((system, tls), wl) in interleave(configs, reps):
+        env = {"AKV_TLS_BUILD": "1"}
+        client = []
+        if tls:
+            env["TLS_DIR"] = TLS_DIR
+            client = ["--tls", "--cacert", str(ca), "--sni", "localhost"]
+        run_kvpace(rec, "encryption", "%s-%s-%s-r%d" % (system, "tls" if tls else "plain", wl, rep),
+                    {"system": system, "tls": tls, "workload": wl, "cpus": 1, "rep": rep}, system,
+                    SERVER_CPUS["1"], WORKLOADS[wl], client, dur, warm, server_env=env, kvbench=KVBENCH_TLS)
+
+
 SUITES = {"matrix": suite_matrix, "sweep": suite_sweep, "pipeline": suite_pipeline,
           "connections": suite_connections, "capacity": suite_capacity, "engine": suite_engine,
-          "transport": suite_transport, "validation": suite_validation, "capacity-evict": suite_capacity_evict}
+          "transport": suite_transport, "validation": suite_validation, "capacity-evict": suite_capacity_evict,
+          "durability": suite_durability, "encryption": suite_encryption}
 
 
 def main():

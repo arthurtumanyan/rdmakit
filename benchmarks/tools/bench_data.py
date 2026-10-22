@@ -191,7 +191,23 @@ def summarize(run_dir):
                 "stream_mb_s": row["stream_mb_s"], "stream_msgs_per_s": row["stream_msgs_per_s"]})
     for (scope, label, size), rows in sorted(tr.items()):
         summary["transport"]["%s|%s|%d" % (scope, label, size)] = _agg(rows)
+
+    # Suites added with run4. Their sections exist only in runs that contain them, so that the summaries (and
+    # digests) of earlier runs stay unchanged. Writes matter in both, so PUT latencies are added.
+    for suite, keyfn in (("durability", lambda p: "%s|%s" % (p["system"], p["mode"])),
+                         ("encryption", lambda p: "%s|%s|%s" % (p["system"], "tls" if p["tls"] else "plain",
+                                                               p["workload"]))):
+        es = entries(suite)
+        if es:
+            summary[suite] = {}
+            for key, grp in _group(es, lambda e: keyfn(e[0])).items():
+                summary[suite][key] = _agg([_metrics_kv(r) | _put_metrics(r) for _, r in grp])
     return summary
+
+
+def _put_metrics(result):
+    lat = result["results"]["put_latency_ns"]
+    return {"put_p50_us": lat["p50"] / 1e3, "put_p99_us": lat["p99"] / 1e3}
 
 
 def canonical(summary):

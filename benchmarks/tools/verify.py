@@ -10,7 +10,7 @@ Checks (every failure is listed; the exit status is non-zero when any check fail
   3. recomputing the summary from the raw files reproduces generated/summary.json exactly;
   4. every figure embeds the digest of that summary and equals, byte for byte, the figure redrawn from the
      summary (rendering is deterministic: fixed SVG hash salt, no date or creator metadata, text kept as text),
-     every figure of report.FIGURES exists, and every image a document references exists;
+     every figure of report.FIGURES that applies to the run exists, and every image a document references exists;
   5. every generated table equals the table recomputed from the data;
   6. every GENERATED block in the documentation equals the generated table of the same name;
   7. every claim cited in the documentation as [C<number>] exists in claims.py and holds for the data, and
@@ -53,8 +53,8 @@ def main():
 
     # repetition counts per configuration and suite
     counts = {}
-    for section in ("matrix", "sweep", "pipeline", "connections", "capacity"):
-        for key, row in summary[section].items():
+    for section in ("matrix", "sweep", "pipeline", "connections", "capacity", "durability", "encryption"):
+        for key, row in summary.get(section, {}).items():
             counts.setdefault(section, set()).add(row["throughput"]["n"])
     for section, ns in counts.items():
         if len(ns) > 1:
@@ -81,7 +81,7 @@ def main():
         problems.append("no figures found")
     with tempfile.TemporaryDirectory() as tmp:
         expected = set()
-        for name, fn in report.FIGURES.items():
+        for name, fn in report.figures_for(summary):
             for theme in ("light", "dark"):
                 fname = "%s%s.svg" % (name, report.THEMES[theme]["suffix"])
                 expected.add(fname)

@@ -18,6 +18,18 @@
 #                memcached: -m (megabytes); kvstore: --capacity.
 #   EXTRA_ARGS   additional server arguments appended to the command line
 #   RDMA_ADDR    IPv4 address of the RDMA interface (kvstore-rdma only)
+#   APPENDFSYNC  always|everysec|no: valkey and kvstore keep an append-only log with this fsync policy in
+#                DATA_DIR/<server> (emptied at start; default DATA_DIR /var/tmp/pace-data, which must be on the
+#                disk to measure, not tmpfs). Unset: no log.
+#   REPLICA_CPUS start a replica of valkey or kvstore pinned to this CPU set: valkey on PORT + 100 (a second
+#                container, pace-<server>-replica), kvstore with its native listener on PORT + 100 following
+#                PORT. Stopped together with the primary.
+#   TLS_DIR      directory with server.crt and server.key (PEM). valkey: TLS on PORT (plain port off);
+#                kvstore: the native listener encrypted (--native-tls); kvstore-resp: RESP over TLS on PORT.
+#                The arenakvd of the TLS build (build/<arch>-tls) is used for every kvstore id when TLS_DIR or
+#                AKV_TLS_BUILD=1 is set, so that plain and encrypted runs use the same binary.
+#
+# kvstore-resp serves RESP2 on PORT (native protocol on PORT + 1), for comparisons with valkey over one protocol.
 set -euo pipefail
 here=$(dirname "$0")
 . "$here/env.sh"
@@ -37,11 +49,32 @@ to_mb() {
 }
 
 stop_one() {
-    docker rm -f "pace-$1" >/dev/null 2>&1 || true
-    if [ -f "/tmp/pace-$1.pid" ]; then
-        kill "$(cat "/tmp/pace-$1.pid")" 2>/dev/null || true
-        rm -f "/tmp/pace-$1.pid"
-    fi
+    docker rm -f "pace-$1" "pace-$1-replica" >/dev/null 2>&1 || true
+    local pids=()
+    for f in "/tmp/pace-$1.pid" "/tmp/pace-$1-replica.pid"; do
+        if [ -f "$f" ]; then
+            pids+=("$(cat "$f")")
+            kill "${pids[-1]}" 2>/dev/null || true
+            rm -f "$f"
+        fi
+    done
+    # Waits (at most 10 s) until the processes have exited, so that the next start finds the ports free.
+    for _ in $(seq 1 100); do
+        local alive=0
+        for p in "${pids[@]}"; do
+            kill -0 "$p" 2>/dev/null && alive=1
+        done
+        [ "$alive" = 0 ] && break
+        sleep 0.1
+    done
+}
+
+# Prints an empty data directory for server $1 (the append-only log lives there).
+data_dir() {
+    local d="${DATA_DIR:-/var/tmp/pace-data}/$1"
+    rm -rf "$d"
+    mkdir -p "$d"
+    echo "$d"
 }
 
 case "$action" in
@@ -54,10 +87,30 @@ start)
     stop_one "$name"
     case "$name" in
     valkey)
+        vol=()
+        persist=(--appendonly no)
+        if [ -n "${APPENDFSYNC:-}" ]; then
+            d=$(data_dir valkey)
+            # As the invoking user, so that the log files stay removable by the next data_dir call.
+            vol=(-v "$d:/data" --user "$(id -u):$(id -g)")
+            persist=(--appendonly yes --appendfsync "$APPENDFSYNC" --dir /data)
+        fi
+        listen=(--port "$port")
+        if [ -n "${TLS_DIR:-}" ]; then
+            vol+=(-v "$TLS_DIR:/tls:ro")
+            listen=(--port 0 --tls-port "$port" --tls-cert-file /tls/server.crt --tls-key-file /tls/server.key
+                --tls-auth-clients no)
+        fi
         # shellcheck disable=SC2086
-        docker run -d --rm --name pace-valkey --network host --cpuset-cpus "$cpus" valkey/valkey:latest \
-            valkey-server --port "$port" --save "" --appendonly no --protected-mode no --io-threads "$ncpu" \
+        docker run -d --rm --name pace-valkey --network host --cpuset-cpus "$cpus" "${vol[@]}" valkey/valkey:latest \
+            valkey-server "${listen[@]}" --save "" "${persist[@]}" --protected-mode no --io-threads "$ncpu" \
             --maxmemory "${cap_mb}mb" --maxmemory-policy allkeys-lru ${EXTRA_ARGS:-} >/dev/null
+        if [ -n "${REPLICA_CPUS:-}" ]; then
+            docker run -d --rm --name pace-valkey-replica --network host --cpuset-cpus "$REPLICA_CPUS" \
+                valkey/valkey:latest valkey-server --port $((port + 100)) --save "" --appendonly no \
+                --protected-mode no --replicaof 127.0.0.1 "$port" --maxmemory "${cap_mb}mb" \
+                --maxmemory-policy allkeys-lru >/dev/null
+        fi
         ;;
     dragonfly)
         # shellcheck disable=SC2086
@@ -71,8 +124,12 @@ start)
         docker run -d --rm --name pace-memcached --network host --cpuset-cpus "$cpus" memcached:latest \
             memcached -p "$port" -t "$ncpu" -m "$cap_mb" ${EXTRA_ARGS:-} >/dev/null
         ;;
-    kvstore | kvstore-rdma | kvstore-mc)
-        bin="$here/../../arenakv/build/$(uname -m)/arenakvd"
+    kvstore | kvstore-rdma | kvstore-mc | kvstore-resp)
+        variant=""
+        if [ -n "${TLS_DIR:-}" ] || [ "${AKV_TLS_BUILD:-0}" = 1 ]; then
+            variant=-tls
+        fi
+        bin="$here/../../arenakv/build/$(uname -m)$variant/arenakvd"
         listen="--port $port"
         if [ "$name" = kvstore-rdma ]; then
             transport="rdma --addr ${RDMA_ADDR:?set RDMA_ADDR to the address of the RDMA interface}"
@@ -82,10 +139,38 @@ start)
         if [ "$name" = kvstore-mc ]; then
             listen="--port $((port + 1)) --memcached-port $port"
         fi
+        if [ "$name" = kvstore-resp ]; then
+            listen="--port $((port + 1)) --resp-port $port"
+        fi
+        persist=""
+        if [ -n "${APPENDFSYNC:-}" ]; then
+            persist="--appendonly $(data_dir "$name") --appendfsync $APPENDFSYNC"
+        fi
+        tls=""
+        if [ -n "${TLS_DIR:-}" ]; then
+            tls="--tls-cert $TLS_DIR/server.crt --tls-key $TLS_DIR/server.key"
+            if [ "$name" = kvstore-resp ]; then
+                listen="--port $((port + 1)) --tls-resp-port $port"
+            else
+                tls="$tls --native-tls"
+            fi
+        fi
         # shellcheck disable=SC2086
         taskset -c "$cpus" "$bin" --transport $transport $listen --threads "$ncpu" --capacity "${cap_mb}M" \
-            ${EXTRA_ARGS:-} >"/tmp/pace-$name.log" 2>&1 &
+            $persist $tls ${EXTRA_ARGS:-} >"/tmp/pace-$name.log" 2>&1 &
         echo $! >"/tmp/pace-$name.pid"
+        if [ -n "${REPLICA_CPUS:-}" ]; then
+            nrep=$(echo "$REPLICA_CPUS" | tr ',' '\n' | wc -l)
+            primary_port=$port
+            if [ "$name" = kvstore-mc ] || [ "$name" = kvstore-resp ]; then
+                primary_port=$((port + 1))
+            fi
+            # shellcheck disable=SC2086
+            taskset -c "$REPLICA_CPUS" "$bin" --transport tcp --port $((port + 100)) --threads "$nrep" \
+                --capacity "${cap_mb}M" --replicaof "127.0.0.1:$primary_port" $tls \
+                >"/tmp/pace-$name-replica.log" 2>&1 &
+            echo $! >"/tmp/pace-$name-replica.pid"
+        fi
         ;;
     *)
         echo "unknown server: $name" >&2
@@ -97,7 +182,7 @@ stop)
     stop_one "$name"
     ;;
 stop-all)
-    for n in valkey dragonfly memcached kvstore kvstore-rdma kvstore-mc; do
+    for n in valkey dragonfly memcached kvstore kvstore-rdma kvstore-mc kvstore-resp; do
         stop_one "$n"
     done
     ;;
@@ -106,7 +191,7 @@ pid)
     valkey) comm=valkey-server ;;
     dragonfly) comm=dragonfly ;;
     memcached) comm=memcached ;;
-    kvstore | kvstore-rdma | kvstore-mc)
+    kvstore | kvstore-rdma | kvstore-mc | kvstore-resp)
         cat "/tmp/pace-$name.pid"
         exit 0
         ;;

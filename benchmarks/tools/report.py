@@ -59,6 +59,15 @@ CAPACITY_ORDER = ["kvstore", "valkey", "dragonfly", "dragonfly-evict", "memcache
 WORKLOAD_TITLE = {"small": "64-byte values", "block": "16 KiB values", "kvcache": "KV-cache requests"}
 TRANSPORT_SLOT = {"rdma-poll": 0, "tcp-poll": 1, "rdma-event": 2}
 TRANSPORT_LABEL = {"tcp-poll": "TCP", "rdma-poll": "Soft-RoCE, polling", "rdma-event": "Soft-RoCE, event-driven"}
+DURABILITY_MODES = ["none", "everysec", "always", "replica"]
+DURABILITY_LABEL = {"none": "no persistence", "everysec": "log, fsync every second", "always": "log, fsync per write",
+                    "replica": "one replica"}
+DURABILITY_TICK = {"none": "none", "everysec": "log,\nfsync 1/s", "always": "log,\nfsync per write",
+                   "replica": "one\nreplica"}
+# Encryption suite: protocol paths compared plain and encrypted.
+ENCRYPTION_PATHS = [("kvstore", "arenakv native"), ("kvstore-resp", "arenakv RESP"), ("valkey", "Valkey RESP")]
+SYSTEM_SLOT["kvstore-resp"] = 0
+SYSTEM_LABEL["kvstore-resp"] = "arenakv (RESP)"
 
 
 def compact(v):
@@ -611,7 +620,11 @@ def tables(summary, digest):
         ["Source commit", env["git_commit"][:12]],
         ["Uncommitted files at run start", env["git_uncommitted_files"]],
     ] + [[label, env[key]] for label, key in (("Containers running at run start", "running_containers"),
-                                              ("Load average (1 min) at run start", "load_avg_1min")) if key in env])
+                                              ("Load average (1 min) at run start", "load_avg_1min"),
+                                              ("OpenSSL", "openssl"),
+                                              ("Filesystem of the append-only logs", "data_dir_fs")) if key in env]
+       + [["fsync() after a 128-byte append, median", "%.2f ms" % env["data_dir_fsync_p50_ms"]]
+          for _ in (1,) if env.get("data_dir_fsync_p50_ms") is not None])
 
     def matrix_table(metric, digits, title_unit):
         rows = []
@@ -742,7 +755,126 @@ def tables(summary, digest):
             rows.append(row)
         out[name] = pv + "\n" + text + " Loopback on one host.\n\n" + md_table(
             ["Message bytes"] + [TRANSPORT_LABEL[k] for k in ("tcp-poll", "rdma-poll", "rdma-event")], rows)
+
+    if "durability" in summary:
+        rows = []
+        for s in ("kvstore", "valkey"):
+            base = get(summary, "durability", "%s|none" % s, "throughput")
+            for mode in DURABILITY_MODES:
+                k = "%s|%s" % (s, mode)
+                if k not in summary["durability"]:
+                    continue
+                tp = get(summary, "durability", k, "throughput")
+                rows.append([SYSTEM_LABEL[s], DURABILITY_LABEL[mode], fmt_stat(tp, 0),
+                             "%.2f" % (tp["mean"] / base["mean"]) if base else "",
+                             fmt_stat(get(summary, "durability", k, "put_p50_us"), 0),
+                             fmt_stat(get(summary, "durability", k, "put_p99_us"), 0),
+                             fmt_stat(get(summary, "durability", k, "p50_us"), 0),
+                             fmt_stat(get(summary, "durability", k, "p99_us"), 0),
+                             fmt_stat(get(summary, "durability", k, "server_cpu_us_per_op"), 2)])
+        out["durability"] = pv + ("\nClosed loop, one server CPU, 16 connections, 50% PUT of 64-byte values (100,000 keys)."
+                                  " The log is written to the NVMe disk of the host. The replica runs on another physical"
+                                  " core; replication is asynchronous, so the primary's numbers include sending the"
+                                  " changes but not waiting for them. Latencies in microseconds; ratio: throughput"
+                                  " relative to no persistence of the same system.\n\n") + md_table(
+            ["System", "Durability", "ops/s", "Ratio", "PUT p50", "PUT p99", "GET p50", "GET p99", "Server CPU µs/op"],
+            rows)
+    if "encryption" in summary:
+        rows = []
+        for s, label in ENCRYPTION_PATHS:
+            for wl in ("small", "block"):
+                pk, tk = "%s|plain|%s" % (s, wl), "%s|tls|%s" % (s, wl)
+                if pk not in summary["encryption"] or tk not in summary["encryption"]:
+                    continue
+                p_tp = get(summary, "encryption", pk, "throughput")
+                t_tp = get(summary, "encryption", tk, "throughput")
+                rows.append([label, WORKLOAD_TITLE[wl], fmt_stat(p_tp, 0), fmt_stat(t_tp, 0),
+                             "%.2f" % (t_tp["mean"] / p_tp["mean"]),
+                             fmt_stat(get(summary, "encryption", pk, "server_cpu_us_per_op"), 2),
+                             fmt_stat(get(summary, "encryption", tk, "server_cpu_us_per_op"), 2),
+                             fmt_stat(get(summary, "encryption", pk, "p99_us"), 0),
+                             fmt_stat(get(summary, "encryption", tk, "p99_us"), 0)])
+        out["encryption"] = pv + ("\nClosed loop, one server CPU, 16 connections, 90% GET. arenakv native: rdmaduct encrypted"
+                                  " endpoints (TLS 1.3 handshake, AES-256-GCM per message) over TCP; RESP: TLS 1.3"
+                                  " streams. All arenakv runs use the arenakvd of the TLS=1 build. Ratio: encrypted"
+                                  " throughput over unencrypted. Latencies are GET latencies in microseconds.\n\n") + md_table(
+            ["Path", "Values", "ops/s plain", "ops/s encrypted", "Ratio", "Server CPU µs/op plain",
+             "Server CPU µs/op encrypted", "p99 plain", "p99 encrypted"], rows)
     return out
+
+
+def fig_durability(summary, theme, path, digest):
+    t = style(theme)
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 3.9), gridspec_kw={"wspace": 0.28})
+    systems = ["kvstore", "valkey"]
+    width = 0.38
+    for ax, metric, ylabel, ptitle, log in (
+            (axes[0], "throughput", "operations / s", "Throughput", True),
+            (axes[1], "put_p50_us", "PUT latency p50 (us)", "PUT latency, median", True)):
+        for j, s in enumerate(systems):
+            color = t["series"][SYSTEM_SLOT[s]]
+            for i, mode in enumerate(DURABILITY_MODES):
+                st = get(summary, "durability", "%s|%s" % (s, mode), metric)
+                if st is None:
+                    continue
+                x = i + (j - 0.5) * width
+                ax.bar(x, st["mean"], width=width * 0.92, color=color, zorder=3)
+                ax.vlines(x, st["min"], st["max"], color=t["text2"], linewidth=1.0, zorder=4)
+                ax.text(x, st["max"] * 1.08, compact(st["mean"]), ha="center", va="bottom", fontsize=6.5,
+                        color=t["text"], zorder=5)
+        ax.set_yscale("log")
+        ax.set_xticks(range(len(DURABILITY_MODES)))
+        ax.set_xticklabels([DURABILITY_TICK[m] for m in DURABILITY_MODES])
+        ax.tick_params(axis="x", length=0)
+        ax.yaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+        ax.set_title(ptitle, loc="left", color=t["text"])
+        ax.set_ylabel(ylabel)
+        plain_axis(ax)
+        ax.grid(axis="y", zorder=0)
+        ax.spines["left"].set_visible(False)
+        ax.tick_params(axis="y", length=0)
+    system_legend(fig, theme, [(s, None) for s in systems], 0.0)
+    fig.subplots_adjust(top=0.80, bottom=0.24, left=0.07, right=0.99)
+    finish(fig, path, theme, digest, "Cost of persistence and replication",
+           "One server CPU, 16 connections, 50% PUT of 64-byte values. Logarithmic axes. arenakv over its native protocol, Valkey over RESP. Whiskers: minimum to maximum.")
+
+
+def fig_encryption(summary, theme, path, digest):
+    t = style(theme)
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 3.9), gridspec_kw={"wspace": 0.24})
+    width = 0.38
+    for ax, wl in zip(axes, ("small", "block")):
+        for i, (s, _) in enumerate(ENCRYPTION_PATHS):
+            color = t["series"][SYSTEM_SLOT[s]]
+            for j, mode in enumerate(("plain", "tls")):
+                st = get(summary, "encryption", "%s|%s|%s" % (s, mode, wl), "throughput")
+                if st is None:
+                    continue
+                x = i + (j - 0.5) * width
+                ax.bar(x, st["mean"], width=width * 0.92, color=color, hatch="////" if mode == "tls" else None,
+                       edgecolor=t["surface"], linewidth=0, zorder=3)
+                ax.vlines(x, st["min"], st["max"], color=t["text2"], linewidth=1.0, zorder=4)
+                ax.text(x, st["max"], compact(st["mean"]), ha="center", va="bottom", fontsize=6.5, color=t["text"],
+                        zorder=5)
+        ax.set_xticks(range(len(ENCRYPTION_PATHS)))
+        ax.set_xticklabels([label for _, label in ENCRYPTION_PATHS])
+        ax.tick_params(axis="x", length=0)
+        ax.set_title(WORKLOAD_TITLE[wl], loc="left", color=t["text"])
+        ax.set_ylabel("operations / s" if wl == "small" else "")
+        ymax = max([v["max"] for v in (get(summary, "encryption", k, "throughput") for k in summary["encryption"]
+                                       if k.endswith("|" + wl)) if v] or [1])
+        ax.set_ylim(0, ymax * 1.18)
+        ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: compact(v)))
+        ax.grid(axis="y", zorder=0)
+        ax.spines["left"].set_visible(False)
+        ax.tick_params(axis="y", length=0)
+    handles = [Patch(facecolor=t["muted"], label="unencrypted"),
+               Patch(facecolor=t["muted"], hatch="////", edgecolor=t["surface"], linewidth=0, label="encrypted")]
+    fig.legend(handles=handles, loc="lower center", ncol=2, bbox_to_anchor=(0.5, 0.0))
+    fig.subplots_adjust(top=0.80, bottom=0.17, left=0.07, right=0.99)
+    finish(fig, path, theme, digest, "Cost of encryption",
+           "One server CPU, 16 connections, 90% GET. Plain bar: unencrypted; hatched bar: the same server and protocol encrypted\n"
+           "(arenakv native: rdmaduct TLS 1.3 handshake and AES-256-GCM per message; RESP: TLS 1.3). Whiskers: minimum to maximum.")
 
 
 FIGURES = {
@@ -759,7 +891,16 @@ FIGURES = {
     "capacity": fig_capacity,
     "transport": fig_transport,
     "engine": fig_engine,
+    "durability": fig_durability,
+    "encryption": fig_encryption,
 }
+# Figures of suites added after run3: drawn only for runs whose summary has the section.
+OPTIONAL_SECTION = {"durability": "durability", "encryption": "encryption"}
+
+
+def figures_for(summary):
+    """The (name, function) pairs of FIGURES that apply to this summary."""
+    return [(n, f) for n, f in FIGURES.items() if OPTIONAL_SECTION.get(n, None) in (None, *summary)]
 
 
 def update_docs(blocks):
@@ -803,7 +944,7 @@ def main():
     gendir.mkdir(parents=True, exist_ok=True)
     (gendir / "summary.json").write_text(bench_data.canonical(summary))
     (gendir / "summary.sha256").write_text(digest + "\n")
-    for name, fn in FIGURES.items():
+    for name, fn in figures_for(summary):
         for theme in ("light", "dark"):
             fn(summary, theme, figdir / ("%s%s.svg" % (name, THEMES[theme]["suffix"])), digest)
     blocks = tables(summary, digest)
