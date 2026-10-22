@@ -33,10 +33,16 @@
  *   --snapshot FILE             snapshot file, loaded at start, written on SAVE/BGSAVE and at exit
  *   --save-interval SECONDS     periodic snapshot when data changed (default: off)
  *   --no-save-on-stop           do not write the snapshot at exit
+ *   --appendonly DIR            append-only log of every change, loaded at start
+ *   --appendfsync always|everysec|no   when the log is synced (default: everysec)
+ *   --aof-rewrite-percentage N, --aof-rewrite-min-size SIZE   automatic rewrite (default: 100, 64M)
+ *   --aof-load-damaged          start with the records before a damaged block instead of failing
+ *   --warm-restart FILE         keep the cache memory in FILE (under /dev/shm) across restarts
  *   --log-level error|warn|info|debug, --log-file FILE (reopened on SIGHUP)
  *   --stats SECONDS             log a statistics line every SECONDS seconds
  *   -h, --help, -V, --version   print the usage text or the version and exit
- * Signals: SIGINT and SIGTERM stop the server (after the final snapshot); SIGHUP reopens the log file.
+ * Signals: SIGINT, SIGTERM and SIGUSR1 stop the server (after syncing the log, the final snapshot and
+ * keeping the warm-restart memory); SIGHUP reopens the log file.
  * Exit status: 0 after a requested stop, 1 when the server cannot start, 2 for invalid options.
  */
 #include <errno.h>
@@ -98,6 +104,12 @@ static const char usage[] =
     "  --snapshot FILE             snapshot file, loaded at start, written on SAVE/BGSAVE and at exit\n"
     "  --save-interval SECONDS     periodic snapshot when data changed (default: off)\n"
     "  --no-save-on-stop           do not write the snapshot at exit\n"
+    "  --appendonly DIR            append-only log of every change, loaded at start\n"
+    "  --appendfsync always|everysec|no   when the log is synced to disk (default: everysec)\n"
+    "  --aof-rewrite-percentage N  rewrite the log when it grew by N% of its base (default: 100; 0: off)\n"
+    "  --aof-rewrite-min-size SIZE ... and is at least SIZE (default: 64M)\n"
+    "  --aof-load-damaged          start with the records before a damaged block instead of failing\n"
+    "  --warm-restart FILE         keep the cache memory in FILE (under /dev/shm) across restarts\n"
     "  --log-level error|warn|info|debug   (default: info)\n"
     "  --log-file FILE             log destination (default: standard error); reopened on SIGHUP\n"
     "  --stats SECONDS             log a statistics line every SECONDS seconds\n"
@@ -106,7 +118,8 @@ static const char usage[] =
     "  -h, --help                  this text\n"
     "  -V, --version               version and build revision\n"
     "\n"
-    "Signals: SIGTERM and SIGINT stop the server after the final snapshot; SIGHUP reopens the log file.\n"
+    "Signals: SIGTERM, SIGINT and SIGUSR1 stop the server after syncing the log, the final snapshot and\n"
+    "keeping the warm-restart memory; SIGHUP reopens the log file.\n"
     "Exit status: 0 after a requested stop, 1 when the server cannot start, 2 for invalid options.\n";
 
 /* Prints an error about the value of option `name` and returns 2 (the exit status for invalid options). */
@@ -225,6 +238,12 @@ static const struct option lo[] = {
     {"log-level", required_argument, NULL, 1010},
     {"log-file", required_argument, NULL, 1011},
     {"config", required_argument, NULL, 1012},
+    {"appendonly", required_argument, NULL, 1013},
+    {"appendfsync", required_argument, NULL, 1014},
+    {"aof-rewrite-percentage", required_argument, NULL, 1015},
+    {"aof-rewrite-min-size", required_argument, NULL, 1016},
+    {"aof-load-damaged", no_argument, NULL, 1017},
+    {"warm-restart", required_argument, NULL, 1018},
     {"help", no_argument, NULL, 'h'},
     {"version", no_argument, NULL, 'V'},
     {NULL, 0, NULL, 0},
@@ -533,6 +552,38 @@ int main(int argc, char **argv) {
             break;
         case 1012:
             break; /* already read */
+        case 1013:
+            cfg.aof_dir = optarg;
+            break;
+        case 1014:
+            if (strcmp(optarg, "always") == 0) {
+                cfg.aof_fsync = 2;
+            } else if (strcmp(optarg, "everysec") == 0) {
+                cfg.aof_fsync = 1;
+            } else if (strcmp(optarg, "no") == 0) {
+                cfg.aof_fsync = 0;
+            } else {
+                return bad_value(name, optarg, "always, everysec or no");
+            }
+            break;
+        case 1015:
+            if (parse_uint(optarg, 0, 100000, &v) != 0) {
+                return bad_value(name, optarg, "a percentage (0: no automatic rewrite)");
+            }
+            cfg.aof_rewrite_percentage = (unsigned)v;
+            break;
+        case 1016:
+            cfg.aof_rewrite_min_size = parse_size(optarg);
+            if (cfg.aof_rewrite_min_size == 0) {
+                return bad_value(name, optarg, "a size such as 64M");
+            }
+            break;
+        case 1017:
+            cfg.aof_load_damaged = 1;
+            break;
+        case 1018:
+            cfg.store.shm_path = optarg;
+            break;
         default:
             fprintf(stderr, "Try 'arenakvd --help' for the list of options.\n");
             return 2;
@@ -559,11 +610,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "arenakvd: TLS listeners need --tls-cert and --tls-key\n");
         return 2;
     }
-    if (cfg.snapshot_path != NULL) {
-        char *copy = keep(cfg.snapshot_path);
+    const char *files[3] = {cfg.snapshot_path, cfg.store.shm_path, cfg.aof_dir};
+    static const char *const what[3] = {"snapshot", "warm-restart", "append-only log"};
+    for (int i = 0; i < 3; i++) {
+        if (files[i] == NULL) {
+            continue;
+        }
+        char *copy = keep(files[i]);
         const char *dir = dirname(copy);
         if (access(dir, W_OK | X_OK) != 0) {
-            fprintf(stderr, "arenakvd: snapshot directory %s is not writable: %s\n", dir, strerror(errno));
+            fprintf(stderr, "arenakvd: %s directory %s is not writable: %s\n", what[i], dir, strerror(errno));
             free(copy);
             return 2;
         }
@@ -572,6 +628,7 @@ int main(int argc, char **argv) {
     struct sigaction sa = {.sa_handler = on_signal};
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGUSR1, &sa, NULL);
     sigaction(SIGHUP, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 

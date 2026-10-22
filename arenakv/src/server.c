@@ -29,6 +29,14 @@
  *
  * Request handling of the native protocol: see akvproto.h. Stores answer with the new CAS version as an
  * 8-byte payload.
+ *
+ * Durability: the engine's change feed goes to the append-only log (aof.h). With fsync policy "always" a
+ * connection whose commands changed data in a turn is parked: its replies stay queued and its descriptor
+ * is removed from the epoll interest until the log's durable sequence number reaches the last record the
+ * turn produced. The log writer syncs a batch of records at once (group commit) and then wakes the
+ * workers that hold parked connections through their eventfd. Parking and waking pair a sequentially
+ * consistent store of the parking flag with a load of the durable number (and the reverse on the writer
+ * side), so a wake-up cannot be missed.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -46,6 +54,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -71,6 +80,9 @@ enum conn_kind {
 };
 
 struct worker;
+struct conn;
+
+static void schedule(struct worker *w, struct conn *c);
 
 struct conn {
     enum conn_kind kind;
@@ -93,6 +105,8 @@ struct conn {
     int tls_want_write; /* the TLS layer needs the socket writable to progress */
     int in_ready;       /* on the worker's ready list */
     int dead;           /* resources released; freed when it leaves the ready list */
+    int parked;         /* replies wait for the append-only log (see above) */
+    uint64_t hold_seq;  /* log sequence number the replies wait for */
 };
 
 struct worker {
@@ -109,6 +123,10 @@ struct worker {
     struct conn **ready;              /* connections with work left after their turn */
     size_t nready;
     size_t ready_cap;
+    struct conn **parked; /* connections waiting for the append-only log */
+    size_t nparked;
+    size_t parked_cap;
+    atomic_int has_parked;
 };
 
 struct cred {
@@ -154,6 +172,7 @@ struct akvd {
     pthread_mutex_t saver_lock;
     pthread_cond_t saver_cond;
     uint64_t saved_puts;
+    aof *aof; /* append-only log, NULL when not configured */
 #ifdef AKV_HAVE_TLS
     SSL_CTX *tls;
 #endif
@@ -295,6 +314,22 @@ uint64_t akvd_uptime(const akvd *d) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (uint64_t)(now.tv_sec - d->started.tv_sec);
+}
+
+int akvd_aof_info(akvd *d, aof_info *out) {
+    if (d->aof == NULL) {
+        return -EINVAL;
+    }
+    aof_info_get(d->aof, out);
+    return 0;
+}
+
+void akvd_warm_info(akvd *d, akv_warm_info *out) {
+    akv_warm_get(d->store, out);
+}
+
+int akvd_aof_rewrite(akvd *d) {
+    return d->aof == NULL ? -EINVAL : aof_rewrite(d->aof);
 }
 
 unsigned akvd_threads(const akvd *d) {
@@ -552,9 +587,22 @@ static uint64_t mono_s(void) {
     return (uint64_t)ts.tv_sec;
 }
 
+static void unpark_remove(struct worker *w, struct conn *c) {
+    for (size_t i = 0; i < w->nparked; i++) {
+        if (w->parked[i] == c) {
+            w->parked[i] = w->parked[--w->nparked];
+            break;
+        }
+    }
+    c->parked = 0;
+}
+
 static void conn_free(struct conn *c) {
     struct worker *w = c->w;
     akvd *d = w->d;
+    if (c->parked) {
+        unpark_remove(w, c);
+    }
     if (c->kind == CK_NATIVE) {
         if (c->ep != NULL) {
             epoll_ctl(w->epfd, EPOLL_CTL_DEL, c->fd, NULL);
@@ -869,6 +917,94 @@ static size_t native_handle(akvd *d, struct conn *c, const uint8_t *msg, size_t 
     return AKVP_RESP_HDR + payload;
 }
 
+/*
+ * Log sequence number the replies of a turn must wait for: the last record appended by this thread when
+ * the turn appended any (aof_thread_seq() moved past `before`) and it is not yet durable; 0 otherwise.
+ */
+static uint64_t hold_needed(akvd *d, uint64_t before) {
+    if (d->aof == NULL || d->cfg.aof_fsync != AOF_FSYNC_ALWAYS) {
+        return 0;
+    }
+    uint64_t s = aof_thread_seq();
+    return s != before && s > aof_durable(d->aof) ? s : 0;
+}
+
+/* Parks c until the log is durable up to seq: no descriptor events, no output. */
+static void park(struct worker *w, struct conn *c, uint64_t seq) {
+    if (w->nparked == w->parked_cap) {
+        size_t cap = w->parked_cap ? w->parked_cap * 2 : 64;
+        struct conn **p = realloc(w->parked, cap * sizeof(*p));
+        if (p == NULL) {
+            schedule(w, c); /* cannot park: retry the turn (replies stay queued) */
+            return;
+        }
+        w->parked = p;
+        w->parked_cap = cap;
+    }
+    c->parked = 1;
+    c->hold_seq = seq;
+    w->parked[w->nparked++] = c;
+    if (c->epmask != 0) {
+        struct epoll_event ev = {.events = 0, .data.ptr = c};
+        epoll_ctl(w->epfd, EPOLL_CTL_MOD, c->fd, &ev);
+        c->epmask = 0;
+    }
+    atomic_store(&w->has_parked, 1);
+    if (aof_durable(w->d->aof) >= seq) {
+        /* became durable meanwhile: the writer may have looked at has_parked before the store above */
+        uint64_t one = 1;
+        if (write(w->evfd, &one, sizeof(one)) < 0) {
+            /* the counter cannot overflow; the next loop iteration releases the connection anyway */
+        }
+    }
+}
+
+/* Schedules parked connections whose replies are durable now. */
+static void unpark_ready(struct worker *w) {
+    if (w->nparked == 0) {
+        return;
+    }
+    uint64_t durable = aof_durable(w->d->aof);
+    for (size_t i = 0; i < w->nparked;) {
+        struct conn *c = w->parked[i];
+        if (c->hold_seq <= durable) {
+            w->parked[i] = w->parked[--w->nparked];
+            c->parked = 0;
+            schedule(w, c);
+        } else {
+            i++;
+        }
+    }
+    if (w->nparked == 0) {
+        atomic_store(&w->has_parked, 0);
+    }
+}
+
+/* Log writer callback: wakes the workers that hold parked connections. */
+static void on_durable(void *arg) {
+    akvd *d = arg;
+    for (unsigned i = 0; i < d->nworkers; i++) {
+        if (atomic_load(&d->workers[i].has_parked)) {
+            uint64_t one = 1;
+            if (write(d->workers[i].evfd, &one, sizeof(one)) < 0) {
+                /* see park() */
+            }
+        }
+    }
+}
+
+/* Engine change feed: forwards every record to the append-only log. */
+static void on_change(void *arg, const akv_change *c) {
+    akvd *d = arg;
+    if (d->aof != NULL) {
+        aof_append(d->aof, c);
+    }
+}
+
+static void aof_log_sink(void *arg, int level, const char *msg) {
+    akvd_log(arg, level == 0 ? AKVD_LOG_ERROR : level == 1 ? AKVD_LOG_WARN : AKVD_LOG_INFO, "%s", msg);
+}
+
 /* Sends queued native responses. Returns 0 (queue empty), 1 (blocked), or a negative error. */
 static int native_flush(struct conn *c) {
     while (ob_pending(&c->pend) > 0) {
@@ -929,6 +1065,7 @@ static void native_prefetch(akvd *d, const uint8_t *msg, size_t len, int stage) 
 /* Serves a native connection for one turn. Returns 0 (armed, waiting), 1 (work left), or -1 (closed). */
 static int native_serve(struct worker *w, struct conn *c) {
     akvd *d = w->d;
+    uint64_t before = aof_thread_seq();
     /* At most recv_depth messages can be held at once (duct_recv). */
     unsigned prefetch = d->cfg.recv_depth < PREFETCH ? d->cfg.recv_depth : PREFETCH;
     size_t cap = d->cfg.max_msg;
@@ -985,6 +1122,22 @@ static int native_serve(struct worker *w, struct conn *c) {
                 }
             }
             if (nb > 0) {
+                uint64_t hold = hold_needed(d, before);
+                if (hold != 0) {
+                    /* Queue the whole batch; it is sent when the log is durable. */
+                    for (unsigned j = 0; j < nb; j++) {
+                        uint8_t len4[4];
+                        akvp_put32(len4, (uint32_t)w->bmsg[j].len);
+                        if (ob_add(&c->pend, len4, 4) != 0 ||
+                            ob_add(&c->pend, w->bmsg[j].data, w->bmsg[j].len) != 0) {
+                            conn_free(c);
+                            return -1;
+                        }
+                    }
+                    c->last_active = mono_s();
+                    park(w, c, hold);
+                    return 0;
+                }
                 rc = native_send_batch(w, c, nb);
                 if (rc < 0) {
                     conn_free(c);
@@ -1125,6 +1278,7 @@ static int tls_buffered(const struct conn *c) {
 static int text_serve(struct worker *w, struct conn *c) {
     akvd *d = w->d;
     size_t max_in = akvd_max_input(d);
+    uint64_t before = aof_thread_seq();
     for (int round = 0; round < BURST; round++) {
         c->tls_want_write = 0;
         if (text_write(c) != 0) {
@@ -1173,6 +1327,11 @@ static int text_serve(struct worker *w, struct conn *c) {
                                            : resp_execute(d, &c->ss, in, avail, &c->out);
             c->in.off += used;
             ob_compact(&c->in);
+            uint64_t hold = hold_needed(d, before);
+            if (hold != 0) {
+                park(w, c, hold);
+                return 0;
+            }
             if (used > 0) {
                 continue; /* replies may be pending: write them, then read again */
             }
@@ -1311,6 +1470,7 @@ static void *worker_main(void *arg) {
                     /* counter already reset by a concurrent read */
                 }
                 adopt(w);
+                unpark_ready(w);
                 continue;
             }
             serve(w, evs[i].data.ptr);
@@ -1334,6 +1494,9 @@ static void *worker_main(void *arg) {
     free(w->ready);
     w->ready = NULL;
     w->nready = 0;
+    free(w->parked);
+    w->parked = NULL;
+    w->nparked = 0;
     while (w->conns != NULL) {
         struct conn *c = w->conns;
         if (c->kind != CK_NATIVE) {
@@ -1524,6 +1687,9 @@ void akvd_config_default(akvd_config *cfg) {
     cfg->recv_depth = 16;
     cfg->send_depth = 16;
     cfg->log_level = AKVD_LOG_INFO;
+    cfg->aof_fsync = AOF_FSYNC_EVERYSEC;
+    cfg->aof_rewrite_percentage = 100;
+    cfg->aof_rewrite_min_size = 64ull << 20; /* Valkey's auto-aof-rewrite-min-size default */
 }
 
 #ifdef AKV_HAVE_TLS
@@ -1576,7 +1742,14 @@ static void free_all(akvd *d) {
     }
     free(d->workers);
     duct_ctx_destroy(d->ctx);
-    akv_destroy(d->store);
+    if (d->aof != NULL) {
+        aof_close(d->aof);
+    }
+    if (d->store != NULL && d->cfg.store.shm_path != NULL) {
+        akv_detach(d->store); /* keeps restored memory when the start fails afterwards */
+    } else {
+        akv_destroy(d->store);
+    }
     for (size_t i = 0; i < d->ncreds; i++) {
         free(d->creds[i].user);
         free(d->creds[i].pass);
@@ -1657,12 +1830,42 @@ akvd *akvd_start(const akvd_config *cfg, int *err) {
     if (d->cfg.auth_file != NULL && (*err = load_creds(d, d->cfg.auth_file)) != 0) {
         goto fail;
     }
+    d->cfg.store.on_change = on_change;
+    d->cfg.store.on_change_arg = d;
+    errno = 0;
     d->store = akv_create(&d->cfg.store);
     if (d->store == NULL) {
-        *err = -EINVAL;
+        *err = d->cfg.store.shm_path != NULL && errno != 0 ? -errno : -EINVAL;
+        if (d->cfg.store.shm_path != NULL) {
+            akvd_log(d, AKVD_LOG_ERROR, "warm-restart file %s: %s", d->cfg.store.shm_path, strerror(-*err));
+        }
         goto fail;
     }
-    if (d->cfg.snapshot_path != NULL) {
+    akv_warm_info wi;
+    akv_warm_get(d->store, &wi);
+    static const char *const warm_names[] = {
+        "none",   "created", "restored", "configuration changed", "previous run did not stop cleanly",
+        "damaged"};
+    if (wi.state == AKV_WARM_RESTORED) {
+        akvd_log(d, AKVD_LOG_INFO,
+                 "warm restart: %llu entries restored in %.3f s (%llu expired while stopped)",
+                 (unsigned long long)wi.entries, (double)wi.rebuild_us / 1e6, (unsigned long long)wi.expired);
+    } else if (wi.state != AKV_WARM_NONE && wi.state != AKV_WARM_CREATED) {
+        akvd_log(d, AKVD_LOG_WARN, "warm restart: memory discarded (%s)", warm_names[wi.state]);
+    }
+    int restored = wi.state == AKV_WARM_RESTORED;
+    int have_log = 0;
+    if (d->cfg.aof_dir != NULL) {
+        char mpath[4096];
+        struct stat mst;
+        snprintf(mpath, sizeof(mpath), "%s/manifest", d->cfg.aof_dir);
+        have_log = stat(mpath, &mst) == 0;
+    }
+    if (d->cfg.snapshot_path != NULL && (restored || have_log)) {
+        akvd_log(d, AKVD_LOG_INFO, "snapshot not loaded: the %s is newer",
+                 restored ? "warm-restart memory" : "append-only log");
+    }
+    if (d->cfg.snapshot_path != NULL && !restored && !have_log) {
         uint64_t loaded = 0;
         int rc = snap_load(d->store, d->cfg.snapshot_path, &loaded);
         if (rc == 0) {
@@ -1673,6 +1876,49 @@ akvd *akvd_start(const akvd_config *cfg, int *err) {
             *err = rc;
             goto fail;
         }
+    }
+    if (d->cfg.aof_dir != NULL) {
+        aof_config ac = {
+            .dir = d->cfg.aof_dir,
+            .fsync = (enum aof_fsync)d->cfg.aof_fsync,
+            .rewrite_percentage = d->cfg.aof_rewrite_percentage,
+            .rewrite_min_size = d->cfg.aof_rewrite_min_size,
+            .load_damaged = d->cfg.aof_load_damaged,
+            .log = aof_log_sink,
+            .log_arg = d,
+            .durable = on_durable,
+            .durable_arg = d,
+        };
+        aof_load_info li;
+        int rc = aof_open(&ac, d->store, !restored, &d->aof, &li);
+        if (rc != 0) {
+            akvd_log(d, AKVD_LOG_ERROR,
+                     "append-only log in %s cannot be opened (%s); see the operations guide for damaged logs",
+                     d->cfg.aof_dir, strerror(-rc));
+            *err = rc;
+            goto fail;
+        }
+        if (li.created) {
+            akvd_log(d, AKVD_LOG_INFO, "append-only log created in %s", d->cfg.aof_dir);
+        } else if (!restored) {
+            akvd_log(d, AKVD_LOG_INFO, "append-only log loaded: %llu records from %llu files",
+                     (unsigned long long)li.records, (unsigned long long)li.files);
+        }
+        if (li.truncated != 0) {
+            akvd_log(d, AKVD_LOG_WARN, "append-only log: %llu bytes of an incomplete last write removed",
+                     (unsigned long long)li.truncated);
+        }
+        if (li.dropped_txn != 0) {
+            akvd_log(d, AKVD_LOG_WARN,
+                     "append-only log: %llu records of an incomplete transaction not applied",
+                     (unsigned long long)li.dropped_txn);
+        }
+        if (li.damaged) {
+            akvd_log(d, AKVD_LOG_WARN,
+                     "append-only log: started with the records before the damage; rewriting");
+        }
+    }
+    {
         akv_stats st;
         akv_stats_get(d->store, &st);
         d->saved_puts = st.puts + st.dels;
@@ -1798,8 +2044,17 @@ void akvd_stop(akvd *d) {
         d->bg_joinable = 0;
     }
     pthread_mutex_unlock(&d->saver_lock);
+    if (d->aof != NULL) {
+        if (aof_close(d->aof) != 0) {
+            akvd_log(d, AKVD_LOG_ERROR, "append-only log: the last write failed before the stop");
+        }
+        d->aof = NULL;
+    }
     if (d->cfg.snapshot_path != NULL && d->cfg.save_on_stop) {
         save_now(d);
+    }
+    if (d->cfg.store.shm_path != NULL) {
+        akvd_log(d, AKVD_LOG_INFO, "cache memory kept in %s for a warm restart", d->cfg.store.shm_path);
     }
     free_all(d);
 }

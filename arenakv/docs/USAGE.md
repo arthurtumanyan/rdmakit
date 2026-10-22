@@ -130,6 +130,12 @@ that names the option and the accepted range.
 | `--snapshot FILE` | | load at start, write on `SAVE`/`BGSAVE`, periodically and at stop; the directory must be writable |
 | `--save-interval SECONDS` | 0 (off) | periodic snapshot when data changed |
 | `--no-save-on-stop` | | skip the snapshot at stop |
+| `--appendonly DIR` | | append-only log of every change in DIR (created with mode 0700); loaded at start ([OPERATIONS.md](OPERATIONS.md#append-only-log)) |
+| `--appendfsync always\|everysec\|no` | everysec | when the log is synced to disk; with `always` a reply that follows a change is sent after the sync |
+| `--aof-rewrite-percentage N` | 100 | rewrite the log when it grew by N% of its base file; 0 disables automatic rewrites |
+| `--aof-rewrite-min-size SIZE` | 64M | ... and the log is at least SIZE |
+| `--aof-load-damaged` | off | start with the records before a damaged block instead of refusing to start |
+| `--warm-restart FILE` | | keep the cache memory in FILE (on tmpfs, normally under `/dev/shm`) so that a restart of the process keeps the entries ([OPERATIONS.md](OPERATIONS.md#warm-restart)) |
 | `--log-level error\|warn\|info\|debug` | info | |
 | `--log-file FILE` | standard error | reopened on `SIGHUP` |
 | `--stats SECONDS` | 0 (off) | log a statistics line periodically |
@@ -152,8 +158,8 @@ the per-instance values. An unknown name stops the start with `FILE:LINE: unknow
 
 | Exit status | Meaning |
 |---|---|
-| 0 | stopped by `SIGTERM` or `SIGINT` (after the final snapshot, if configured), or `--help`/`--version` |
-| 1 | the server could not start (port in use, snapshot damaged, TLS files unreadable, no RDMA device) |
+| 0 | stopped by `SIGTERM`, `SIGINT` or `SIGUSR1` (after syncing the append-only log, the final snapshot and keeping the warm-restart memory, as configured), or `--help`/`--version` |
+| 1 | the server could not start (port in use, snapshot or log damaged, TLS files unreadable, no RDMA device) |
 | 2 | invalid options |
 
 Start-up failures are logged with the listener or file concerned, for example:
@@ -258,6 +264,7 @@ Command names are case-insensitive. Values and keys are byte strings; the engine
 | `SAVE` | `OK` | writes the snapshot synchronously; error without `--snapshot` |
 | `BGSAVE` | `Background saving started` | error while a background save runs |
 | `LASTSAVE` | Unix time of the last successful snapshot, 0 if none | |
+| `BGREWRITEAOF` | `Background append only file rewriting started` | error without `--appendonly` or while a rewrite runs |
 | `TIME` | seconds and microseconds | |
 | `QUIT` | `OK`, then the connection closes | |
 

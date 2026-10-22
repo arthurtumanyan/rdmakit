@@ -371,6 +371,11 @@ static void cmd_info(akvd *d, struct obuf *o) {
     akv_stats_get(akvd_store(d), &st);
     struct srv_counters *c = akvd_counters(d);
     struct obuf b = {0};
+    aof_info ai = {0};
+    int aof_on = akvd_aof_info(d, &ai) == 0;
+    akv_warm_info wi;
+    akvd_warm_info(d, &wi);
+    static const char *const warm_state[] = {"off", "created", "restored", "mismatch", "unclean", "damaged"};
 #define LD(f) ((unsigned long long)__atomic_load_n(&c->f, __ATOMIC_RELAXED))
     ob_printf(&b,
               "# Server\r\narenakv_version:%s\r\nredis_mode:standalone\r\nprocess_id:%d\r\n"
@@ -378,7 +383,10 @@ static void cmd_info(akvd *d, struct obuf *o) {
               "# Clients\r\nconnected_clients:%u\r\n\r\n"
               "# Memory\r\nused_memory:%llu\r\nmaxmemory:%llu\r\nindex_memory:%llu\r\n\r\n"
               "# Persistence\r\nrdb_bgsave_in_progress:%d\r\nrdb_last_save_time:%llu\r\n"
-              "rdb_last_bgsave_status:%s\r\n\r\n"
+              "rdb_last_bgsave_status:%s\r\naof_enabled:%d\r\naof_rewrite_in_progress:%d\r\n"
+              "aof_last_bgrewrite_status:%s\r\naof_last_write_status:%s\r\naof_current_size:%llu\r\n"
+              "aof_base_size:%llu\r\naof_buffer_length:%llu\r\naof_rewrites:%llu\r\naof_fsyncs:%llu\r\n"
+              "warm_restart:%s\r\nwarm_restart_entries:%llu\r\nwarm_restart_rebuild_us:%llu\r\n\r\n"
               "# Stats\r\ntotal_connections_received:%llu\r\nrejected_connections:%llu\r\n"
               "total_commands_processed:%llu\r\nkeyspace_hits:%llu\r\nkeyspace_misses:%llu\r\n"
               "evicted_keys:%llu\r\nexpired_keys:%llu\r\n\r\n"
@@ -387,8 +395,13 @@ static void cmd_info(akvd *d, struct obuf *o) {
               __atomic_load_n(&c->curr_connections, __ATOMIC_RELAXED),
               (unsigned long long)(st.log_bytes + st.index_bytes), (unsigned long long)st.arena_bytes,
               (unsigned long long)st.index_bytes, akvd_bgsave_running(d),
-              (unsigned long long)akvd_lastsave(d), akvd_last_save_ok(d) ? "ok" : "err",
-              LD(total_connections), LD(rejected_connections), LD(commands), LD(get_hits), LD(get_misses),
+              (unsigned long long)akvd_lastsave(d), akvd_last_save_ok(d) ? "ok" : "err", aof_on,
+              ai.rewrite_running, !aof_on || ai.last_rewrite_ok ? "ok" : "err",
+              !aof_on || ai.last_write_ok ? "ok" : "err", (unsigned long long)ai.current_size,
+              (unsigned long long)ai.base_size, (unsigned long long)ai.pending,
+              (unsigned long long)ai.rewrites, (unsigned long long)ai.fsyncs, warm_state[wi.state],
+              (unsigned long long)wi.entries, (unsigned long long)wi.rebuild_us, LD(total_connections),
+              LD(rejected_connections), LD(commands), LD(get_hits), LD(get_misses),
               (unsigned long long)(st.evictions + st.index_evictions), (unsigned long long)st.expired,
               (unsigned long long)st.entries);
 #undef LD
@@ -823,6 +836,15 @@ static void dispatch(akvd *d, struct session *ss, struct arg *a, size_t n, struc
             r_err(o, "ERR Background save already in progress");
         } else {
             r_err(o, "ERR persistence is not configured (snapshot option)");
+        }
+    } else if (is(c, "BGREWRITEAOF")) {
+        int rc = akvd_aof_rewrite(d);
+        if (rc == 0) {
+            r_raw(o, "+Background append only file rewriting started\r\n");
+        } else if (rc == -EBUSY) {
+            r_err(o, "ERR Background append only file rewriting already in progress");
+        } else {
+            r_err(o, "ERR the append-only log is not configured (appendonly option)");
         }
     } else if (is(c, "LASTSAVE")) {
         r_int(o, (long long)akvd_lastsave(d));

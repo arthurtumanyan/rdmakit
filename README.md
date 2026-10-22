@@ -89,10 +89,10 @@ Statements about other systems reflect their public documentation at the time of
 | Expiry, CAS, conditional stores, increments | yes | yes | yes | yes |
 | Data types | strings | strings | strings, lists, hashes, sets, sorted sets, streams | as Valkey |
 | Authentication | shared credentials file | SASL, ASCII auth | ACL users | ACL users |
-| Persistence | snapshots | warm restart | RDB, AOF | snapshots |
+| Persistence | snapshots, append-only log (fsync always, everysec or no), warm restart | warm restart | RDB, AOF | snapshots |
 | Replication, cluster | no (client-side consistent hashing) | no (client-side hashing) | yes | replication, cluster mode |
 | Hash index | grows from a small size | grows | grows | grows |
-| Source size | about 6,400 lines (engine, server, protocols, client) | large | large | large |
+| Source size | about 8,600 lines (engine, server, protocols, persistence, client) | large | large | large |
 | Production use | not recommended | widely deployed | widely deployed | deployed |
 
 ### rdmaduct and RDMA communication frameworks
@@ -218,7 +218,7 @@ kvpace/build/x86_64/kvpace --driver native --driver-opt transport=rdma --host 19
 | Project | Suites | Also run with |
 |---|---|---|
 | rdmaduct | handshake codec with two million fuzzed inputs, TCP framing attacked through a raw socket, fault injection, RDMA flow control under a slow consumer, abrupt close, connect/disconnect cycles with a descriptor-leak check, examples | ASan + UBSan |
-| arenakv | engine model test against a reference map (eviction, overwrite, no stale reads, growing index), expiry, CAS, increments, memcached and RESP protocols with byte-by-byte feeds and one million fuzzed inputs, pipelining and backpressure on real sockets, snapshots, TLS, native protocol over TCP and RDMA, third-party clients (valkey-cli, valkey-benchmark, memtier_benchmark, redis-py) | ASan + UBSan, TSan |
+| arenakv | engine model test against a reference map (eviction, overwrite, no stale reads, growing index), expiry, CAS, increments, memcached and RESP protocols with byte-by-byte feeds and one million fuzzed inputs, pipelining and backpressure on real sockets, snapshots, change feed replay, append-only log (rewrites under load, torn and damaged files, SIGKILL with every fsync policy), warm restart, TLS, native protocol over TCP and RDMA, third-party clients (valkey-cli, valkey-benchmark, memtier_benchmark, redis-py) | ASan + UBSan, TSan |
 | kvpace | histogram error bounds, workload generators, Zipf generator, all drivers against in-process servers (synchronous and pipelined), TLS, runner timing with multiplexed connections, result merging, KV-cache workload | ASan + UBSan |
 
 All suites pass on x86-64 (gcc 13, Ubuntu 24.04), including the RDMA suites on Soft-RoCE. Continuous integration ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds with gcc

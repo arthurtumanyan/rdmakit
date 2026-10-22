@@ -15,6 +15,7 @@
 
 #include "akv.h"
 #include "akvd.h"
+#include "aof.h"
 
 /* Growable output buffer. Bytes [off, len) are pending. */
 struct obuf {
@@ -103,6 +104,12 @@ uint64_t akvd_uptime(const akvd *d);
 
 /* Number of worker threads. */
 unsigned akvd_threads(const akvd *d);
+
+/* State of the append-only log. Returns 0, or -EINVAL when no log is configured. */
+int akvd_aof_info(akvd *d, aof_info *out);
+
+/* Outcome of the warm-restart attach at start. */
+void akvd_warm_info(akvd *d, akv_warm_info *out);
 
 /* Server version string. */
 #define AKVD_VERSION "0.2.0"

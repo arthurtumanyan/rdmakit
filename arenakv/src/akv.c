@@ -5,7 +5,7 @@
  *
  *   offset size field
  *   0      4    total    entry size in bytes including this header, multiple of 8
- *   4      1    flags    ENTRY_ACCESSED, ENTRY_PAD
+ *   4      1    flags    ENTRY_ACCESSED, ENTRY_PAD, ENTRY_DEAD
  *   5      1    reserved
  *   6      2    klen     key length
  *   8      4    vlen     value length
@@ -20,6 +20,11 @@
  * the wrap-around. Only `total` and `flags` (the first 5 bytes) are written for it, because the gap can
  * be as small as 8 bytes.
  *
+ * ENTRY_DEAD marks an entry that was deleted, replaced, expired or dropped from the index while it was
+ * still between tail and head. Liveness is decided by the index; the flag exists so that a warm restart
+ * can rebuild the index from the arena alone. Entries behind the tail are never examined, so evictions at
+ * the tail do not set it.
+ *
  * Index slot: 16-bit tag (never 0 for an occupied slot) and 48-bit value (arena offset / 8 + 1).
  *
  * Engine clock: milliseconds of CLOCK_MONOTONIC_COARSE since the engine was created, plus 1, so that 0 can
@@ -30,15 +35,27 @@
  *
  * CAS versions: per shard counter shifted left by 10 bits, ORed with the shard index (at most 1024
  * shards), so versions are unique within the engine without a shared counter.
+ *
+ * Warm-restart file (akv_config.shm_path), little-endian, mapped shared:
+ *   header   struct warm_hdr: magic "AKVWARM1", version, clean flag, the configuration that must match,
+ *            hash seed, wall-clock and engine time at detach, and head, tail and CAS counter per shard;
+ *            padded to a multiple of 4096 bytes
+ *   arenas   one per shard, `per_shard` bytes each, in shard order
+ * The clean flag is set by akv_detach() after all other header fields and cleared when an engine attaches,
+ * so a file left by a crash is never trusted. Engine times in the arenas are converted on attach using
+ * the wall-clock time that passed between detach and attach (CLOCK_REALTIME; a clock step during the
+ * downtime shifts expiry times by the same amount).
  */
 #include "akv.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -48,6 +65,7 @@
 #define ENTRY_HDR 40u
 #define ENTRY_ACCESSED 1u
 #define ENTRY_PAD 2u
+#define ENTRY_DEAD 4u
 #define SLOTS 16u
 #define WINDOW 2u /* buckets examined per lookup */
 #define MAX_REINSERT_STREAK 64u
@@ -92,13 +110,79 @@ struct shard {
     char pad[64]; /* keeps the locks of neighboring shards on different cache lines */
 };
 
+struct warm_shard {
+    uint64_t head;
+    uint64_t tail;
+    uint64_t cas_seq;
+};
+
+struct warm_hdr {
+    char magic[8];
+    uint32_t version;
+    uint32_t clean; /* 1 after akv_detach(), 0 while an engine is attached */
+    uint64_t capacity;
+    uint32_t shards;
+    uint32_t max_entry;
+    uint64_t seed;
+    uint64_t per_shard;
+    int64_t wall_ms;    /* CLOCK_REALTIME at detach, milliseconds */
+    uint64_t engine_ms; /* engine clock at detach */
+    uint64_t reserved[4];
+    struct warm_shard sh[];
+};
+
+#define WARM_MAGIC "AKVWARM1"
+#define WARM_VERSION 1u
+
 struct akv {
     akv_config cfg;
     struct shard *shards;
     uint32_t nshards;
     uint64_t seed;
     struct timespec epoch;
+    int64_t wall_epoch_ms; /* CLOCK_REALTIME in milliseconds at engine time 1 */
+    int quiet;             /* set while the index is rebuilt: no change records */
+    int follower;          /* expired entries are hidden from lookups but not removed (akv_set_follower) */
+    /* Warm-restart file mapping (fd < 0 without one). */
+    int shm_fd;
+    uint8_t *shm_base;
+    size_t shm_size;
+    struct warm_hdr *warm;
+    akv_warm_info warm_info;
 };
+
+/* Lock set held by the calling thread (akv_lock_keys / akv_lock_all). */
+static _Thread_local struct {
+    const akv *store;
+    akv_lockset set;
+    uint64_t txn;
+} held;
+
+/* Set while akv_apply() runs on this thread: lookups see entries whose expiry has passed. */
+static _Thread_local int applying;
+
+static inline int is_held(const akv *s, const struct shard *sh) {
+    return held.store == s && ((held.set.bits[sh->index >> 6] >> (sh->index & 63)) & 1) != 0;
+}
+
+/* Locks a shard unless the calling thread holds it through a lock set. */
+static inline void sh_lock(const akv *s, struct shard *sh) {
+    if (!is_held(s, sh)) {
+        pthread_mutex_lock(&sh->lock);
+    }
+}
+
+static inline void sh_unlock(const akv *s, struct shard *sh) {
+    if (!is_held(s, sh)) {
+        pthread_mutex_unlock(&sh->lock);
+    }
+}
+
+static int64_t wall_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 const char *akv_simd_name(void) {
     return AKV_SIMD_NAME;
@@ -172,6 +256,43 @@ static inline uint8_t *entry_val(struct entry_hdr *e) {
     return (uint8_t *)e + ENTRY_HDR + e->klen;
 }
 
+/* ---- change feed --------------------------------------------------------------------------------- */
+
+static inline uint64_t held_txn(const akv *s) {
+    return held.store == s ? held.txn : 0;
+}
+
+static int64_t unix_expiry(const akv *s, uint64_t expiry) {
+    return expiry == 0 ? 0 : s->wall_epoch_ms + (int64_t)expiry - 1;
+}
+
+static void emit_slow(akv *s, enum akv_change_kind kind, enum akv_del_reason reason, struct entry_hdr *e) {
+    akv_change c = {.kind = kind, .reason = reason, .key = entry_key(e), .klen = e->klen, .txn = held_txn(s)};
+    if (kind != AKV_CHG_DEL) {
+        c.cas = e->cas;
+        c.expire_unix_ms = unix_expiry(s, e->expiry);
+    }
+    if (kind == AKV_CHG_PUT) {
+        c.val = entry_val(e);
+        c.vlen = e->vlen;
+        c.flags = e->uflags;
+    }
+    s->cfg.on_change(s->cfg.on_change_arg, &c);
+}
+
+/* Reports the state of entry e (PUT, TOUCH) or its removal (DEL) to the change feed, if any. */
+static inline void emit(akv *s, enum akv_change_kind kind, enum akv_del_reason reason, struct entry_hdr *e) {
+    if (__builtin_expect(s->cfg.on_change != NULL && !s->quiet, 0)) {
+        emit_slow(s, kind, reason, e);
+    }
+}
+
+/* Marks an entry that is no longer live and reports its removal. */
+static inline void kill_entry(akv *s, struct entry_hdr *e, enum akv_del_reason reason) {
+    e->flags |= ENTRY_DEAD;
+    emit(s, AKV_CHG_DEL, reason, e);
+}
+
 /* Finds the slot referring to the entry at physical offset phys with the given hash; NULL when absent. */
 static struct bucket *find_by_pos(struct shard *sh, uint64_t h, uint64_t phys, unsigned *slot) {
     uint16_t tag = tag_of(h);
@@ -211,17 +332,21 @@ static struct bucket *find_key(struct shard *sh, uint64_t h, const void *key, si
 }
 
 /* Finds the entry of key and removes it from the index when it has expired. NULL when absent. */
-static struct entry_hdr *find_live(struct shard *sh, uint64_t h, const void *key, size_t klen, uint64_t now,
-                                   struct bucket **bp, unsigned *slot) {
+static struct entry_hdr *find_live(akv *s, struct shard *sh, uint64_t h, const void *key, size_t klen,
+                                   uint64_t now, struct bucket **bp, unsigned *slot) {
     struct bucket *b = find_key(sh, h, key, klen, slot);
     if (b == NULL) {
         return NULL;
     }
     struct entry_hdr *e = entry_at(sh, (slot_get(b, *slot) - 1) * 8);
-    if (e->expiry != 0 && e->expiry <= now) {
+    if (e->expiry != 0 && e->expiry <= now && !applying) {
+        if (s->follower) {
+            return NULL; /* hidden; removed by the leader's DEL record or by eviction */
+        }
         b->tags[*slot] = 0; /* the entry becomes dead log space */
         sh->st.expired++;
         sh->st.entries--;
+        kill_entry(s, e, AKV_DEL_EXPIRED);
         return NULL;
     }
     *bp = b;
@@ -254,7 +379,7 @@ static struct bucket *table_alloc(uint64_t nbuckets) {
  * window of 32 slots already full, which is rare at the post-growth load) are dropped from the index.
  * Returns 0, or -1 when the bound is reached or memory is exhausted.
  */
-static int index_grow(struct shard *sh) {
+static int index_grow(akv *s, struct shard *sh) {
     uint64_t n = sh->nbuckets * 2;
     if (n > sh->max_buckets) {
         return -1;
@@ -271,10 +396,11 @@ static int index_grow(struct shard *sh) {
                 continue;
             }
             uint64_t v = slot_get(ob, i);
-            const struct entry_hdr *e = entry_at(sh, (v - 1) * 8);
+            struct entry_hdr *e = entry_at(sh, (v - 1) * 8);
             if (window_put(tab, mask, e->hash, v) != 0) {
                 sh->st.index_evictions++;
                 sh->st.entries--;
+                kill_entry(s, e, AKV_DEL_EVICTED);
             }
         }
     }
@@ -292,12 +418,12 @@ static int index_grow(struct shard *sh) {
  * growth bound a full window drops its oldest live entry (in log order), unless eviction is disabled.
  * Returns 0, or -ENOMEM (no_evict and no slot).
  */
-static int index_insert(struct shard *sh, int no_evict, uint64_t h, uint64_t value) {
+static int index_insert(akv *s, struct shard *sh, int no_evict, uint64_t h, uint64_t value) {
     if (sh->st.entries + 1 > sh->nbuckets * SLOTS * 3 / 4) {
-        index_grow(sh);
+        index_grow(s, sh);
     }
     while (window_put(sh->buckets, sh->mask, h, value) != 0) {
-        if (index_grow(sh) == 0) {
+        if (index_grow(s, sh) == 0) {
             continue;
         }
         if (no_evict) {
@@ -322,6 +448,7 @@ static int index_insert(struct shard *sh, int no_evict, uint64_t h, uint64_t val
         fb->tags[fslot] = 0;
         sh->st.index_evictions++;
         sh->st.entries--;
+        kill_entry(s, entry_at(sh, (slot_get(fb, fslot) - 1) * 8), AKV_DEL_EVICTED);
     }
     sh->st.entries++;
     return 0;
@@ -385,6 +512,7 @@ static int evict_one(akv *s, struct shard *sh, unsigned *streak, uint64_t now) {
         sh->tail += total;
         sh->st.expired++;
         sh->st.entries--;
+        emit(s, AKV_CHG_DEL, AKV_DEL_EXPIRED, e);
         return 0;
     }
     if (s->cfg.no_evict) {
@@ -407,6 +535,7 @@ static int evict_one(akv *s, struct shard *sh, unsigned *streak, uint64_t now) {
         } else {
             sh->st.index_evictions++;
             sh->st.entries--;
+            kill_entry(s, entry_at(sh, np), AKV_DEL_EVICTED);
         }
         (*streak)++;
         return 0;
@@ -415,6 +544,7 @@ static int evict_one(akv *s, struct shard *sh, unsigned *streak, uint64_t now) {
     sh->tail += total;
     sh->st.evictions++;
     sh->st.entries--;
+    emit(s, AKV_CHG_DEL, AKV_DEL_EVICTED, e);
     return 0;
 }
 
@@ -441,8 +571,8 @@ static uint64_t next_pow2(uint64_t v) {
     return p;
 }
 
-static void shard_destroy(struct shard *sh) {
-    if (sh->arena != NULL) {
+static void shard_destroy(const akv *s, struct shard *sh) {
+    if (sh->arena != NULL && s->shm_fd < 0) {
         munmap(sh->arena, sh->size);
     }
     if (sh->buckets != NULL) {
@@ -450,6 +580,179 @@ static void shard_destroy(struct shard *sh) {
     }
     free(sh->scratch);
     pthread_mutex_destroy(&sh->lock);
+}
+
+/* Size of the warm-restart header for n shards, rounded up to a page. */
+static size_t warm_hdr_size(uint32_t n) {
+    size_t bytes = sizeof(struct warm_hdr) + (size_t)n * sizeof(struct warm_shard);
+    return (bytes + 4095) & ~(size_t)4095;
+}
+
+/*
+ * Opens and maps the warm-restart file and decides whether its content can be restored (*restore). A file
+ * that cannot be restored is truncated and resized, which zeroes it. On restore the stored hash seed
+ * replaces s->seed. Returns 0 or -errno.
+ */
+static int warm_open(akv *s, uint64_t per_shard, int *restore) {
+    size_t hsz = warm_hdr_size(s->nshards);
+    size_t size = hsz + (size_t)per_shard * s->nshards;
+    int fd = open(s->cfg.shm_path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        return -errno;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        int rc = -errno;
+        close(fd);
+        return rc;
+    }
+    enum akv_warm_state state = AKV_WARM_CREATED;
+    *restore = 0;
+    struct warm_hdr h;
+    if (st.st_size > 0) {
+        state = AKV_WARM_CORRUPT;
+        if ((size_t)st.st_size >= sizeof(h) && pread(fd, &h, sizeof(h), 0) == (ssize_t)sizeof(h) &&
+            memcmp(h.magic, WARM_MAGIC, 8) == 0 && h.version == WARM_VERSION) {
+            if ((size_t)st.st_size != size || h.capacity != s->cfg.capacity || h.shards != s->nshards ||
+                h.max_entry != s->cfg.max_entry || h.per_shard != per_shard ||
+                (s->cfg.hash_seed != 0 && h.seed != s->cfg.hash_seed)) {
+                state = AKV_WARM_MISMATCH;
+            } else if (h.clean != 1) {
+                state = AKV_WARM_UNCLEAN;
+            } else {
+                state = AKV_WARM_RESTORED;
+                *restore = 1;
+                s->seed = h.seed;
+            }
+        }
+    }
+    if (!*restore && (ftruncate(fd, 0) != 0 || ftruncate(fd, (off_t)size) != 0)) {
+        int rc = -errno;
+        close(fd);
+        return rc;
+    }
+    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) {
+        int rc = -errno;
+        close(fd);
+        return rc;
+    }
+    s->shm_fd = fd;
+    s->shm_base = p;
+    s->shm_size = size;
+    s->warm = p;
+    s->warm_info.state = state;
+    struct warm_hdr *w = s->warm;
+    if (!*restore) {
+        memcpy(w->magic, WARM_MAGIC, 8);
+        w->version = WARM_VERSION;
+        w->capacity = s->cfg.capacity;
+        w->shards = s->nshards;
+        w->max_entry = s->cfg.max_entry;
+        w->seed = s->seed;
+        w->per_shard = per_shard;
+    }
+    w->clean = 0; /* in use: a crash from now on leaves the file untrusted */
+    return 0;
+}
+
+/*
+ * Rebuilds the index of one shard from its arena between the stored tail and head. Dead entries and
+ * entries whose time ran out during the downtime (elapsed_ms of wall-clock time after engine time
+ * old_now) are skipped; remaining expiry times are moved to the current engine clock. Returns 0, or -1
+ * when a log position or an entry header is inconsistent.
+ */
+static int warm_rebuild(akv *s, struct shard *sh, const struct warm_shard *ws, int64_t elapsed_ms,
+                        uint64_t old_now, uint64_t now) {
+    if (ws->tail > ws->head || ws->head - ws->tail > sh->size) {
+        return -1;
+    }
+    sh->head = ws->head;
+    sh->tail = ws->tail;
+    sh->cas_seq = ws->cas_seq;
+    for (uint64_t pos = sh->tail; pos < sh->head;) {
+        uint64_t phys = pos % sh->size;
+        struct entry_hdr *e = entry_at(sh, phys);
+        uint32_t total = e->total;
+        if (total < 8 || total % 8 != 0 || total > sh->head - pos || total > sh->size - phys) {
+            return -1;
+        }
+        pos += total;
+        if (e->flags & ENTRY_PAD) {
+            if (phys + total != sh->size) {
+                return -1;
+            }
+            continue;
+        }
+        if (total < ENTRY_HDR || e->klen == 0 || entry_total(e->klen, e->vlen) != total) {
+            return -1;
+        }
+        if (e->flags & ENTRY_DEAD) {
+            continue;
+        }
+        if (e->hash != akv_hash64(entry_key(e), e->klen, s->seed)) {
+            return -1;
+        }
+        if (e->expiry != 0) {
+            int64_t left = (int64_t)e->expiry - (int64_t)old_now - elapsed_ms;
+            if (left <= 0) {
+                e->flags |= ENTRY_DEAD;
+                s->warm_info.expired++;
+                continue;
+            }
+            e->expiry = now + (uint64_t)left;
+        }
+        uint64_t value = phys / 8 + 1;
+        unsigned slot;
+        struct bucket *b = find_key(sh, e->hash, entry_key(e), e->klen, &slot);
+        if (b != NULL) {
+            /* An older version without the dead mark: the later one in log order is current. */
+            entry_at(sh, (slot_get(b, slot) - 1) * 8)->flags |= ENTRY_DEAD;
+            slot_set(b, slot, tag_of(e->hash), value);
+            continue;
+        }
+        if (index_insert(s, sh, 0, e->hash, value) != 0) {
+            e->flags |= ENTRY_DEAD;
+        }
+    }
+    return 0;
+}
+
+/* Restores all shards from the warm-restart file; on an inconsistency every shard starts empty. */
+static void warm_restore(akv *s) {
+    struct timespec t0;
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    const struct warm_hdr *w = s->warm;
+    int64_t elapsed = wall_now_ms() - w->wall_ms;
+    if (elapsed < 0) {
+        elapsed = 0;
+    }
+    uint64_t now = now_ms(s);
+    s->quiet = 1;
+    int bad = 0;
+    for (uint32_t i = 0; i < s->nshards && !bad; i++) {
+        bad = warm_rebuild(s, &s->shards[i], &w->sh[i], elapsed, w->engine_ms, now) != 0;
+    }
+    if (bad) {
+        for (uint32_t i = 0; i < s->nshards; i++) {
+            struct shard *sh = &s->shards[i];
+            madvise(sh->arena, sh->size, MADV_REMOVE);
+            memset(sh->buckets, 0, sh->nbuckets * sizeof(struct bucket));
+            sh->head = 0;
+            sh->tail = 0;
+            sh->st.entries = 0;
+        }
+        s->warm_info.state = AKV_WARM_CORRUPT;
+        s->warm_info.expired = 0;
+    }
+    s->quiet = 0;
+    for (uint32_t i = 0; i < s->nshards; i++) {
+        s->warm_info.entries += s->shards[i].st.entries;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    s->warm_info.rebuild_us =
+        (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_nsec - t0.tv_nsec) / 1000);
 }
 
 akv *akv_create(const akv_config *in) {
@@ -462,6 +765,7 @@ akv *akv_create(const akv_config *in) {
     }
     if (cfg.shards > 1024 || (cfg.shards & (cfg.shards - 1)) != 0 ||
         cfg.capacity < (uint64_t)cfg.shards * 4096) {
+        errno = EINVAL;
         return NULL;
     }
     akv *s = calloc(1, sizeof(*s));
@@ -471,6 +775,7 @@ akv *akv_create(const akv_config *in) {
     s->cfg = cfg;
     s->nshards = cfg.shards;
     s->seed = cfg.hash_seed;
+    s->shm_fd = -1;
     clock_gettime(CLOCK_MONOTONIC_COARSE, &s->epoch);
     if (s->seed == 0) {
         uint64_t seed = 0x243f6a8885a308d3ull ^ (uint64_t)(uintptr_t)s ^ ((uint64_t)getpid() << 32);
@@ -484,6 +789,16 @@ akv *akv_create(const akv_config *in) {
         return NULL;
     }
     uint64_t per_shard = (cfg.capacity / cfg.shards) & ~(uint64_t)7;
+    int restore = 0;
+    if (cfg.shm_path != NULL) {
+        int rc = warm_open(s, per_shard, &restore);
+        if (rc != 0) {
+            free(s->shards);
+            free(s);
+            errno = -rc;
+            return NULL;
+        }
+    }
     /* Bound: one slot per smallest possible entry (header plus one key byte, rounded) at 75% load. */
     uint64_t max_slots = per_shard / entry_total(1, 0) + 1;
     uint64_t max_buckets = next_pow2(max_slots * 4 / (SLOTS * 3) + 1);
@@ -503,14 +818,18 @@ akv *akv_create(const akv_config *in) {
         pthread_mutex_init(&sh->lock, NULL);
         sh->index = i;
         sh->size = per_shard;
-        sh->arena = mmap(NULL, sh->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (sh->arena == MAP_FAILED) {
-            sh->arena = NULL;
-            akv_destroy(s);
-            return NULL;
-        }
-        if (cfg.huge_pages) {
-            madvise(sh->arena, sh->size, MADV_HUGEPAGE);
+        if (s->shm_fd >= 0) {
+            sh->arena = s->shm_base + warm_hdr_size(s->nshards) + (size_t)i * per_shard;
+        } else {
+            sh->arena = mmap(NULL, sh->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (sh->arena == MAP_FAILED) {
+                sh->arena = NULL;
+                akv_destroy(s);
+                return NULL;
+            }
+            if (cfg.huge_pages) {
+                madvise(sh->arena, sh->size, MADV_HUGEPAGE);
+            }
         }
         sh->buckets = table_alloc(nbuckets);
         if (sh->buckets == NULL) {
@@ -528,6 +847,10 @@ akv *akv_create(const akv_config *in) {
             return NULL;
         }
     }
+    s->wall_epoch_ms = wall_now_ms() - (int64_t)(now_ms(s) - 1);
+    if (restore) {
+        warm_restore(s);
+    }
     return s;
 }
 
@@ -536,10 +859,36 @@ void akv_destroy(akv *s) {
         return;
     }
     for (uint32_t i = 0; i < s->nshards; i++) {
-        shard_destroy(&s->shards[i]);
+        shard_destroy(s, &s->shards[i]);
+    }
+    if (s->shm_fd >= 0) {
+        munmap(s->shm_base, s->shm_size);
+        close(s->shm_fd);
     }
     free(s->shards);
     free(s);
+}
+
+int akv_detach(akv *s) {
+    if (s->shm_fd < 0) {
+        akv_destroy(s);
+        return -EINVAL;
+    }
+    struct warm_hdr *w = s->warm;
+    for (uint32_t i = 0; i < s->nshards; i++) {
+        const struct shard *sh = &s->shards[i];
+        w->sh[i] = (struct warm_shard){.head = sh->head, .tail = sh->tail, .cas_seq = sh->cas_seq};
+    }
+    w->wall_ms = wall_now_ms();
+    w->engine_ms = now_ms(s);
+    /* The flag is written last: a reader that sees it set sees all other fields. */
+    __atomic_store_n(&w->clean, 1u, __ATOMIC_RELEASE);
+    akv_destroy(s);
+    return 0;
+}
+
+void akv_warm_get(const akv *s, akv_warm_info *out) {
+    *out = s->warm_info;
 }
 
 /* ---- operations ------------------------------------------------------------------------------------ */
@@ -626,6 +975,7 @@ static int store_locked(akv *s, struct shard *sh, uint64_t h, const void *key, s
         old->expiry = expiry;
         sh->st.overwrites++;
         sh->st.puts++;
+        emit(s, AKV_CHG_PUT, AKV_DEL_CLIENT, old);
         if (cas_out != NULL) {
             *cas_out = cas;
         }
@@ -651,16 +1001,20 @@ static int store_locked(akv *s, struct shard *sh, uint64_t h, const void *key, s
     struct bucket *b =
         find_key(sh, h, key, klen, &slot); /* the allocation may have evicted the old version */
     if (b != NULL && slot_get(b, slot) != pos_value) {
-        slot_set(b, slot, tag_of(h), pos_value); /* replace: the previous version is now dead log space */
+        /* Replace: the previous version is now dead log space. */
+        entry_at(sh, (slot_get(b, slot) - 1) * 8)->flags |= ENTRY_DEAD;
+        slot_set(b, slot, tag_of(h), pos_value);
         sh->st.overwrites++;
     } else if (b == NULL) {
-        if (index_insert(sh, s->cfg.no_evict, h, pos_value) != 0) {
+        if (index_insert(s, sh, s->cfg.no_evict, h, pos_value) != 0) {
             /* The entry stays as dead log space. */
+            e->flags |= ENTRY_DEAD;
             sh->st.rejected++;
             return -ENOMEM;
         }
     }
     sh->st.puts++;
+    emit(s, AKV_CHG_PUT, AKV_DEL_CLIENT, e);
     if (cas_out != NULL) {
         *cas_out = cas;
     }
@@ -678,11 +1032,11 @@ int akv_store(akv *s, const void *key, size_t klen, const void *val, size_t vlen
     }
     uint64_t h = akv_hash64(key, klen, s->seed);
     struct shard *sh = shard_of(s, h);
-    pthread_mutex_lock(&sh->lock);
+    sh_lock(s, sh);
     uint64_t now = now_ms(s);
     struct bucket *b = NULL;
     unsigned slot = 0;
-    struct entry_hdr *old = find_live(sh, h, key, klen, now, &b, &slot);
+    struct entry_hdr *old = find_live(s, sh, h, key, klen, now, &b, &slot);
     int rc = 0;
     switch (opts->mode) {
     case AKV_SET:
@@ -703,7 +1057,7 @@ int akv_store(akv *s, const void *key, size_t klen, const void *val, size_t vlen
         break;
     }
     if (rc != 0) {
-        pthread_mutex_unlock(&sh->lock);
+        sh_unlock(s, sh);
         return rc;
     }
     if (opts->ttl_ms < 0 && opts->mode != AKV_APPEND && opts->mode != AKV_PREPEND) {
@@ -712,9 +1066,10 @@ int akv_store(akv *s, const void *key, size_t klen, const void *val, size_t vlen
             b->tags[slot] = 0;
             sh->st.entries--;
             sh->st.expired++;
+            kill_entry(s, old, AKV_DEL_CLIENT);
         }
         sh->st.puts++;
-        pthread_mutex_unlock(&sh->lock);
+        sh_unlock(s, sh);
         if (cas_out != NULL) {
             *cas_out = 0;
         }
@@ -730,13 +1085,13 @@ int akv_store(akv *s, const void *key, size_t klen, const void *val, size_t vlen
         expiry = old->expiry;
         if (size_ok(s, sh, klen, (size_t)old->vlen + vlen) != 0) {
             sh->st.rejected++;
-            pthread_mutex_unlock(&sh->lock);
+            sh_unlock(s, sh);
             return -E2BIG;
         }
         /* Copy the old value: allocating the new version may evict or move the old one. */
         tmp = malloc(old->vlen > 0 ? old->vlen : 1);
         if (tmp == NULL) {
-            pthread_mutex_unlock(&sh->lock);
+            sh_unlock(s, sh);
             return -ENOMEM;
         }
         memcpy(tmp, entry_val(old), old->vlen);
@@ -759,7 +1114,7 @@ int akv_store(akv *s, const void *key, size_t klen, const void *val, size_t vlen
         }
     }
     rc = store_locked(s, sh, h, key, klen, old, parts, plen, uflags, expiry, now, cas_out);
-    pthread_mutex_unlock(&sh->lock);
+    sh_unlock(s, sh);
     free(tmp);
     return rc;
 }
@@ -775,28 +1130,27 @@ int akv_get_meta(akv *s, const void *key, size_t klen, void *buf, size_t cap, si
     }
     uint64_t h = akv_hash64(key, klen, s->seed);
     struct shard *sh = shard_of(s, h);
-    pthread_mutex_lock(&sh->lock);
+    sh_lock(s, sh);
     sh->st.gets++;
     uint64_t now = now_ms(s);
     struct bucket *b;
     unsigned slot;
-    struct entry_hdr *e = find_live(sh, h, key, klen, now, &b, &slot);
+    struct entry_hdr *e = find_live(s, sh, h, key, klen, now, &b, &slot);
     int rc;
     if (e == NULL) {
         rc = -ENOENT;
     } else {
-        if (touch_ttl_ms != AKV_TTL_KEEP) {
-            if (touch_ttl_ms < 0) {
-                e->expiry = now; /* expired: reclaimed by the next lookup or by eviction */
-            } else {
-                e->expiry = expiry_of(now, touch_ttl_ms);
-            }
+        int touch = touch_ttl_ms != AKV_TTL_KEEP;
+        if (touch && touch_ttl_ms >= 0) {
+            e->expiry = expiry_of(now, touch_ttl_ms);
+            e->cas = next_cas(sh);
+            emit(s, AKV_CHG_TOUCH, AKV_DEL_CLIENT, e);
         }
         *vlen = e->vlen;
         if (meta != NULL) {
             meta->flags = e->uflags;
             meta->cas = e->cas;
-            meta->ttl_ms = ttl_left(e->expiry, now);
+            meta->ttl_ms = touch && touch_ttl_ms < 0 ? 0 : ttl_left(e->expiry, now);
         }
         if (e->vlen > cap) {
             rc = -EMSGSIZE;
@@ -806,8 +1160,15 @@ int akv_get_meta(akv *s, const void *key, size_t klen, void *buf, size_t cap, si
             sh->st.hits++;
             rc = 0;
         }
+        if (touch && touch_ttl_ms < 0) {
+            /* Returned once, then removed (memcached gat with a negative expiry). */
+            b->tags[slot] = 0;
+            sh->st.entries--;
+            sh->st.expired++;
+            kill_entry(s, e, AKV_DEL_CLIENT);
+        }
     }
-    pthread_mutex_unlock(&sh->lock);
+    sh_unlock(s, sh);
     return rc;
 }
 
@@ -821,11 +1182,11 @@ int akv_exists(akv *s, const void *key, size_t klen) {
     }
     uint64_t h = akv_hash64(key, klen, s->seed);
     struct shard *sh = shard_of(s, h);
-    pthread_mutex_lock(&sh->lock);
+    sh_lock(s, sh);
     struct bucket *b;
     unsigned slot;
-    int found = find_live(sh, h, key, klen, now_ms(s), &b, &slot) != NULL;
-    pthread_mutex_unlock(&sh->lock);
+    int found = find_live(s, sh, h, key, klen, now_ms(s), &b, &slot) != NULL;
+    sh_unlock(s, sh);
     return found;
 }
 
@@ -835,17 +1196,19 @@ int akv_del(akv *s, const void *key, size_t klen) {
     }
     uint64_t h = akv_hash64(key, klen, s->seed);
     struct shard *sh = shard_of(s, h);
-    pthread_mutex_lock(&sh->lock);
+    sh_lock(s, sh);
     struct bucket *b;
     unsigned slot;
     int rc = -ENOENT;
-    if (find_live(sh, h, key, klen, now_ms(s), &b, &slot) != NULL) {
+    struct entry_hdr *e = find_live(s, sh, h, key, klen, now_ms(s), &b, &slot);
+    if (e != NULL) {
         b->tags[slot] = 0;
         sh->st.dels++;
         sh->st.entries--;
+        kill_entry(s, e, AKV_DEL_CLIENT);
         rc = 0;
     }
-    pthread_mutex_unlock(&sh->lock);
+    sh_unlock(s, sh);
     return rc;
 }
 
@@ -855,24 +1218,26 @@ int akv_touch(akv *s, const void *key, size_t klen, int64_t ttl_ms) {
     }
     uint64_t h = akv_hash64(key, klen, s->seed);
     struct shard *sh = shard_of(s, h);
-    pthread_mutex_lock(&sh->lock);
+    sh_lock(s, sh);
     uint64_t now = now_ms(s);
     struct bucket *b;
     unsigned slot;
-    struct entry_hdr *e = find_live(sh, h, key, klen, now, &b, &slot);
+    struct entry_hdr *e = find_live(s, sh, h, key, klen, now, &b, &slot);
     int rc = -ENOENT;
     if (e != NULL) {
         if (ttl_ms < 0) {
             b->tags[slot] = 0;
             sh->st.entries--;
             sh->st.expired++;
+            kill_entry(s, e, AKV_DEL_CLIENT);
         } else {
             e->expiry = expiry_of(now, ttl_ms);
             e->cas = next_cas(sh);
+            emit(s, AKV_CHG_TOUCH, AKV_DEL_CLIENT, e);
         }
         rc = 0;
     }
-    pthread_mutex_unlock(&sh->lock);
+    sh_unlock(s, sh);
     return rc;
 }
 
@@ -919,11 +1284,11 @@ int akv_incr(akv *s, const void *key, size_t klen, int64_t delta, enum akv_incr_
     }
     uint64_t h = akv_hash64(key, klen, s->seed);
     struct shard *sh = shard_of(s, h);
-    pthread_mutex_lock(&sh->lock);
+    sh_lock(s, sh);
     uint64_t now = now_ms(s);
     struct bucket *b;
     unsigned slot;
-    struct entry_hdr *e = find_live(sh, h, key, klen, now, &b, &slot);
+    struct entry_hdr *e = find_live(s, sh, h, key, klen, now, &b, &slot);
     char text[24];
     size_t tlen = 0;
     int rc = 0;
@@ -965,20 +1330,29 @@ int akv_incr(akv *s, const void *key, size_t klen, int64_t delta, enum akv_incr_
         uint64_t expiry = e != NULL ? e->expiry : 0;
         rc = store_locked(s, sh, h, key, klen, e, parts, plen, uflags, expiry, now, cas_out);
     }
-    pthread_mutex_unlock(&sh->lock);
+    sh_unlock(s, sh);
     return rc;
 }
 
 void akv_flush(akv *s) {
     for (uint32_t i = 0; i < s->nshards; i++) {
+        sh_lock(s, &s->shards[i]);
+    }
+    if (s->cfg.on_change != NULL && !s->quiet) {
+        akv_change c = {.kind = AKV_CHG_FLUSH, .txn = held_txn(s)};
+        s->cfg.on_change(s->cfg.on_change_arg, &c);
+    }
+    for (uint32_t i = 0; i < s->nshards; i++) {
         struct shard *sh = &s->shards[i];
-        pthread_mutex_lock(&sh->lock);
-        madvise(sh->arena, sh->size, MADV_DONTNEED); /* private anonymous memory reads back as zero */
+        /* Private anonymous memory reads back as zero after MADV_DONTNEED; shared file pages need MADV_REMOVE. */
+        madvise(sh->arena, sh->size, s->shm_fd >= 0 ? MADV_REMOVE : MADV_DONTNEED);
         madvise(sh->buckets, sh->nbuckets * sizeof(struct bucket), MADV_DONTNEED);
         sh->head = 0;
         sh->tail = 0;
         sh->st.entries = 0;
-        pthread_mutex_unlock(&sh->lock);
+    }
+    for (uint32_t i = s->nshards; i-- > 0;) {
+        sh_unlock(s, &s->shards[i]);
     }
 }
 
@@ -988,14 +1362,14 @@ int akv_foreach(akv *s, int (*fn)(void *arg, const akv_record *r), void *arg) {
     int rc = 0;
     for (uint32_t i = 0; i < s->nshards && rc == 0; i++) {
         struct shard *sh = &s->shards[i];
-        pthread_mutex_lock(&sh->lock);
+        sh_lock(s, sh);
         uint64_t now = now_ms(s);
         /* Copy live entries in log order; ttl is stored in the expiry field as the remaining time + 1. */
         size_t need = (size_t)(sh->head - sh->tail);
         if (need > copy_cap) {
             uint8_t *p = realloc(copy, need);
             if (p == NULL) {
-                pthread_mutex_unlock(&sh->lock);
+                sh_unlock(s, sh);
                 rc = -ENOMEM;
                 break;
             }
@@ -1020,7 +1394,7 @@ int akv_foreach(akv *s, int (*fn)(void *arg, const akv_record *r), void *arg) {
             c->expiry = e->expiry == 0 ? 0 : (uint64_t)ttl_left(e->expiry, now) + 1;
             used += total;
         }
-        pthread_mutex_unlock(&sh->lock);
+        sh_unlock(s, sh);
         for (size_t off = 0; off < used && rc == 0;) {
             struct entry_hdr *c = (struct entry_hdr *)(copy + off);
             off += c->total;
@@ -1044,7 +1418,7 @@ void akv_stats_get(akv *s, akv_stats *out) {
     memset(out, 0, sizeof(*out));
     for (uint32_t i = 0; i < s->nshards; i++) {
         struct shard *sh = &s->shards[i];
-        pthread_mutex_lock(&sh->lock);
+        sh_lock(s, sh);
         out->entries += sh->st.entries;
         out->arena_bytes += sh->size;
         out->log_bytes += sh->head - sh->tail;
@@ -1060,6 +1434,134 @@ void akv_stats_get(akv *s, akv_stats *out) {
         out->expired += sh->st.expired;
         out->index_bytes += sh->nbuckets * sizeof(struct bucket);
         out->index_grows += sh->st.index_grows;
-        pthread_mutex_unlock(&sh->lock);
+        sh_unlock(s, sh);
     }
+}
+
+/* ---- replay, lock sets ----------------------------------------------------------------------------- */
+
+/* Engine-clock expiry of an absolute Unix expiry; a passed time maps to 1 (expired), none to 0. */
+static uint64_t engine_expiry(const akv *s, int64_t expire_unix_ms) {
+    if (expire_unix_ms == 0) {
+        return 0;
+    }
+    int64_t e = expire_unix_ms - s->wall_epoch_ms + 1;
+    return e >= 1 ? (uint64_t)e : 1;
+}
+
+/* Sets the expiry of the entry of key (engine clock) under the shard lock; 0 when present, -ENOENT. */
+static int set_expiry(akv *s, const void *key, size_t klen, uint64_t expiry) {
+    uint64_t h = akv_hash64(key, klen, s->seed);
+    struct shard *sh = shard_of(s, h);
+    sh_lock(s, sh);
+    struct bucket *b;
+    unsigned slot;
+    struct entry_hdr *e = find_live(s, sh, h, key, klen, now_ms(s), &b, &slot);
+    int rc = -ENOENT;
+    if (e != NULL) {
+        e->expiry = expiry;
+        e->cas = next_cas(sh);
+        emit(s, AKV_CHG_TOUCH, AKV_DEL_CLIENT, e);
+        rc = 0;
+    }
+    sh_unlock(s, sh);
+    return rc;
+}
+
+/*
+ * Records are applied with lookups that see expired entries, and expiry times are applied as absolute
+ * times even when they have passed: a record produced before an expiry (a touch that removes it, an
+ * append) is then applied to the same entry it saw. Expiry itself arrives as a DEL record. Valkey treats
+ * expiry the same way while loading an append-only file and on replicas, which delete expired keys only
+ * on the primary's DEL.
+ */
+int akv_apply(akv *s, const akv_change *c) {
+    int rc = 0;
+    applying = 1;
+    switch (c->kind) {
+    case AKV_CHG_PUT: {
+        akv_store_opts o = {.mode = AKV_SET, .flags = c->flags};
+        rc = akv_store(s, c->key, c->klen, c->val, c->vlen, &o, NULL);
+        if (rc == 0 && c->expire_unix_ms != 0) {
+            rc = set_expiry(s, c->key, c->klen, engine_expiry(s, c->expire_unix_ms));
+        }
+        break;
+    }
+    case AKV_CHG_DEL:
+        rc = akv_del(s, c->key, c->klen);
+        break;
+    case AKV_CHG_TOUCH:
+        rc = c->klen == 0 || c->klen > 0xffff
+                 ? -EINVAL
+                 : set_expiry(s, c->key, c->klen, engine_expiry(s, c->expire_unix_ms));
+        break;
+    case AKV_CHG_FLUSH:
+        akv_flush(s);
+        break;
+    default:
+        rc = -EINVAL;
+        break;
+    }
+    applying = 0;
+    return rc == -ENOENT ? 0 : rc;
+}
+
+void akv_set_follower(akv *s, int on) {
+    __atomic_store_n(&s->follower, on != 0, __ATOMIC_RELAXED);
+}
+
+static void lock_set(akv *s, const akv_lockset *set, uint64_t txn) {
+    for (uint32_t i = 0; i < s->nshards; i++) {
+        if ((set->bits[i >> 6] >> (i & 63)) & 1) {
+            pthread_mutex_lock(&s->shards[i].lock);
+        }
+    }
+    held.store = s;
+    held.set = *set;
+    held.txn = txn;
+}
+
+void akv_lock_keys(akv *s, const void *const *keys, const size_t *lens, size_t n, uint64_t txn,
+                   akv_lockset *set) {
+    memset(set, 0, sizeof(*set));
+    for (size_t i = 0; i < n; i++) {
+        if (lens[i] == 0 || lens[i] > 0xffff) {
+            continue; /* rejected by the operation itself */
+        }
+        uint32_t idx = shard_of(s, akv_hash64(keys[i], lens[i], s->seed))->index;
+        set->bits[idx >> 6] |= 1ull << (idx & 63);
+    }
+    lock_set(s, set, txn);
+}
+
+void akv_lock_all(akv *s, uint64_t txn, akv_lockset *set) {
+    memset(set, 0, sizeof(*set));
+    for (uint32_t i = 0; i < s->nshards; i++) {
+        set->bits[i >> 6] |= 1ull << (i & 63);
+    }
+    lock_set(s, set, txn);
+}
+
+void akv_unlock(akv *s, const akv_lockset *set) {
+    memset(&held, 0, sizeof(held));
+    for (uint32_t i = s->nshards; i-- > 0;) {
+        if ((set->bits[i >> 6] >> (i & 63)) & 1) {
+            pthread_mutex_unlock(&s->shards[i].lock);
+        }
+    }
+}
+
+uint64_t akv_cas_of(akv *s, const void *key, size_t klen) {
+    if (klen == 0 || klen > 0xffff) {
+        return 0;
+    }
+    uint64_t h = akv_hash64(key, klen, s->seed);
+    struct shard *sh = shard_of(s, h);
+    sh_lock(s, sh);
+    struct bucket *b;
+    unsigned slot;
+    struct entry_hdr *e = find_live(s, sh, h, key, klen, now_ms(s), &b, &slot);
+    uint64_t cas = e != NULL ? e->cas : 0;
+    sh_unlock(s, sh);
+    return cas;
 }

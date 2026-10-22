@@ -7,6 +7,10 @@
  * connections through rdmaduct's pollable descriptors, text protocols on non-blocking sockets. Requests
  * of a connection are executed in order and may be pipelined. A background thread runs periodic
  * snapshots. The server owns its engine and transport context.
+ *
+ * Persistence: snapshots (snapshot_path), an append-only log of every change (aof_dir, see src/aof.h) and
+ * warm restart (store.shm_path: the cache memory survives a restart of the process). At start the warm
+ * memory is used when it is valid, otherwise the append-only log, otherwise the snapshot.
  */
 #ifndef AKVD_H
 #define AKVD_H
@@ -59,11 +63,23 @@ typedef struct akvd_config {
     const char *snapshot_path;
     unsigned save_interval_s; /* periodic snapshot when entries changed; 0 = only on request and exit */
     int save_on_stop;         /* write a snapshot in akvd_stop() */
+    /* Append-only log directory; NULL disables the log. */
+    const char *aof_dir;
+    /*
+     * fsync policy of the log, as Valkey's appendfsync: 0 no (the kernel decides), 1 everysec (default;
+     * up to about one second of acknowledged changes can be lost in a crash), 2 always (a reply that
+     * follows a change is sent only after the change is on disk).
+     */
+    unsigned aof_fsync;
+    unsigned aof_rewrite_percentage; /* rewrite when the log grew by this percentage of its base; 0 = off */
+    uint64_t aof_rewrite_min_size;   /* ... and is at least this many bytes (default 64 MiB) */
+    int aof_load_damaged; /* start with the records before a damaged block (then rewrite) instead of failing */
     enum akvd_log_level log_level;
     const char *log_path; /* NULL = standard error */
 } akvd_config;
 
-/* Fills cfg with defaults: 256 MiB store, AUTO transport, native port 7600, text listeners off. */
+/* Fills cfg with defaults: 256 MiB store, AUTO transport, native port 7600, text listeners off, log policy
+ * everysec with automatic rewrites at 100% growth above 64 MiB. */
 void akvd_config_default(akvd_config *cfg);
 
 /*
@@ -98,6 +114,9 @@ int akvd_bgsave(akvd *d);
 /* 1 while a background snapshot runs. */
 int akvd_bgsave_running(const akvd *d);
 
+/* Starts a rewrite of the append-only log. Returns 0, -EBUSY (one is running) or -EINVAL (no log). */
+int akvd_aof_rewrite(akvd *d);
+
 /* Unix time of the last successful snapshot, 0 when none was written since the start. */
 uint64_t akvd_lastsave(const akvd *d);
 
@@ -113,7 +132,11 @@ void akvd_reopen_log(akvd *d);
 /* Writes a line to the server log when level is at or below the configured level. */
 void akvd_log(akvd *d, enum akvd_log_level level, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 
-/* Stops accepting, saves the snapshot if configured, closes all connections, joins the threads, frees everything. */
+/*
+ * Stops accepting, closes all connections, joins the threads, writes and syncs the append-only log,
+ * saves the snapshot if configured, keeps the cache memory for a warm restart if configured
+ * (akv_detach), and frees everything.
+ */
 void akvd_stop(akvd *d);
 
 #endif

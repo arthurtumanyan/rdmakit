@@ -35,7 +35,7 @@ CFLAGS += -fsanitize=thread -fno-omit-frame-pointer
 LDFLAGS += -fsanitize=thread
 endif
 
-LIB_SRC := src/akv.c src/server.c src/client.c src/proto_mc.c src/proto_resp.c src/snapshot.c
+LIB_SRC := src/akv.c src/server.c src/client.c src/proto_mc.c src/proto_resp.c src/snapshot.c src/aof.c
 LIB_OBJ := $(patsubst src/%.c,$(OUT)/%.o,$(LIB_SRC))
 LIB := $(OUT)/libarenakv.a
 TESTS := $(patsubst tests/%.c,$(OUT)/%,$(wildcard tests/test_*.c))
@@ -82,6 +82,7 @@ RUN := $(if $(TSAN),setarch $(ARCH) -R,)
 test: $(TESTS) $(OUT)/arenakvd $(OUT)/akv_cli
 	@set -e; for t in $(TESTS); do echo "== $$t"; DUCT_TEST_ADDR="$(ADDR)" $(RUN) $$t; done
 	@echo "== tests/cli.sh"; $(RUN) tests/cli.sh $(OUT)
+	@echo "== tests/durability.py"; $(RUN) python3 tests/durability.py $(OUT)
 
 install: $(OUT)/arenakvd $(OUT)/akv_bench $(OUT)/akv_cli
 	install -D -m 755 $(OUT)/arenakvd $(DESTDIR)$(PREFIX)/bin/arenakvd

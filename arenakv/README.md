@@ -12,8 +12,11 @@ instructions, and evicts with a second chance.
   CAS), increments, touch, flush, multi-key reads.
 - Event-loop server: worker threads serve thousands of pipelined connections; native connections use rdmaduct's
   pollable descriptors.
-- Authentication for all protocols, TLS for the text protocols (optional OpenSSL build), snapshots to disk with
-  CRC-checked blocks, configuration file, log rotation, systemd unit and container image.
+- Authentication for all protocols, TLS for the text protocols (optional OpenSSL build), configuration file, log
+  rotation, systemd unit and container image.
+- Persistence: snapshots, an append-only log of every change with the fsync policies of Valkey (`always`,
+  `everysec`, `no`) and background rewrites, and warm restart (the cache memory survives a restart of the process).
+  Every file block is CRC-checked.
 - Sharded engine: operations on different shards run in parallel. Tag comparison with SSE2 (x86-64) or NEON
   (aarch64), with a portable fallback.
 - Client library (`akvclient.h`) with pipelining and consistent hashing over several servers, and a native driver
@@ -36,7 +39,7 @@ use an RDMA transport. `arenakv` is a cache built for that access pattern:
   model test against a reference map checks this under eviction.
 - **Transport-independent server.** The native protocol runs over [`rdmaduct`](../rdmaduct), so the same binary
   serves TCP and RDMA clients, next to standard memcached and Redis clients on the text protocols.
-- **Small enough to audit:** about 6,400 lines including the server, three protocols, persistence and the client.
+- **Small enough to audit:** about 8,600 lines including the server, three protocols, persistence and the client.
 
 memcached, Valkey and Dragonfly are mature and remain the right default for general caching. The measurements
 below show where `arenakv` is in the same range, where it is better, and where it is worse.
@@ -54,7 +57,7 @@ below show where `arenakv` is in the same range, where it is better, and where i
 | Expiry, CAS, conditional stores, increments | yes | yes | yes | yes |
 | Data types | strings | strings | strings, lists, hashes, sets, sorted sets, streams | as Valkey |
 | Authentication | shared credentials file | SASL, ASCII auth | ACL users | ACL users |
-| Persistence | snapshots (CRC-checked, atomic rename) | warm restart | RDB, AOF | snapshots |
+| Persistence | snapshots, append-only log (fsync always, everysec or no), warm restart | warm restart | RDB, AOF | snapshots |
 | Replication, cluster | no (client-side consistent hashing) | no (client-side hashing) | yes | replication, cluster mode |
 | Hash index | grows from a small size | grows | grows | grows |
 | Production use | not recommended | widely deployed | widely deployed | deployed |
@@ -233,6 +236,9 @@ and clang on x86-64 and arm64.
 | `test_primitives` | vector tag matching equals the scalar reference for all lane combinations; hash avalanche and bucket distribution |
 | `test_proto` | memcached and RESP commands with exact replies, also fed one byte at a time; framing errors; authentication; one million fuzzed inputs |
 | `test_net` | pipelining, large values and backpressure on real sockets, 16 concurrent clients, connection limit, idle timeout, snapshots (round trip, expiry across downtime, corruption, truncation), TLS, native revision 2, consistent hashing |
+| `test_feed` | change feed replayed into a second engine gives the identical state (with eviction, expiry, flush, index-window drops); transaction ids; lock sets under concurrency; warm restart round trip, expiry across the downtime, changed configuration, missing detach, damaged header |
+| `test_aof` | append-only log round trip, rewrites while four threads write, automatic rewrites, torn and zero-filled tails, damage before the end, incomplete transactions, durable sequence numbers |
+| `durability.py` | `SIGKILL` of a writing server with `always` (no acknowledged write lost) and `everysec` (losses only from the last 2 s), `SIGKILL` during a rewrite, warm restart with identical contents |
 | `test_server` | native protocol round trips, malformed requests, size limits, concurrent clients, shutdown with clients connected; over TCP, and over RDMA when `DUCT_TEST_ADDR` is set |
 
 ## Run the server
@@ -271,7 +277,9 @@ END
 | `--threads N` | CPUs of the affinity mask | worker threads |
 | `--max-conns N`, `--idle-timeout SEC` | unlimited, never | connection limits |
 | `--auth-file FILE` | none | credentials (`user:password` or a password per line) |
-| `--snapshot FILE`, `--save-interval SEC`, `--no-save-on-stop` | none, off, save at stop | persistence |
+| `--snapshot FILE`, `--save-interval SEC`, `--no-save-on-stop` | none, off, save at stop | snapshots |
+| `--appendonly DIR`, `--appendfsync always\|everysec\|no` | none, everysec | append-only log |
+| `--warm-restart FILE` | none | keep the cache memory (on tmpfs) across restarts |
 | `--max-msg BYTES`, `--depth N` | 65536, 16 | native message size and buffers per connection |
 | `--huge-pages` | off | advise transparent huge pages for the arenas |
 | `--log-level`, `--log-file`, `--stats SEC` | info, stderr, off | logging (SIGHUP reopens the file) |
@@ -342,7 +350,7 @@ transport.
 | Path | Content |
 |---|---|
 | `include/` | public headers: `akv.h` (engine), `akvproto.h` (protocol), `akvd.h` (server), `akvclient.h` |
-| `src/` | `akv.c` engine, `simd.h`, `hash.h`, `server.c` core, `proto_mc.c`, `proto_resp.c`, `snapshot.c`, `client.c` |
+| `src/` | `akv.c` engine, `simd.h`, `hash.h`, `server.c` core, `proto_mc.c`, `proto_resp.c`, `snapshot.c`, `aof.c` append-only log, `client.c` |
 | `tools/` | `arenakvd` daemon, `akv_cli` native-protocol client, `akv_bench` micro-benchmarks |
 | `tests/` | engine, protocol, network and server tests; `compat.sh` with third-party clients |
 | `contrib/` | example configuration, systemd unit, Dockerfile |

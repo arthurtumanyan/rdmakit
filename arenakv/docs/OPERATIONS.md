@@ -178,7 +178,20 @@ over rdmaduct is never encrypted, over TCP or RDMA.
 
 ## Persistence
 
-### Behavior
+### Choosing a mechanism
+
+| Mechanism | Option | What survives | What can be lost | Cost while running |
+|---|---|---|---|---|
+| none | | nothing | everything at a stop or crash | none |
+| snapshot | `--snapshot FILE` | the content at the last save | changes since the last `SAVE`, `BGSAVE`, periodic save or clean stop | a copy of the whole content per save |
+| append-only log | `--appendonly DIR` | every change written to the log | `always`: nothing that was acknowledged; `everysec`: up to about one second; `no`: what the kernel had not written | one record per change, and the fsync policy |
+| warm restart | `--warm-restart FILE` | the cache memory across a stop and start of the process (upgrade, configuration change) | everything after a crash or a reboot (the memory is then not trusted) | none (the memory is a file on tmpfs) |
+
+The mechanisms combine. At start the server takes the warm-restart memory when it is valid, otherwise the
+append-only log, otherwise the snapshot, and logs which one it used. A typical cache that must keep its content over
+upgrades uses `--warm-restart`; one that must also survive crashes adds `--appendonly`.
+
+### Snapshots
 
 - `--snapshot FILE` loads the file at start (if it exists) and writes it at stop (`SIGTERM`/`SIGINT`, unless
   `--no-save-on-stop`), on `SAVE` (synchronous) and `BGSAVE` (background thread), and every `--save-interval`
@@ -193,6 +206,51 @@ over rdmaduct is never encrypted, over TCP or RDMA.
   are reassigned on load.
 - The start-up log reports `snapshot loaded: N entries`. Loading into a smaller `--capacity` evicts the oldest
   entries as stores do; with `--no-evict`, entries that do not fit are skipped.
+- With a valid warm-restart memory or an append-only log, the snapshot is not loaded (`snapshot not loaded: the
+  append-only log is newer`).
+
+### Append-only log
+
+- `--appendonly DIR` records every change: stores of all kinds, increments, deletes, expiry changes, flushes, and
+  removals by expiry and eviction. Each record holds the resulting state (the full value and the absolute expiry
+  time), so replaying a record twice changes nothing.
+- The directory holds `manifest`, one `base-N.aof` and one or more `incr-N.aof` files. A new directory gets a base
+  file with the current content (for example the content loaded from a snapshot).
+- fsync policies, with the semantics of Valkey's `appendfsync`:
+
+  | `--appendfsync` | A reply to a change is sent | Lost in a crash of the machine |
+  |---|---|---|
+  | `always` | after the change is on disk; changes of many connections share one `fdatasync` | nothing that was acknowledged |
+  | `everysec` (default) | at once; the log is synced about once per second | up to about one second of changes |
+  | `no` | at once; the kernel writes when it decides | what was not yet written by the kernel |
+
+  A crash of the process alone (not of the machine) loses nothing that was handed to the log under any policy,
+  because written data stays in the kernel's page cache; `tests/durability.py` checks this with `SIGKILL`.
+- Rewriting: `BGREWRITEAOF`, or automatically when the log grew by `--aof-rewrite-percentage` of its base and is at
+  least `--aof-rewrite-min-size`. The server switches to a new increment file, writes a new base from the current
+  content in the background, then replaces the manifest and removes the old files. Changes continue during the
+  rewrite; a crash at any point leaves a manifest whose files replay to the latest state.
+- Loading: the start-up log reports `append-only log loaded: N records from M files`. Transactions are applied
+  completely or not at all; an unfinished transaction at the end of the log is not applied and reported.
+- INFO reports `aof_enabled`, the sizes, the rewrite and write status and the number of syncs
+  ([RESP INFO fields](#resp-info-fields)). `aof_last_write_status:err` means the disk refused a write (full, read
+  only); the server retries every second and, with `always`, holds the replies until a write succeeds.
+
+### Warm restart
+
+- `--warm-restart FILE` places the cache memory in FILE, which must be on tmpfs (normally `/dev/shm`; the start
+  fails when the directory is not writable). The file has the size of `--capacity` plus a header of a few KiB.
+- A stop by `SIGTERM`, `SIGINT` or `SIGUSR1` records the log positions and the time in the file. The next start with
+  the same `--capacity`, `--shards` and `--max-entry` rebuilds the hash index from the memory instead of starting
+  empty: `warm restart: N entries restored in S s (M expired while stopped)`. Expiry times count the time the server
+  was stopped.
+- The memory is discarded, with a warning, when the previous process did not stop cleanly (crash, `SIGKILL`), when
+  one of these options changed, or when the file is damaged or written by an incompatible version. The server then
+  starts from the append-only log or the snapshot, if configured.
+- The file does not survive a reboot (tmpfs). To start empty on purpose, remove the file before starting or run
+  `FLUSHALL` before stopping.
+- Memory accounting: the pages of the file count as shared memory (`Shmem` in `/proc/meminfo`) rather than as
+  anonymous memory of the process, and a container's tmpfs size limit applies to them.
 
 ### Backup and restore
 
@@ -206,9 +264,13 @@ To restore: stop the server (it writes its own snapshot at stop), replace the sn
 start empty, move the file away before starting. To discard the cache contents at the next stop, start with
 `--no-save-on-stop` or remove the file after stopping.
 
+An append-only log directory is copied with `cp -a` while `aof_rewrite_in_progress` is 0. A copy taken while
+changes are written may end in a partial block; that block is cut off when the copy is loaded, so the copy restores
+the changes up to that point. To restore, stop the server, replace the directory, and start it.
+
 ### Damaged files
 
-Each block of records carries a CRC32C; a damaged or truncated file is refused and the server does not start:
+Each block of records carries a CRC32C; a damaged or truncated snapshot is refused and the server does not start:
 
 ```
 [error] snapshot /var/lib/arenakv/arenakv.snap cannot be loaded (Bad message); move it away to start empty
@@ -217,12 +279,32 @@ cannot start server: Bad message
 
 Move the file away (keep it for analysis) and start again; the server starts empty.
 
+In the append-only log, an incomplete last block of the last increment file (the remains of a crash during a
+write, including a zero-filled tail) is removed at start with a warning (`... bytes of an incomplete last write
+removed`), as Valkey does with `aof-load-truncated yes`. A damaged block anywhere else stops the start:
+
+```
+[error] append-only log: damaged block at offset 1048600 of /var/lib/arenakv/aof/incr-7.aof
+[error] append-only log in /var/lib/arenakv/aof cannot be opened (Bad message); see the operations guide for damaged logs
+```
+
+Keep a copy of the directory, then either restore a backup or start once with `--aof-load-damaged`: the server
+applies the records before the damaged block, skips the rest, and writes a new base at once, so the log is whole
+again. A directory with log files but no `manifest` is refused as well.
+
 ### Format
 
-Little-endian. Header: magic `AKVSNAP1` (8 bytes), version 1 (4), reserved (4), creation time in Unix seconds (8).
-Blocks: magic `BLK1` (4), record count (4), payload length (4), CRC32C of the payload (4), payload of records (key
-length 2, reserved 2, client flags 4, value length 4, remaining time to live in ms 8 with -1 for none, key, value).
-An end block with record count 0 holds the total number of records (8). Definition: `src/srv.h`, `src/snapshot.c`.
+Snapshots, little-endian. Header: magic `AKVSNAP1` (8 bytes), version 1 (4), reserved (4), creation time in Unix
+seconds (8). Blocks: magic `BLK1` (4), record count (4), payload length (4), CRC32C of the payload (4), payload of
+records (key length 2, reserved 2, client flags 4, value length 4, remaining time to live in ms 8 with -1 for none,
+key, value). An end block with record count 0 holds the total number of records (8). Definition: `src/srv.h`,
+`src/snapshot.c`.
+
+Append-only log files, little-endian. Header: magic `AKVLOG01` (8), version 1 (4), file kind 0 base / 1 increment
+(4), creation time (8). Blocks: magic `ALG1` (4), record count (4), payload length (4), CRC32C (4), records (kind 1,
+reason 1, key length 2, client flags 4, value length 4, absolute expiry in Unix ms 8 with 0 for none, transaction id
+8, key, value). Record kinds: 1 store, 2 delete, 3 expiry change, 4 flush, 100 end of a transaction. Definition:
+`src/aof.h`, `src/aof.c`. Warm-restart file: `src/akv.c` (header `struct warm_hdr`).
 
 ## Monitoring
 
@@ -247,6 +329,10 @@ An end block with record count 0 holds the total number of records (8). Definiti
 | `maxmemory` | configured capacity of the arenas |
 | `index_memory` | bytes of the hash index |
 | `rdb_bgsave_in_progress`, `rdb_last_save_time`, `rdb_last_bgsave_status` | snapshot state (`ok`/`err` of the last attempt) |
+| `aof_enabled`, `aof_rewrite_in_progress`, `aof_last_bgrewrite_status`, `aof_last_write_status` | append-only log configured, rewrite running, `ok`/`err` of the last rewrite and of the last write |
+| `aof_current_size`, `aof_base_size`, `aof_buffer_length` | bytes of all log files, of the base file, and of changes not yet written |
+| `aof_rewrites`, `aof_fsyncs` | completed rewrites and `fdatasync` calls since the start |
+| `warm_restart`, `warm_restart_entries`, `warm_restart_rebuild_us` | outcome of the warm restart at start (`off`, `created`, `restored`, `mismatch`, `unclean`, `damaged`), entries restored, time to rebuild the index |
 | `total_connections_received`, `rejected_connections` | accepted connections; connections closed by `--max-conns` |
 | `total_commands_processed` | requests of all protocols |
 | `keyspace_hits`, `keyspace_misses` | reads of all protocols that found / did not find the key |
@@ -311,10 +397,10 @@ snapshot writes, TLS files that cannot be loaded.
 
 | Task | Procedure |
 |---|---|
-| Restart without losing data | configure `--snapshot`; `SIGTERM` (`systemctl restart`) writes it and the next start loads it |
+| Restart without losing data | `--warm-restart` keeps the memory over a stop and start; `--appendonly` or `--snapshot` also cover crashes ([Choosing a mechanism](#choosing-a-mechanism)) |
 | Change capacity, threads, ports or credentials | edit the configuration, restart; the snapshot is loaded into the new capacity |
 | Empty the cache | RESP `FLUSHALL`, memcached `flush_all`, `akv_cli flush`; with a snapshot configured, the next save writes the empty state |
-| Upgrade | stop (snapshot written), install the new binary, start; snapshot format version 1 is read by every version that writes it |
+| Upgrade | stop (log synced, snapshot written, warm memory kept), install the new binary, start; a version that cannot read the warm-restart memory discards it and loads the log or snapshot; snapshot format version 1 and log format version 1 are read by every version that writes them |
 | Move to another host | copy the snapshot file; expiry continues from the file's creation time |
 | Check the version | `arenakvd --version`, RESP `INFO`, memcached `version` |
 
@@ -328,7 +414,10 @@ snapshot writes, TLS files that cannot be loaded.
 | RDMA clients cannot connect although the server started | `--addr` is not the address of the interface that belongs to the RDMA device | `rdma link show`, `ip -4 addr show dev <netdev>`; use that address on server and client |
 | RDMA connections fail with memory errors | memlock limit too low | `LimitMEMLOCK=infinity`, `ulimit -l unlimited` |
 | `snapshot ... cannot be loaded (Bad message)` | damaged or truncated snapshot | move the file away and start ([Damaged files](#damaged-files)) |
-| `snapshot directory ... is not writable` | wrong path or permissions | create the directory, give it to the server user |
+| `snapshot directory ... is not writable` (or `warm-restart`, `append-only log`) | wrong path or permissions | create the directory, give it to the server user |
+| `append-only log ... cannot be opened (Bad message)` | a damaged block before the end of the log, or log files without a manifest | [Damaged files](#damaged-files) |
+| `warm restart: memory discarded (...)` | crash, changed `--capacity`/`--shards`/`--max-entry`, or another version | expected after a crash; the log or snapshot is loaded instead |
+| `aof_last_write_status:err` | the disk refuses writes (full, read-only) | free space; with `always`, clients wait until writes succeed again |
 | `TLS options need a build with TLS=1` | TLS listener options on a build without TLS | build with `make TLS=1` |
 | clients get `NOAUTH` / `CLIENT_ERROR unauthenticated` / `AKVP_NOAUTH` | `--auth-file` is set | authenticate first ([Authentication](#authentication)) |
 | `SERVER_ERROR object too large for cache`, `ERR string exceeds maximum allowed size`, `AKVP_TOOBIG` | entry above `min(max-entry, capacity / shards / 2)`, or a native message above `--max-msg` | raise `--max-entry` or `--max-msg`, or lower `--shards` |
