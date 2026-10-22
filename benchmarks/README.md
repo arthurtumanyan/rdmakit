@@ -455,15 +455,15 @@ Differences are stated only for means or, where noted, for non-overlapping repet
   [C4]. At four server CPUs arenakv over its native protocol uses less server CPU time per operation than Valkey and
   Dragonfly in all three workloads [C5]. The native protocol and the memcached protocol on the same server differ by
   less than 5% in server CPU time per operation in every row [C29]. In run2 (`data/2026-10-21-run2`) the native
-  protocol cost more in every row; the TCP transport changes between the runs (one read per batch, byte-sized send
+  protocol cost more in every row [C32]; the TCP transport changes between the runs (one read per batch, byte-sized send
   batches, direct waiting without a second epoll set, delivery in place; see
   [`rdmaduct/docs/ARCHITECTURE.md`](../rdmaduct/docs/ARCHITECTURE.md)) removed that difference.
 - arenakv over Soft-RoCE has lower mean throughput than arenakv over TCP in all six rows [C6]. Soft-RoCE is a software
   implementation sharing the CPUs with the load generator, so these rows say nothing about RDMA hardware.
 - No operation failed in any matrix run [C22].
 - With 64-byte values arenakv has a lower mean resident memory than each of Valkey, Dragonfly and memcached, below
-  20 MiB, at one and at four server CPUs [C16]. In run1 it used more than eight times their memory, because the
-  index was sized from the configured capacity; the index now starts small and grows with the data.
+  20 MiB, at one and at four server CPUs [C16]. In run1 it used more than eight times their memory [C33], because
+  the index was sized from the configured capacity; the index now starts small and grows with the data.
 
 **Latency under offered load (open loop, one server CPU, 64-byte values)**
 
@@ -477,7 +477,7 @@ Differences are stated only for means or, where noted, for non-overlapping repet
   time.
 - Below saturation the p99 latency has a coefficient of variation above 20% between repetitions in at least half of the
   16 cells [C10]. Tail latencies at moderate load are noisy on this machine and must not be used to rank servers. The
-  p99 curves are not monotonic between 100,000 and 220,000 operations per second. This run used the `performance`
+  p99 curves are not monotonic between 100,000 and 220,000 operations per second [C36]. This run used the `performance`
   governor, so frequency scaling does not explain the shape; client thread scheduling is a hypothesis that was not
   tested.
 
@@ -516,7 +516,7 @@ Differences are stated only for means or, where noted, for non-overlapping repet
   so this compares systems at equal configuration, not at equal total memory.
 - With default flags Dragonfly in cache mode failed more than 90% of requests at 256 MB and more than 80% at 1 GB with
   out-of-memory errors; with `--max_eviction_per_heartbeat` raised no request failed [C14]. Both variants are shown;
-  the raised flag was chosen after the failures were observed in run1 (see the methodology). memcached failed fewer
+  the raised flag was chosen after the failures were observed in run1 [C37] (see the methodology). memcached failed fewer
   than 0.1% of requests in every capacity configuration; arenakv and Valkey failed none [C15].
 
 **Engine and transport**
@@ -528,16 +528,16 @@ Differences are stated only for means or, where noted, for non-overlapping repet
 - Loopback transport: for messages up to 1 KiB the median round trip of Soft-RoCE with polling is lower than that of
   TCP; for messages of 16 KiB and larger TCP is lower than both Soft-RoCE modes [C19]. TCP streaming throughput is at
   least four times that of both Soft-RoCE modes at every measured message size [C20]. In run1 TCP was slower than
-  Soft-RoCE for messages up to 1 KiB; the TCP transport now sends a batch with one `sendmsg()` and buffers its reads.
+  Soft-RoCE with polling for messages up to 1 KiB [C34]; the TCP transport now sends a batch with one `sendmsg()` and buffers its reads.
   These are software-RDMA results.
 
 **Load generator**
 
 - With the client model of `memtier_benchmark` (4 threads with 4 connections each) kvpace measures a throughput within
   3% of `memtier_benchmark` with 16 connections, and at least 25% higher with one connection, on both validation
-  servers [C21]. With one blocking thread per connection (the model of run1) it measures between 5% and 15% less with
+  servers [C21]. With one blocking thread per connection (the model of the matrix suite) it measures between 5% and 15% less with
   16 connections [C23]. The one-connection difference is the per-request cost of the clients themselves: kvpace
-  measures a p50 latency of 7 to 9 microseconds where memtier reports 15. Comparisons between servers must use one tool and one client model
+  measures a p50 latency of 7 to 9 microseconds where memtier reports 15 [C35]. Comparisons between servers must use one tool and one client model
   for all of them.
 
 ## What these results do not show

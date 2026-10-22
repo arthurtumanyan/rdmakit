@@ -6,7 +6,8 @@ when a cited claim does not hold, when a document cites an unknown claim, or whe
 prose and data cannot drift apart silently. Claims are written after looking at the data and are phrased so
 that the condition below is exactly what the sentence says. "Mean" refers to the mean over repetitions;
 "ranges do not overlap" means the smallest repetition of one system is larger than the largest repetition of
-the other.
+the other. A claim listed in _RUN is evaluated on the summary of that earlier run directory (a sibling
+of the verified run) instead; such claims describe how an earlier run differed and name the run in their text.
 """
 
 TCP_SYSTEMS = ["kvstore", "kvstore-mc", "valkey", "dragonfly", "memcached"]
@@ -218,6 +219,44 @@ def c31(s):
     return all(1 < lead(cpus) < 1.15 for cpus in (1, 4))
 
 
+def c32(s):
+    return all(mean(s, "kvstore", cpus, wl, "server_cpu_us_per_op") > mean(s, "kvstore-mc", cpus, wl, "server_cpu_us_per_op")
+               for cpus in (1, 4) for wl in WORKLOADS)
+
+
+def c33(s):
+    return all(mean(s, "kvstore", cpus, "small", "server_rss_mib") > 8 * mean(s, x, cpus, "small", "server_rss_mib")
+               for cpus in (1, 4) for x in ("valkey", "dragonfly", "memcached"))
+
+
+def c34(s):
+    t = s["transport"]
+    return all(t["loopback|tcp-poll|%d" % n]["rtt_p50_us"]["mean"] > t["loopback|rdma-poll|%d" % n]["rtt_p50_us"]["mean"]
+               for n in (64, 256, 1024))
+
+
+def c35(s):
+    v = s["validation"]
+    servers = ("valkey", "kvstore-mc")
+    return all(7 <= v["%s|kvpace|1" % x]["p50_us"]["mean"] <= 9 and v["%s|memtier|1" % x]["p50_us"]["mean"] == 15
+               for x in servers)
+
+
+def c36(s):
+    def falls(x):
+        p = [sweep(s, x, r, "p99_us")["mean"] for r in (100000, 140000, 180000, 220000)]
+        return any(b < a for a, b in zip(p, p[1:]))
+    return all(falls(x) for x in SWEEP_SYSTEMS)
+
+
+def c37(s):
+    return all(cap(s, "dragonfly", c, "error_rate")["min"] > 0.8 for c in ("256mb", "1gb"))
+
+
+def c38(s):
+    return max(loop(s, "pipeline", x, 32)["min"] for x in TCP_SYSTEMS) > 3_000_000
+
+
 _TEXT = {
     1: "arenakv over TCP, with its native protocol or with the memcached protocol, has the highest mean throughput in all six matrix rows",
     2: "at four server CPUs the throughput of arenakv (TCP, native protocol) is higher than that of Valkey and of Dragonfly in all three workloads, with non-overlapping ranges",
@@ -250,6 +289,15 @@ _TEXT = {
     29: "in every matrix row the mean server CPU time per operation of native arenakv and of arenakv over the memcached protocol differ by less than 5%",
     30: "for each of the five TCP servers the kernel-mode share of the server CPU time is lower at pipeline depth 32 than at depth 1, with non-overlapping ranges",
     31: "in the KV-cache rows the higher of the two arenakv TCP means exceeds the mean throughput of memcached by less than 15%, at one and at four server CPUs",
+    32: "in run 2026-10-21-run2 the mean server CPU time per operation of native arenakv is higher than that of arenakv over the memcached protocol in every matrix row",
+    33: "in run 2026-10-20-run1 the mean resident memory of arenakv with 64-byte values is more than eight times that of each of Valkey, Dragonfly and memcached, at one and at four server CPUs",
+    34: "in run 2026-10-20-run1 the median loopback round trip of TCP is higher than that of Soft-RoCE with polling for messages of 64, 256 and 1024 bytes",
+    35: "with one connection kvpace measures a mean p50 latency between 7 and 9 microseconds and memtier_benchmark reports 15 microseconds, on both validation servers",
+    36: "for each of the four servers of the sweep the mean p99 latency decreases at least once between consecutive offered rates from 100,000 to 220,000 operations per second",
+    37: "in run 2026-10-20-run1 Dragonfly with default flags failed more than 80% of requests in every repetition at 256 MB and at 1 GB",
+    38: "with 32 requests in flight per connection the four client CPUs drive more than 3 million operations per second in every repetition of at least one server of the pipeline suite",
 }
+# Claims about an earlier run: claim number -> run directory name under benchmarks/data.
+_RUN = {32: "2026-10-21-run2", 33: "2026-10-20-run1", 34: "2026-10-20-run1", 37: "2026-10-20-run1"}
 _CHECK = {n: globals()["c%d" % n] for n in _TEXT}
-CLAIMS = [{"id": "C%d" % n, "text": _TEXT[n], "check": _CHECK[n]} for n in sorted(_TEXT)]
+CLAIMS = [{"id": "C%d" % n, "text": _TEXT[n], "check": _CHECK[n], "run": _RUN.get(n)} for n in sorted(_TEXT)]

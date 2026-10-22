@@ -36,7 +36,7 @@ use an RDMA transport. `arenakv` is a cache built for that access pattern:
   model test against a reference map checks this under eviction.
 - **Transport-independent server.** The native protocol runs over [`rdmaduct`](../rdmaduct), so the same binary
   serves TCP and RDMA clients, next to standard memcached and Redis clients on the text protocols.
-- **Small enough to audit:** about 6,500 lines including the server, three protocols, persistence and the client.
+- **Small enough to audit:** about 6,400 lines including the server, three protocols, persistence and the client.
 
 memcached, Valkey and Dragonfly are mature and remain the right default for general caching. The measurements
 below show where `arenakv` is in the same range, where it is better, and where it is worse.
@@ -49,13 +49,13 @@ below show where `arenakv` is in the same range, where it is better, and where i
 | Target values | large, mostly immutable blocks | small to medium objects | data structures | data structures |
 | Memory layout | log-structured arena per shard | slab allocator | per-object allocation (jemalloc) | per-object allocation (mimalloc) |
 | Eviction | second chance in write order | segmented LRU | approximate LRU / LFU policies | cache mode (2Q-based) |
-| Network transport | TCP, TLS, RDMA reliable connections | TCP, UDP, Unix sockets, TLS | TCP, Unix sockets, TLS | TCP, TLS |
+| Network transport | TCP, TLS, RDMA reliable connections | TCP, UDP, Unix sockets, TLS | TCP, Unix sockets, TLS | TCP, Unix sockets, TLS |
 | Protocols | memcached text and meta, RESP2, native binary ([PROTOCOL.md](docs/PROTOCOL.md)) | text, meta, binary | RESP2, RESP3 | RESP2, RESP3, memcached text |
 | Expiry, CAS, conditional stores, increments | yes | yes | yes | yes |
 | Data types | strings | strings | strings, lists, hashes, sets, sorted sets, streams | as Valkey |
 | Authentication | shared credentials file | SASL, ASCII auth | ACL users | ACL users |
 | Persistence | snapshots (CRC-checked, atomic rename) | warm restart | RDB, AOF | snapshots |
-| Replication, cluster | no (client-side consistent hashing) | no (client-side hashing) | yes | replication |
+| Replication, cluster | no (client-side consistent hashing) | no (client-side hashing) | yes | replication, cluster mode |
 | Hash index | grows from a small size | grows | grows | grows |
 | Production use | not recommended | widely deployed | widely deployed | deployed |
 

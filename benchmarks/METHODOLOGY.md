@@ -159,7 +159,7 @@ overlap, or when the statement is a direct restatement of a table cell.
 - **Client limits.** The matrix uses one thread per connection with blocking I/O on four client CPUs. In the
   four-CPU configurations the generator may be the bottleneck; those rows show the order of systems under this
   client, not the capacity of each server. With pipelined requests the same four client CPUs drive more than
-  3 million operations per second (pipeline suite).
+  3 million operations per second (pipeline suite) [C38].
 - **Default configurations.** Each system runs with defaults plus the settings above. A system's maintainers might
   recommend different settings.
 - **Container overhead.** Valkey, Dragonfly and memcached run in containers on the host network; arenakv runs

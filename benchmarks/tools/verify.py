@@ -14,7 +14,7 @@ Checks (every failure is listed; the exit status is non-zero when any check fail
   5. every generated table equals the table recomputed from the data;
   6. every GENERATED block in the documentation equals the generated table of the same name;
   7. every claim cited in the documentation as [C<number>] exists in claims.py and holds for the data, and
-     every claim in claims.py is cited at least once.
+     every claim in claims.py is cited at least once; claims about an earlier run are evaluated on that run.
 Environment problems (run made from a modified source tree, power-saving CPU governor) are reported as
 warnings, not failures: they limit what the numbers mean and are stated in the documentation.
 """
@@ -118,6 +118,7 @@ def main():
                 problems.append("%s: referenced image %s does not exist" % (md.relative_to(ROOT), ref))
 
     known = {c["id"]: c for c in claims.CLAIMS}
+    earlier = {}  # run directory name -> summary, for claims about earlier runs
     for cid in sorted(cited - set(known)):
         problems.append("documentation cites %s which is not defined in claims.py" % cid)
     for cid, c in known.items():
@@ -125,7 +126,12 @@ def main():
             problems.append("claim %s is defined but not cited in any document" % cid)
             continue
         try:
-            ok = bool(c["check"](summary))
+            if c["run"]:
+                if c["run"] not in earlier:
+                    earlier[c["run"]] = bench_data.summarize(run.parent / c["run"])
+                ok = bool(c["check"](earlier[c["run"]]))
+            else:
+                ok = bool(c["check"](summary))
         except Exception as e:  # noqa: BLE001
             ok = False
             problems.append("claim %s could not be evaluated: %r" % (cid, e))

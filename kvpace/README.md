@@ -56,9 +56,9 @@ generation, HTTP. See
 | Protocols | RESP, memcached text, arenakv native | RESP, memcached text and binary | many databases through bindings |
 | Same measurement code for all servers | yes | yes (two protocols) | per binding |
 | Several connections per thread, pipelining | yes (`--conns-per-thread`, `--pipeline`) | yes (`-c`, `--pipeline`) | no (one request per thread) |
-| Operation mix | GET, SET, DEL, INCR, MGET, read-modify-write, INSERT | GET/SET ratio, multi-get | read, update, insert, scan, read-modify-write |
+| Operation mix | GET, SET, DEL, INCR, MGET, read-modify-write, INSERT | GET/SET ratio, multi-get, arbitrary commands (`--command`) | read, update, insert, scan, read-modify-write |
 | YCSB core workloads | A, B, C, D, F (E needs range scans) | no | A to F |
-| Key distributions | uniform, Zipfian, sequential, Gaussian, latest | uniform, Gaussian, sequential | uniform, Zipfian, latest, hotspot, sequential |
+| Key distributions | uniform, Zipfian, sequential, Gaussian, latest | uniform, Zipfian, Gaussian, sequential, parallel | uniform, Zipfian, latest, hotspot, sequential |
 | Value sizes | fixed, range, weighted list | fixed, range, weighted list | field count and length |
 | TLS, authentication | yes (`TLS=1`) | yes | per binding |
 | Open-loop arrivals | constant or Poisson schedule | per-connection rate limit | target throughput |
