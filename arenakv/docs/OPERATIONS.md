@@ -79,7 +79,7 @@ Each instance needs its own ports, snapshot file and log file. Bind them to sepa
 - The hash index is additional memory. It grows with the number of entries (about 20 to 40 bytes per entry) and is
   reported as `index_memory` (RESP `INFO`) and `index_bytes` (memcached `stats`). `--avg-entry` presizes it, at
   the cost of index memory for keys that never arrive. Growth does not pause a shard: the old table is moved into the
-  new one a few buckets per operation, and until the move ends the shard holds both tables (1.5 times the new size).
+  new one a bucket per operation, and until the move ends the shard holds both tables (1.5 times the new size).
 - `--max-entry` bounds key + value (default 1 MiB). Entries larger than half of a shard's arena are refused as well:
   with capacity C and S shards the limit is `min(max-entry, C / S / 2)`. Large entries with a small capacity need
   fewer shards.

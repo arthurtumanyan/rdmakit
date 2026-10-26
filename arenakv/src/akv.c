@@ -25,12 +25,15 @@
  * can rebuild the index from the arena alone. Entries behind the tail are never examined, so evictions at
  * the tail do not set it.
  *
- * Index slot: 16-bit tag (never 0 for an occupied slot) and 48-bit value (arena offset / 8 + 1).
+ * Index slot: 16-bit tag (never 0 for an occupied slot) and a 48-bit value. The low pos_bits bits of the
+ * value hold arena offset / 8 + 1 (pos_bits = bit length of shard size / 8 + 1); the remaining
+ * 48 - pos_bits bits hold the low bits of the key hash, from which an index move computes a slot's new
+ * bucket without reading the entry from the arena.
  *
- * Index growth is incremental: a doubling allocates the new table and keeps the old one; each later store
- * and lookup moves MIGRATE_STEP buckets of the old table into the new one (index_migrate). While a move
- * is in progress every slot lives in exactly one of the two tables, lookups examine both, and new slots
- * go into the new table only. A doubling that is due before the move has finished completes it first,
+ * Index growth is incremental: a doubling allocates the new table and keeps the old one; each later
+ * store, lookup and index insert moves MIGRATE_STEP buckets of the old table into the new one
+ * (index_migrate). While a move is in progress every slot lives in exactly one of the two tables, lookups
+ * examine both, and new slots go into the new table only. A doubling that is due before the move has finished completes it first,
  * so at most two tables exist per shard.
  *
  * Engine clock: milliseconds of CLOCK_MONOTONIC_COARSE since the engine was created, plus 1, so that 0 can
@@ -77,15 +80,21 @@
 #define MAX_REINSERT_STREAK 64u
 #define INITIAL_BUCKETS 16u
 /*
- * Old-table buckets moved per store or lookup during a move. A doubling to N buckets leaves the table at
- * 37.5% load, so the next doubling for load is at least 6N new keys away (16 slots x (75% - 37.5%)); four
- * buckets per operation finish the move after N / 8 operations. A doubling caused by a full window before
- * that completes the move at once (index_grow). Four buckets rather than one keep the move's accesses to
- * both tables sequential: filling one shard with 4 million keys from the minimal index took 10% longer in
- * total with one bucket per operation and less than 1% longer with four than with a rehash in one piece
- * (i9-12900K, one core).
+ * Old-table buckets moved per store, lookup or index insert during a move. A doubling to N buckets for
+ * load leaves the table at 37.5% load, so the next one is at least 6N new keys away (16 slots x (75% -
+ * 37.5%)); one bucket per operation finishes the move after N / 2 operations. A doubling caused by a full
+ * window before that completes the move at once (index_grow). A move reads no entries (index_migrate),
+ * so a step costs a few hundred nanoseconds; one bucket rather than several keeps that cost small for
+ * every operation in a move window, which is what bounds queueing when requests arrive at a fixed rate.
  */
-#define MIGRATE_STEP 4u
+#define MIGRATE_STEP 1u
+/*
+ * Upper limit of the hash bits kept in slot values. Tests compile the engine with a small limit to exercise
+ * moves that read the entry's hash (tests/test_slot_bits.c); the default never limits.
+ */
+#ifndef AKV_SLOT_HASH_BITS_MAX
+#define AKV_SLOT_HASH_BITS_MAX 48u
+#endif
 /* Moved old-table buckets returned to the kernel at once: 512 buckets of 128 bytes = 64 KiB. */
 #define RELEASE_BUCKETS 512u
 #define NO_POS UINT64_MAX
@@ -125,7 +134,9 @@ struct shard {
     uint64_t old_nbuckets;
     uint64_t old_mask;
     uint64_t moved;
-    uint8_t *scratch; /* holds an entry while it is reinserted */
+    unsigned pos_bits;  /* bits of a slot value holding arena offset / 8 + 1 */
+    unsigned hash_bits; /* bits above them holding the low bits of the key hash: 48 - pos_bits */
+    uint8_t *scratch;   /* holds an entry while it is reinserted */
     uint64_t scratch_size;
     int reinserting; /* set while scratch is in use: nested evictions must not reinsert */
     uint32_t index;  /* shard number, low bits of CAS versions */
@@ -276,6 +287,17 @@ static inline struct entry_hdr *entry_at(const struct shard *sh, uint64_t phys) 
     return (struct entry_hdr *)(sh->arena + phys);
 }
 
+/* Slot value of the entry at physical offset phys with hash h. */
+static inline uint64_t slot_val(const struct shard *sh, uint64_t phys, uint64_t h) {
+    uint64_t low = sh->hash_bits != 0 ? h & ((1ull << sh->hash_bits) - 1) : 0;
+    return (low << sh->pos_bits) | (phys / 8 + 1);
+}
+
+/* Physical arena offset of the entry referred to by slot i of bucket b. */
+static inline uint64_t slot_phys(const struct shard *sh, const struct bucket *b, unsigned i) {
+    return ((slot_get(b, i) & ((1ull << sh->pos_bits) - 1)) - 1) * 8;
+}
+
 static inline uint8_t *entry_key(struct entry_hdr *e) {
     return (uint8_t *)e + ENTRY_HDR;
 }
@@ -351,7 +373,7 @@ static struct bucket *window_find_pos(struct bucket *tab, uint64_t mask, uint64_
 
 /* Finds the slot referring to the entry at physical offset phys with the given hash; NULL when absent. */
 static struct bucket *find_by_pos(struct shard *sh, uint64_t h, uint64_t phys, unsigned *slot) {
-    uint64_t want = phys / 8 + 1;
+    uint64_t want = slot_val(sh, phys, h);
     struct bucket *b = window_find_pos(sh->buckets, sh->mask, h, want, slot);
     if (b == NULL && old_may_hold(sh, h)) {
         b = window_find_pos(sh->old, sh->old_mask, h, want, slot);
@@ -369,7 +391,7 @@ static struct bucket *window_find_key(const struct shard *sh, struct bucket *tab
         while (m != 0) {
             unsigned i = (unsigned)__builtin_ctz(m);
             m &= m - 1;
-            struct entry_hdr *e = entry_at(sh, (slot_get(b, i) - 1) * 8);
+            struct entry_hdr *e = entry_at(sh, slot_phys(sh, b, i));
             if (e->hash == h && e->klen == klen && memcmp(entry_key(e), key, klen) == 0) {
                 *slot = i;
                 return b;
@@ -395,7 +417,7 @@ static struct entry_hdr *find_live(akv *s, struct shard *sh, uint64_t h, const v
     if (b == NULL) {
         return NULL;
     }
-    struct entry_hdr *e = entry_at(sh, (slot_get(b, *slot) - 1) * 8);
+    struct entry_hdr *e = entry_at(sh, slot_phys(sh, b, *slot));
     if (e->expiry != 0 && e->expiry <= now && !applying) {
         if (s->follower) {
             return NULL; /* hidden; removed by the leader's DEL record or by eviction */
@@ -410,18 +432,25 @@ static struct entry_hdr *find_live(akv *s, struct shard *sh, uint64_t h, const v
     return e;
 }
 
-/* Places (tag, value) into a free slot of the window of h in table tab. Returns 0, or -1 when full. */
-static int window_put(struct bucket *tab, uint64_t mask, uint64_t h, uint64_t value) {
+/*
+ * Places (tag, value) into a free slot of the window of h in table tab; only the bits of h covered by mask
+ * are used. Returns 0, or -1 when full.
+ */
+static int window_put_tag(struct bucket *tab, uint64_t mask, uint64_t h, uint16_t tag, uint64_t value) {
     for (unsigned n = 0; n < WINDOW; n++) {
         struct bucket *b = bucket_in(tab, mask, h, n);
         for (unsigned i = 0; i < SLOTS; i++) {
             if (b->tags[i] == 0) {
-                slot_set(b, i, tag_of(h), value);
+                slot_set(b, i, tag, value);
                 return 0;
             }
         }
     }
     return -1;
+}
+
+static inline int window_put(struct bucket *tab, uint64_t mask, uint64_t h, uint64_t value) {
+    return window_put_tag(tab, mask, h, tag_of(h), value);
 }
 
 static struct bucket *table_alloc(uint64_t nbuckets) {
@@ -445,34 +474,34 @@ static void index_drop_old(struct shard *sh) {
  * at the post-growth load) are dropped from the index. Must not run while the caller still uses a bucket
  * pointer obtained from a lookup: a moved slot changes its bucket.
  *
- * The headers of a bucket's entries are prefetched before its slots are moved, so their cache misses
- * overlap, and the next bucket is prefetched for the following step. Every RELEASE_BUCKETS moved buckets
- * return their pages to the kernel (MADV_DONTNEED): the final munmap then frees little, and lookups that
- * still read a released bucket see zero tags, which is what a moved bucket holds.
+ * When the hash bits stored in the slot values cover the new table's bucket bits, a slot is moved without
+ * reading its entry, so a step touches only the old bucket and its destination buckets. This holds up to
+ * the growth bound for shards of up to 512 MiB (the bound is about one bucket per 576 bytes of arena);
+ * larger shards read each entry's hash once their table outgrows the stored bits. The next old bucket is prefetched for
+ * the following step. Every RELEASE_BUCKETS moved buckets return their pages to the kernel (MADV_DONTNEED):
+ * the final munmap then frees little, and lookups that still read a released bucket see zero tags, which
+ * is what a moved bucket holds.
  */
 static void index_migrate(akv *s, struct shard *sh, uint64_t count) {
+    int from_slot = (sh->mask >> sh->hash_bits) == 0;
     while (sh->old != NULL && count-- > 0) {
         struct bucket *ob = &sh->old[sh->moved];
-        for (unsigned i = 0; i < SLOTS; i++) {
-            if (ob->tags[i] != 0) {
-                __builtin_prefetch(entry_at(sh, (slot_get(ob, i) - 1) * 8), 0, 0);
-            }
-        }
         if (sh->moved + 1 < sh->old_nbuckets) {
             __builtin_prefetch(ob + 1, 1, 0);
             __builtin_prefetch((const char *)(ob + 1) + 64, 1, 0);
         }
         for (unsigned i = 0; i < SLOTS; i++) {
-            if (ob->tags[i] == 0) {
+            uint16_t tag = ob->tags[i];
+            if (tag == 0) {
                 continue;
             }
             uint64_t v = slot_get(ob, i);
-            struct entry_hdr *e = entry_at(sh, (v - 1) * 8);
+            uint64_t h = from_slot ? v >> sh->pos_bits : entry_at(sh, slot_phys(sh, ob, i))->hash;
             ob->tags[i] = 0;
-            if (window_put(sh->buckets, sh->mask, e->hash, v) != 0) {
+            if (window_put_tag(sh->buckets, sh->mask, h, tag, v) != 0) {
                 sh->st.index_evictions++;
                 sh->st.entries--;
-                kill_entry(s, e, AKV_DEL_EVICTED);
+                kill_entry(s, entry_at(sh, slot_phys(sh, ob, i)), AKV_DEL_EVICTED);
             }
         }
         if (++sh->moved == sh->old_nbuckets) {
@@ -544,7 +573,7 @@ static int index_insert(akv *s, struct shard *sh, int no_evict, uint64_t h, uint
         for (unsigned n = 0; n < WINDOW; n++) {
             struct bucket *cand = bucket_at(sh, h, n);
             for (unsigned i = 0; i < SLOTS; i++) {
-                uint64_t p = (slot_get(cand, i) - 1) * 8;
+                uint64_t p = slot_phys(sh, cand, i);
                 uint64_t age = (p + sh->size - sh->tail % sh->size) % sh->size;
                 if (age < best_age) {
                     best_age = age;
@@ -553,7 +582,7 @@ static int index_insert(akv *s, struct shard *sh, int no_evict, uint64_t h, uint
                 }
             }
         }
-        struct entry_hdr *dropped = entry_at(sh, (slot_get(fb, fslot) - 1) * 8);
+        struct entry_hdr *dropped = entry_at(sh, slot_phys(sh, fb, fslot));
         fb->tags[fslot] = 0;
         sh->st.index_evictions++;
         sh->st.entries--;
@@ -639,7 +668,7 @@ static int evict_one(akv *s, struct shard *sh, unsigned *streak, uint64_t now) {
         memcpy(entry_at(sh, np), sh->scratch, total);
         entry_at(sh, np)->flags = 0;
         /* Re-register the entry: the slot may have been cleared by nested evictions, so insert afresh. */
-        if (window_put(sh->buckets, sh->mask, hash, np / 8 + 1) == 0) {
+        if (window_put(sh->buckets, sh->mask, hash, slot_val(sh, np, hash)) == 0) {
             sh->st.reinsertions++;
         } else {
             sh->st.index_evictions++;
@@ -815,12 +844,12 @@ static int warm_rebuild(akv *s, struct shard *sh, const struct warm_shard *ws, i
             }
             e->expiry = now + (uint64_t)left;
         }
-        uint64_t value = phys / 8 + 1;
+        uint64_t value = slot_val(sh, phys, e->hash);
         unsigned slot;
         struct bucket *b = find_key(sh, e->hash, entry_key(e), e->klen, &slot);
         if (b != NULL) {
             /* An older version without the dead mark: the later one in log order is current. */
-            entry_at(sh, (slot_get(b, slot) - 1) * 8)->flags |= ENTRY_DEAD;
+            entry_at(sh, slot_phys(sh, b, slot))->flags |= ENTRY_DEAD;
             slot_set(b, slot, tag_of(e->hash), value);
             continue;
         }
@@ -956,6 +985,11 @@ akv *akv_create(const akv_config *in) {
         sh->nbuckets = nbuckets;
         sh->mask = nbuckets - 1;
         sh->max_buckets = max_buckets;
+        sh->pos_bits = 64u - (unsigned)__builtin_clzll(per_shard / 8 + 1);
+        sh->hash_bits = sh->pos_bits < 48u ? 48u - sh->pos_bits : 0u;
+        if (sh->hash_bits > AKV_SLOT_HASH_BITS_MAX) {
+            sh->hash_bits = AKV_SLOT_HASH_BITS_MAX;
+        }
         uint64_t biggest = entry_total(0xffff, cfg.max_entry);
         sh->scratch_size = biggest < per_shard / 2 ? biggest : per_shard / 2;
         sh->scratch = malloc(sh->scratch_size);
@@ -1046,7 +1080,7 @@ void akv_prefetch_entry(akv *s, const void *key, size_t klen) {
     struct bucket *b = bucket_at(sh, h, 0);
     uint32_t m = akv_match16(b->tags, tag);
     if (m != 0) {
-        __builtin_prefetch(entry_at(sh, (slot_get(b, (unsigned)__builtin_ctz(m)) - 1) * 8), 0, 3);
+        __builtin_prefetch(entry_at(sh, slot_phys(sh, b, (unsigned)__builtin_ctz(m))), 0, 3);
     }
     pthread_mutex_unlock(&sh->lock);
 }
@@ -1114,13 +1148,13 @@ static int store_locked(akv *s, struct shard *sh, uint64_t h, const void *key, s
     if (plen[1] > 0) {
         memcpy(entry_val(e) + plen[0], parts[1], plen[1]);
     }
-    uint64_t pos_value = phys / 8 + 1;
+    uint64_t pos_value = slot_val(sh, phys, h);
     unsigned slot;
     struct bucket *b =
         find_key(sh, h, key, klen, &slot); /* the allocation may have evicted the old version */
     if (b != NULL && slot_get(b, slot) != pos_value) {
         /* Replace: the previous version is now dead log space. */
-        entry_at(sh, (slot_get(b, slot) - 1) * 8)->flags |= ENTRY_DEAD;
+        entry_at(sh, slot_phys(sh, b, slot))->flags |= ENTRY_DEAD;
         slot_set(b, slot, tag_of(h), pos_value);
         sh->st.overwrites++;
     } else if (b == NULL) {

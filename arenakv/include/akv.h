@@ -20,7 +20,7 @@
  *     verifies the key only for tag matches. The index of a shard starts small and doubles when it is
  *     three quarters full or when a key finds no free slot in its window, up to a bound derived from
  *     the shard size. Growth is incremental: the old table is kept and each later store and lookup on
- *     the shard moves a few of its buckets into the new one, so no operation waits for a full rehash.
+ *     the shard moves one of its buckets into the new one, so no operation waits for a full rehash.
  *   - A store of the same total entry size as the existing entry overwrites it in place.
  *   - Eviction follows the log order with a second chance: an entry that was read since it was written (or
  *     since its last reinsertion) is copied to the head once instead of being evicted.

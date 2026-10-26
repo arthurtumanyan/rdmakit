@@ -32,9 +32,11 @@ This document is for people who change or review the code. Usage is in [USAGE.md
   tags.
 - **Index growth**: a shard starts with 16 buckets (2 KiB) unless `avg_entry` presizes it. The index doubles when
   entries exceed 75% of the slots, or when a key finds its window full, up to a bound of one slot per smallest
-  possible entry. Doubling allocates the new table and keeps the old one; every later store and lookup on the shard
-  moves four old buckets into the new table (re-inserting each slot by its stored hash), so no operation waits for a
-  full rehash. While a move is in progress each slot is in exactly one table, lookups examine the new table and then,
+  possible entry. Doubling allocates the new table and keeps the old one; every later store, lookup and index insert on
+  the shard moves one old bucket into the new table, so no operation waits for a full rehash. A move reads no entries:
+  the slot value keeps the low bits of the key hash next to the arena offset, enough to place the slot in the new
+  table (for shards of up to 512 MiB at every table size; larger shards read the entry's hash once their table
+  outgrows the stored bits). While a move is in progress each slot is in exactly one table, lookups examine the new table and then,
   unless the key's old window has already been moved, the old one, and new slots go into the new table. Moved
   old-table pages are returned to the kernel in 64 KiB steps; the old table is freed after its last bucket. A doubling
   that is due before a move has finished completes that move first, so a shard holds at most two tables. Only at the
@@ -84,7 +86,9 @@ All entries start at multiples of 8 bytes in the arena.
 | 40 | k | key |
 | 40 + k | v | value, padded to a multiple of 8 |
 
-Index slot: a 16-bit tag (never 0 for an occupied slot) and a 48-bit value (arena offset / 8 + 1).
+Index slot: a 16-bit tag (never 0 for an occupied slot) and a 48-bit value. Its low bits hold the arena offset / 8 + 1
+(as many bits as the shard size needs); the remaining bits hold the low bits of the key hash. The index is never
+written to disk: a warm restart rebuilds it from the arena.
 
 ## Invariants
 
