@@ -27,6 +27,12 @@
  *
  * Index slot: 16-bit tag (never 0 for an occupied slot) and 48-bit value (arena offset / 8 + 1).
  *
+ * Index growth is incremental: a doubling allocates the new table and keeps the old one; each later store
+ * and lookup moves MIGRATE_STEP buckets of the old table into the new one (index_migrate). While a move
+ * is in progress every slot lives in exactly one of the two tables, lookups examine both, and new slots
+ * go into the new table only. A doubling that is due before the move has finished completes it first,
+ * so at most two tables exist per shard.
+ *
  * Engine clock: milliseconds of CLOCK_MONOTONIC_COARSE since the engine was created, plus 1, so that 0 can
  * mean "no expiry". Expiry is therefore unaffected by changes of the wall clock. The coarse clock is read
  * from the vDSO without the timestamp counter (clock_gettime(2)); its resolution is one scheduler tick
@@ -70,6 +76,18 @@
 #define WINDOW 2u /* buckets examined per lookup */
 #define MAX_REINSERT_STREAK 64u
 #define INITIAL_BUCKETS 16u
+/*
+ * Old-table buckets moved per store or lookup during a move. A doubling to N buckets leaves the table at
+ * 37.5% load, so the next doubling for load is at least 6N new keys away (16 slots x (75% - 37.5%)); four
+ * buckets per operation finish the move after N / 8 operations. A doubling caused by a full window before
+ * that completes the move at once (index_grow). Four buckets rather than one keep the move's accesses to
+ * both tables sequential: filling one shard with 4 million keys from the minimal index took 10% longer in
+ * total with one bucket per operation and less than 1% longer with four than with a rehash in one piece
+ * (i9-12900K, one core).
+ */
+#define MIGRATE_STEP 4u
+/* Moved old-table buckets returned to the kernel at once: 512 buckets of 128 bytes = 64 KiB. */
+#define RELEASE_BUCKETS 512u
 #define NO_POS UINT64_MAX
 
 struct entry_hdr {
@@ -101,7 +119,13 @@ struct shard {
     uint64_t nbuckets;
     uint64_t mask;        /* bucket count - 1 */
     uint64_t max_buckets; /* growth bound */
-    uint8_t *scratch;     /* holds an entry while it is reinserted */
+    /* Previous table while its slots are moved into `buckets` (NULL otherwise); buckets below `moved` are
+     * empty. */
+    struct bucket *old;
+    uint64_t old_nbuckets;
+    uint64_t old_mask;
+    uint64_t moved;
+    uint8_t *scratch; /* holds an entry while it is reinserted */
     uint64_t scratch_size;
     int reinserting; /* set while scratch is in use: nested evictions must not reinsert */
     uint32_t index;  /* shard number, low bits of CAS versions */
@@ -297,12 +321,21 @@ static inline void kill_entry(akv *s, struct entry_hdr *e, enum akv_del_reason r
     emit(s, AKV_CHG_DEL, reason, e);
 }
 
-/* Finds the slot referring to the entry at physical offset phys with the given hash; NULL when absent. */
-static struct bucket *find_by_pos(struct shard *sh, uint64_t h, uint64_t phys, unsigned *slot) {
+/*
+ * Whether the old table may still hold a slot for hash h: a move is in progress and the window of h in the
+ * old table is not entirely below the move position. A window that wraps past the last bucket ends at
+ * index old_nbuckets or beyond, which `moved` reaches only when the move is complete.
+ */
+static inline int old_may_hold(const struct shard *sh, uint64_t h) {
+    return sh->old != NULL && (h & sh->old_mask) + WINDOW > sh->moved;
+}
+
+/* Finds the slot in table tab holding value `want` for hash h; NULL when absent. */
+static struct bucket *window_find_pos(struct bucket *tab, uint64_t mask, uint64_t h, uint64_t want,
+                                      unsigned *slot) {
     uint16_t tag = tag_of(h);
-    uint64_t want = phys / 8 + 1;
     for (unsigned n = 0; n < WINDOW; n++) {
-        struct bucket *b = bucket_at(sh, h, n);
+        struct bucket *b = bucket_in(tab, mask, h, n);
         uint32_t m = akv_match16(b->tags, tag);
         while (m != 0) {
             unsigned i = (unsigned)__builtin_ctz(m);
@@ -316,11 +349,22 @@ static struct bucket *find_by_pos(struct shard *sh, uint64_t h, uint64_t phys, u
     return NULL;
 }
 
-/* Finds the slot of key (hash h); NULL when absent. Expired entries are found too. */
-static struct bucket *find_key(struct shard *sh, uint64_t h, const void *key, size_t klen, unsigned *slot) {
+/* Finds the slot referring to the entry at physical offset phys with the given hash; NULL when absent. */
+static struct bucket *find_by_pos(struct shard *sh, uint64_t h, uint64_t phys, unsigned *slot) {
+    uint64_t want = phys / 8 + 1;
+    struct bucket *b = window_find_pos(sh->buckets, sh->mask, h, want, slot);
+    if (b == NULL && old_may_hold(sh, h)) {
+        b = window_find_pos(sh->old, sh->old_mask, h, want, slot);
+    }
+    return b;
+}
+
+/* Finds the slot of key (hash h) in table tab; NULL when absent. */
+static struct bucket *window_find_key(const struct shard *sh, struct bucket *tab, uint64_t mask, uint64_t h,
+                                      const void *key, size_t klen, unsigned *slot) {
     uint16_t tag = tag_of(h);
     for (unsigned n = 0; n < WINDOW; n++) {
-        struct bucket *b = bucket_at(sh, h, n);
+        struct bucket *b = bucket_in(tab, mask, h, n);
         uint32_t m = akv_match16(b->tags, tag);
         while (m != 0) {
             unsigned i = (unsigned)__builtin_ctz(m);
@@ -333,6 +377,15 @@ static struct bucket *find_key(struct shard *sh, uint64_t h, const void *key, si
         }
     }
     return NULL;
+}
+
+/* Finds the slot of key (hash h) in either table; NULL when absent. Expired entries are found too. */
+static struct bucket *find_key(struct shard *sh, uint64_t h, const void *key, size_t klen, unsigned *slot) {
+    struct bucket *b = window_find_key(sh, sh->buckets, sh->mask, h, key, klen, slot);
+    if (b == NULL && old_may_hold(sh, h)) {
+        b = window_find_key(sh, sh->old, sh->old_mask, h, key, klen, slot);
+    }
+    return b;
 }
 
 /* Finds the entry of key and removes it from the index when it has expired. NULL when absent. */
@@ -378,12 +431,73 @@ static struct bucket *table_alloc(uint64_t nbuckets) {
     return p == MAP_FAILED ? NULL : p;
 }
 
+/* Releases the old table of an unfinished move without moving its slots (flush, failed warm restore). */
+static void index_drop_old(struct shard *sh) {
+    if (sh->old != NULL) {
+        munmap(sh->old, sh->old_nbuckets * sizeof(struct bucket));
+        sh->old = NULL;
+    }
+}
+
 /*
- * Doubles the index of a shard and rehashes every slot. Entries that find no slot in the new table (a
- * window of 32 slots already full, which is rare at the post-growth load) are dropped from the index.
- * Returns 0, or -1 when the bound is reached or memory is exhausted.
+ * Moves up to `count` buckets of the old table into the current one, and releases the old table after its
+ * last bucket. Entries that find no slot in the new table (a window of 32 slots already full, which is rare
+ * at the post-growth load) are dropped from the index. Must not run while the caller still uses a bucket
+ * pointer obtained from a lookup: a moved slot changes its bucket.
+ *
+ * The headers of a bucket's entries are prefetched before its slots are moved, so their cache misses
+ * overlap, and the next bucket is prefetched for the following step. Every RELEASE_BUCKETS moved buckets
+ * return their pages to the kernel (MADV_DONTNEED): the final munmap then frees little, and lookups that
+ * still read a released bucket see zero tags, which is what a moved bucket holds.
+ */
+static void index_migrate(akv *s, struct shard *sh, uint64_t count) {
+    while (sh->old != NULL && count-- > 0) {
+        struct bucket *ob = &sh->old[sh->moved];
+        for (unsigned i = 0; i < SLOTS; i++) {
+            if (ob->tags[i] != 0) {
+                __builtin_prefetch(entry_at(sh, (slot_get(ob, i) - 1) * 8), 0, 0);
+            }
+        }
+        if (sh->moved + 1 < sh->old_nbuckets) {
+            __builtin_prefetch(ob + 1, 1, 0);
+            __builtin_prefetch((const char *)(ob + 1) + 64, 1, 0);
+        }
+        for (unsigned i = 0; i < SLOTS; i++) {
+            if (ob->tags[i] == 0) {
+                continue;
+            }
+            uint64_t v = slot_get(ob, i);
+            struct entry_hdr *e = entry_at(sh, (v - 1) * 8);
+            ob->tags[i] = 0;
+            if (window_put(sh->buckets, sh->mask, e->hash, v) != 0) {
+                sh->st.index_evictions++;
+                sh->st.entries--;
+                kill_entry(s, e, AKV_DEL_EVICTED);
+            }
+        }
+        if (++sh->moved == sh->old_nbuckets) {
+            index_drop_old(sh);
+        } else if (sh->moved % RELEASE_BUCKETS == 0) {
+            madvise(sh->old + (sh->moved - RELEASE_BUCKETS), RELEASE_BUCKETS * sizeof(struct bucket),
+                    MADV_DONTNEED);
+        }
+    }
+}
+
+/* Advances an unfinished move by MIGRATE_STEP buckets; called at the end of stores and lookups. */
+static inline void index_step(akv *s, struct shard *sh) {
+    if (__builtin_expect(sh->old != NULL, 0)) {
+        index_migrate(s, sh, MIGRATE_STEP);
+    }
+}
+
+/*
+ * Doubles the index of a shard: the current table becomes the old table of a move (index_migrate), after
+ * an unfinished earlier move has been completed. Returns 0, or -1 when the bound is reached or memory is
+ * exhausted (the index is then unchanged apart from the completed move).
  */
 static int index_grow(akv *s, struct shard *sh) {
+    index_migrate(s, sh, UINT64_MAX);
     uint64_t n = sh->nbuckets * 2;
     if (n > sh->max_buckets) {
         return -1;
@@ -392,27 +506,14 @@ static int index_grow(akv *s, struct shard *sh) {
     if (tab == NULL) {
         return -1;
     }
-    uint64_t mask = n - 1;
-    for (uint64_t b = 0; b < sh->nbuckets; b++) {
-        struct bucket *ob = &sh->buckets[b];
-        for (unsigned i = 0; i < SLOTS; i++) {
-            if (ob->tags[i] == 0) {
-                continue;
-            }
-            uint64_t v = slot_get(ob, i);
-            struct entry_hdr *e = entry_at(sh, (v - 1) * 8);
-            if (window_put(tab, mask, e->hash, v) != 0) {
-                sh->st.index_evictions++;
-                sh->st.entries--;
-                kill_entry(s, e, AKV_DEL_EVICTED);
-            }
-        }
-    }
-    munmap(sh->buckets, sh->nbuckets * sizeof(struct bucket));
+    sh->old = sh->buckets;
+    sh->old_nbuckets = sh->nbuckets;
+    sh->old_mask = sh->mask;
+    sh->moved = 0;
     /* Atomic stores: akv_prefetch() reads both without the lock. */
     __atomic_store_n(&sh->buckets, tab, __ATOMIC_RELAXED);
     sh->nbuckets = n;
-    __atomic_store_n(&sh->mask, mask, __ATOMIC_RELAXED);
+    __atomic_store_n(&sh->mask, n - 1, __ATOMIC_RELAXED);
     sh->st.index_grows++;
     return 0;
 }
@@ -420,9 +521,12 @@ static int index_grow(akv *s, struct shard *sh) {
 /*
  * Inserts a new index slot for an entry. Grows the index at 75% load or when the window is full; at the
  * growth bound a full window drops its oldest live entry (in log order), unless eviction is disabled.
- * Returns 0, or -ENOMEM (no_evict and no slot).
+ * Every insert advances an unfinished move, so a move ends within N / 8 inserts of its doubling while the
+ * new table is still near 37.5% load, also where no lookups or stores run in between (warm restart
+ * rebuild). Returns 0, or -ENOMEM (no_evict and no slot).
  */
 static int index_insert(akv *s, struct shard *sh, int no_evict, uint64_t h, uint64_t value) {
+    index_step(s, sh);
     if (sh->st.entries + 1 > sh->nbuckets * SLOTS * 3 / 4) {
         index_grow(s, sh);
     }
@@ -583,6 +687,7 @@ static void shard_destroy(const akv *s, struct shard *sh) {
     if (sh->buckets != NULL) {
         munmap(sh->buckets, sh->nbuckets * sizeof(struct bucket));
     }
+    index_drop_old(sh);
     free(sh->scratch);
     pthread_mutex_destroy(&sh->lock);
 }
@@ -750,6 +855,7 @@ static void warm_restore(akv *s) {
             struct shard *sh = &s->shards[i];
             madvise(sh->arena, sh->size, MADV_REMOVE);
             memset(sh->buckets, 0, sh->nbuckets * sizeof(struct bucket));
+            index_drop_old(sh);
             sh->head = 0;
             sh->tail = 0;
             sh->st.entries = 0;
@@ -912,7 +1018,8 @@ static inline struct shard *shard_of(akv *s, uint64_t h) {
  * Prefetches the first index bucket of the key (both cache lines of the 128-byte bucket). Reads the table
  * pointer and mask without the lock: during a concurrent index growth they may belong to different
  * tables, and the address may then lie outside the current table. A prefetch of any address neither
- * faults nor changes memory (Intel SDM vol. 2, PREFETCHh), so the hint is harmless.
+ * faults nor changes memory (Intel SDM vol. 2, PREFETCHh), so the hint is harmless. During a move a key
+ * may still be in the old table, which is not prefetched.
  */
 void akv_prefetch(akv *s, const void *key, size_t klen) {
     uint64_t h = akv_hash64(key, klen, s->seed);
@@ -927,7 +1034,7 @@ void akv_prefetch(akv *s, const void *key, size_t klen) {
 /*
  * Second prefetch stage: finds the entry of the key under the shard lock (trylock: a contended shard is
  * skipped) and prefetches its header and key. Called after akv_prefetch() for every key of a group, when
- * the buckets are expected to be in the cache.
+ * the buckets are expected to be in the cache. Examines the first bucket of the current table only.
  */
 void akv_prefetch_entry(akv *s, const void *key, size_t klen) {
     uint64_t h = akv_hash64(key, klen, s->seed);
@@ -1125,6 +1232,7 @@ int akv_store(akv *s, const void *key, size_t klen, const void *val, size_t vlen
         }
     }
     rc = store_locked(s, sh, h, key, klen, old, parts, plen, uflags, expiry, now, cas_out);
+    index_step(s, sh);
     sh_unlock(s, sh);
     free(tmp);
     return rc;
@@ -1179,6 +1287,7 @@ int akv_get_meta(akv *s, const void *key, size_t klen, void *buf, size_t cap, si
             kill_entry(s, e, AKV_DEL_CLIENT);
         }
     }
+    index_step(s, sh);
     sh_unlock(s, sh);
     return rc;
 }
@@ -1340,6 +1449,7 @@ int akv_incr(akv *s, const void *key, size_t klen, int64_t delta, enum akv_incr_
         uint32_t uflags = e != NULL ? e->uflags : 0;
         uint64_t expiry = e != NULL ? e->expiry : 0;
         rc = store_locked(s, sh, h, key, klen, e, parts, plen, uflags, expiry, now, cas_out);
+        index_step(s, sh);
     }
     sh_unlock(s, sh);
     return rc;
@@ -1358,6 +1468,7 @@ void akv_flush(akv *s) {
         /* Private anonymous memory reads back as zero after MADV_DONTNEED; shared file pages need MADV_REMOVE. */
         madvise(sh->arena, sh->size, s->shm_fd >= 0 ? MADV_REMOVE : MADV_DONTNEED);
         madvise(sh->buckets, sh->nbuckets * sizeof(struct bucket), MADV_DONTNEED);
+        index_drop_old(sh);
         sh->head = 0;
         sh->tail = 0;
         sh->st.entries = 0;
@@ -1448,6 +1559,9 @@ void akv_stats_get(akv *s, akv_stats *out) {
         out->rejected += sh->st.rejected;
         out->expired += sh->st.expired;
         out->index_bytes += sh->nbuckets * sizeof(struct bucket);
+        if (sh->old != NULL) {
+            out->index_bytes += sh->old_nbuckets * sizeof(struct bucket);
+        }
         out->index_grows += sh->st.index_grows;
         sh_unlock(s, sh);
     }

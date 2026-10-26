@@ -7,7 +7,8 @@
  * - arena wrap-around with small gaps (tiny shard arena, entry sizes that leave 8 and 16 byte gaps)
  * - second chance: a frequently read entry survives while unread neighbors are evicted
  * - multi-threaded stress with self-describing values (run under ThreadSanitizer as well)
- * - index growth from the minimal size without losing entries; the same model with a growing index
+ * - index growth from the minimal size without losing entries; the same model with a growing index;
+ *   lookups of every key while a doubling is still moving slots, and release of the old table
  * - store modes (add, replace, append, prepend, CAS), client flags and CAS versions
  * - expiry: time to live, touch, persist, keep-ttl, get-and-touch, reclamation counters
  * - increments in memcached (unsigned, wrapping, floor at 0) and RESP (signed, overflow) semantics
@@ -397,6 +398,64 @@ static void test_growth(void) {
     akv_destroy(s);
 }
 
+/*
+ * Incremental growth: right after a doubling the old table is still held (index memory is three times the
+ * size before the doubling) and every key stored so far is found while its slot may be in either table;
+ * lookups then finish the move and release the old table.
+ */
+static void test_incremental_growth(void) {
+    akv_config cfg;
+    akv_config_default(&cfg);
+    cfg.capacity = 64 << 20;
+    cfg.shards = 1;
+    cfg.hash_seed = 7;
+    akv *s = akv_create(&cfg);
+    enum { N = 100000 };
+    char key[32];
+    size_t klen;
+    unsigned char val[32] = {0};
+    unsigned char out[32];
+    size_t n;
+    akv_stats prev;
+    akv_stats_get(s, &prev);
+    unsigned checks = 0;
+    for (unsigned i = 0; i < N; i++) {
+        key_of(i, key, &klen);
+        EXPECT(akv_put(s, key, klen, val, sizeof(val)) == 0, "incremental put %u", i);
+        akv_stats st;
+        akv_stats_get(s, &st);
+        if (st.index_grows != prev.index_grows) {
+            EXPECT(st.index_grows == prev.index_grows + 1, "one doubling per put");
+            EXPECT(st.index_bytes == 3 * prev.index_bytes, "index %llu bytes after doubling %llu bytes",
+                   (unsigned long long)st.index_bytes, (unsigned long long)prev.index_bytes);
+            unsigned missing = 0;
+            for (unsigned j = 0; j <= i; j++) {
+                key_of(j, key, &klen);
+                missing += !akv_exists(s, key, klen); /* akv_exists does not advance the move */
+            }
+            EXPECT(missing == 0, "%u of %u keys missing during the move after doubling %llu", missing, i + 1,
+                   (unsigned long long)st.index_grows);
+            checks++;
+        }
+        prev = st;
+    }
+    for (unsigned i = 0; i < N; i++) {
+        key_of(i, key, &klen);
+        EXPECT(akv_get(s, key, klen, out, sizeof(out), &n) == 0, "incremental get %u", i);
+    }
+    akv_stats st;
+    akv_stats_get(s, &st);
+    uint64_t buckets = st.index_bytes / 128;
+    EXPECT((buckets & (buckets - 1)) == 0, "old table still held after %u lookups (%llu buckets)", N,
+           (unsigned long long)buckets);
+    EXPECT(st.entries == N && st.index_evictions == 0, "entries %llu, index evictions %llu",
+           (unsigned long long)st.entries, (unsigned long long)st.index_evictions);
+    EXPECT(checks > 5, "only %u doublings observed", checks);
+    printf("incremental growth: %u doublings checked mid-move, index %llu KiB\n", checks,
+           (unsigned long long)(st.index_bytes >> 10));
+    akv_destroy(s);
+}
+
 /* akv_prefetch() runs without the lock while another thread grows the index (checked under TSan). */
 struct prefetch_arg {
     akv *s;
@@ -726,6 +785,7 @@ int main(void) {
     test_inplace();
     test_threads();
     test_growth();
+    test_incremental_growth();
     test_prefetch();
     test_modes();
     test_ttl();

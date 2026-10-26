@@ -32,9 +32,13 @@ This document is for people who change or review the code. Usage is in [USAGE.md
   tags.
 - **Index growth**: a shard starts with 16 buckets (2 KiB) unless `avg_entry` presizes it. The index doubles when
   entries exceed 75% of the slots, or when a key finds its window full, up to a bound of one slot per smallest
-  possible entry. Doubling allocates the new table, re-inserts every slot by its stored hash and frees the old table,
-  all under the shard lock (the shard is unavailable during the rehash). Only at the bound does a full window drop its
-  oldest live entry (an index eviction).
+  possible entry. Doubling allocates the new table and keeps the old one; every later store and lookup on the shard
+  moves four old buckets into the new table (re-inserting each slot by its stored hash), so no operation waits for a
+  full rehash. While a move is in progress each slot is in exactly one table, lookups examine the new table and then,
+  unless the key's old window has already been moved, the old one, and new slots go into the new table. Moved
+  old-table pages are returned to the kernel in 64 KiB steps; the old table is freed after its last bucket. A doubling
+  that is due before a move has finished completes that move first, so a shard holds at most two tables. Only at the
+  bound does a full window drop its oldest live entry (an index eviction).
 - **Store modes** (`akv_store`): SET, ADD, REPLACE, APPEND, PREPEND, CAS, with client flags and a time to live.
   APPEND and PREPEND copy the old value first, because allocating the new version may evict or move the old one.
 - **Overwrite**: an entry of equal total size is overwritten in place (value, flags, CAS, expiry); otherwise the new
@@ -92,7 +96,8 @@ Index slot: a 16-bit tag (never 0 for an occupied slot) and a 48-bit value (aren
    reinsert (it would overwrite the scratch buffer).
 4. The entry counter equals the number of occupied index slots (tests compare it with a reference model), including
    expired entries not yet reclaimed.
-5. Index growth re-inserts every occupied slot; a rehash never changes which entry a key refers to.
+5. Index growth re-inserts every occupied slot of the old table exactly once and clears it there; a slot is never in
+   both tables, and a move never changes which entry a key refers to.
 
 ## Server
 
@@ -157,4 +162,3 @@ engine and server tests under ThreadSanitizer (`make TSAN=1 test`).
 - memcached binary protocol.
 - Zero-copy GET from the registered arena and a one-sided GET path (the transport provides the operations; the
   engine's entry layout and locking would have to support remote readers).
-- Incremental index rehashing (growth pauses one shard for the duration of its rehash).
