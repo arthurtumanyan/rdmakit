@@ -101,7 +101,7 @@ struct conn {
     struct worker *w;
     struct conn *prev;
     struct conn *next;
-    uint64_t last_active; /* seconds of CLOCK_MONOTONIC_COARSE */
+    uint64_t last_active; /* milliseconds of CLOCK_MONOTONIC_COARSE */
     struct session ss;
     /* native */
     duct_ep *ep;
@@ -773,6 +773,17 @@ static uint64_t mono_s(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
     return (uint64_t)ts.tv_sec;
+}
+
+/*
+ * Milliseconds of CLOCK_MONOTONIC_COARSE (resolution one scheduler tick). Connection activity is kept in
+ * milliseconds: with whole seconds, a connection active just before a second boundary would count as idle
+ * for a full second a few milliseconds later.
+ */
+static uint64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
 /* ---- pub/sub ------------------------------------------------------------------------------------------ */
@@ -1708,7 +1719,7 @@ static int native_serve(struct worker *w, struct conn *c) {
                             return -1;
                         }
                     }
-                    c->last_active = mono_s();
+                    c->last_active = mono_ms();
                     park(w, c, hold);
                     return 0;
                 }
@@ -1723,7 +1734,7 @@ static int native_serve(struct worker *w, struct conn *c) {
             }
         }
         if (handled > 0) {
-            c->last_active = mono_s(); /* once per turn, not per request */
+            c->last_active = mono_ms(); /* once per turn, not per request */
         }
         if (handled == BURST) {
             return 1;
@@ -1892,7 +1903,7 @@ static int text_serve(struct worker *w, struct conn *c) {
         }
         if (r > 0) {
             ob_commit(&c->in, (size_t)r);
-            c->last_active = mono_s();
+            c->last_active = mono_ms();
         }
         size_t avail = c->in.len - c->in.off;
         if (avail > 0) {
@@ -2005,7 +2016,7 @@ static void adopt(struct worker *w) {
         c->w = w;
         c->ss.conn = c;
         c->ss.worker = w->index;
-        c->last_active = mono_s();
+        c->last_active = mono_ms();
         if (c->kind == CK_NATIVE) {
             c->fd = duct_ep_direct_fd(c->ep);
         }
@@ -2024,11 +2035,11 @@ static void close_idle(struct worker *w) {
     if (limit == 0) {
         return;
     }
-    uint64_t now = mono_s();
+    uint64_t now = mono_ms();
     struct conn *c = w->conns;
     while (c != NULL) {
         struct conn *next = c->next;
-        if (now - c->last_active >= limit && !c->in_ready) {
+        if (now - c->last_active >= (uint64_t)limit * 1000 && !c->in_ready) {
             akvd_log(w->d, AKVD_LOG_DEBUG, "closing idle connection %llu", (unsigned long long)c->ss.id);
             conn_free(c);
         }

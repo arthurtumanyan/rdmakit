@@ -95,7 +95,8 @@ Each instance needs its own ports, snapshot file and log file. Bind them to sepa
   a connection are executed in order and may be pipelined.
 - `--max-conns N` closes connections above the limit right after accepting them (counted as `rejected_connections`).
   The process also needs a file descriptor per connection (`LimitNOFILE`, `ulimit -n`).
-- `--idle-timeout SECONDS` closes connections without traffic, which frees the buffers of abandoned clients.
+- `--idle-timeout SECONDS` closes connections without traffic, which frees the buffers of abandoned clients. A
+  connection is closed between SECONDS and SECONDS + 1 after its last request (each worker checks once per second).
 - RDMA: `--wait event` (default) sleeps on completion events; `--wait poll` spins and only pays off with a core per
   connection.
 

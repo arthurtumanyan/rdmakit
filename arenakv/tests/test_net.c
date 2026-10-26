@@ -6,7 +6,7 @@
  *     of 64 MiB that the client reads only after sending everything (backpressure), 16 concurrent
  *     clients with self-describing values
  *   - request counters kept per worker: stats and INFO report the sums over all workers
- *   - connection limit and idle timeout
+ *   - connection limit and idle timeout, including activity just before a second boundary
  *   - snapshot: save at stop, load at start with flags and expiry, corrupt and truncated files refused,
  *     BGSAVE and LASTSAVE
  *   - TLS (build with TLS=1): RESP over TLS with a certificate that the test creates
@@ -311,6 +311,45 @@ static void test_limits(void) {
     sleep_ms(2500);
     send_all(a, "PING\r\n", 6);
     EXPECT(recv_upto(a, buf, sizeof(buf), 2000) == 0, "idle connection closed");
+    close(a);
+    close(b);
+    akvd_stop(d);
+}
+
+/*
+ * A connection active just before a second boundary of the server's clock is not idle right after it. One
+ * worker serves a and b; a sends a request shortly before a boundary, b one shortly after it, which wakes
+ * the worker and runs its idle scan; a's next request must still be answered.
+ */
+static void test_idle_boundary(void) {
+    akvd_config cfg;
+    base_config(&cfg);
+    cfg.threads = 1;
+    cfg.idle_timeout_s = 1;
+    cfg.port = NULL;
+    akvd *d = akvd_start(&cfg, NULL);
+    EXPECT(d != NULL, "idle boundary server");
+    if (d == NULL) {
+        return;
+    }
+    int a = tcp_connect(akvd_resp_port(d));
+    int b = tcp_connect(akvd_resp_port(d));
+    for (int i = 0; i < 3; i++) {
+        struct timespec ts;
+        do {
+            sleep_ms(5);
+            clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+        } while (ts.tv_nsec < 900000000L);
+        exchange(a, "PING\r\n", "+PONG\r\n", "request before a second boundary");
+        exchange(b, "PING\r\n", "+PONG\r\n", "other connection before the boundary");
+        do {
+            sleep_ms(5);
+            clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+        } while (ts.tv_nsec >= 900000000L);
+        sleep_ms(50);
+        exchange(b, "PING\r\n", "+PONG\r\n", "other connection after the boundary");
+        exchange(a, "PING\r\n", "+PONG\r\n", "request after the boundary within the idle timeout");
+    }
     close(a);
     close(b);
     akvd_stop(d);
@@ -1002,6 +1041,7 @@ int main(void) {
     }
     test_counters();
     test_limits();
+    test_idle_boundary();
     test_snapshot();
     test_native_auth();
     test_pool();
