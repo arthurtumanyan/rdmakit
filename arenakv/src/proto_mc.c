@@ -306,7 +306,9 @@ static void cmd_stats(akvd *d, const struct tok *t, int nt, struct obuf *out) {
     }
     akv_stats st;
     akv_stats_get(akvd_store(d), &st);
-    struct srv_counters *c = akvd_counters(d);
+    struct srv_counters sum;
+    akvd_counters_sum(d, &sum);
+    const struct srv_counters *c = &sum;
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
 #define LD(f) ((unsigned long long)__atomic_load_n(&c->f, __ATOMIC_RELAXED))

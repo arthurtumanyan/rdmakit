@@ -5,6 +5,7 @@
  *   - memcached and RESP over TCP: 2000 pipelined commands in one write, values up to 512 KiB, replies
  *     of 64 MiB that the client reads only after sending everything (backpressure), 16 concurrent
  *     clients with self-describing values
+ *   - request counters kept per worker: stats and INFO report the sums over all workers
  *   - connection limit and idle timeout
  *   - snapshot: save at stop, load at start with flags and expiry, corrupt and truncated files refused,
  *     BGSAVE and LASTSAVE
@@ -917,6 +918,75 @@ static void test_native_tls(void) {
 }
 #endif
 
+/* Value of "STAT <name> <n>" in a memcached stats reply, or -1. */
+static long long stat_value(const char *reply, const char *name) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "STAT %s ", name);
+    const char *p = strstr(reply, pat);
+    return p != NULL ? strtoll(p + strlen(pat), NULL, 10) : -1;
+}
+
+/*
+ * Request counters are kept per worker thread: 8 connections spread over 4 workers each send 50 hits and
+ * 50 misses; the memcached stats and the RESP INFO reply must report the sums of all workers.
+ */
+static void test_counters(void) {
+    akvd_config cfg;
+    base_config(&cfg);
+    cfg.threads = 4;
+    akvd *d = akvd_start(&cfg, NULL);
+    EXPECT(d != NULL, "counter server");
+    if (d == NULL) {
+        return;
+    }
+    enum { CONNS = 8, EACH = 50 };
+    int fd0 = tcp_connect(akvd_memcached_port(d));
+    exchange(fd0, "set c-hit 0 0 1\r\nv\r\n", "STORED\r\n", "counter set");
+    int fds[CONNS];
+    static char req[CONNS * EACH * 32];
+    size_t rl = 0;
+    for (int i = 0; i < EACH; i++) {
+        rl += (size_t)snprintf(req + rl, sizeof(req) - rl, "get c-hit\r\nget c-miss\r\n");
+    }
+    for (int c = 0; c < CONNS; c++) {
+        fds[c] = tcp_connect(akvd_memcached_port(d));
+        EXPECT(fds[c] >= 0 && send_all(fds[c], req, rl) == 0, "counter connection %d", c);
+    }
+    static char buf[1 << 16];
+    for (int c = 0; c < CONNS; c++) {
+        size_t want = (size_t)EACH * (strlen("VALUE c-hit 0 1\r\nv\r\nEND\r\n") + strlen("END\r\n"));
+        EXPECT(recv_all(fds[c], buf, want) == 0, "counter replies %d", c);
+        close(fds[c]);
+    }
+    char stats[4096];
+    size_t n = 0;
+    EXPECT(send_all(fd0, "stats\r\n", 7) == 0, "stats request");
+    while (n < sizeof(stats) - 1 && (n < 5 || memcmp(stats + n - 5, "END\r\n", 5) != 0)) {
+        size_t r = recv_upto(fd0, stats + n, 1, 5000);
+        if (r == 0) {
+            break;
+        }
+        n += r;
+    }
+    stats[n] = '\0';
+    long long gets = (long long)CONNS * EACH * 2;
+    EXPECT(stat_value(stats, "cmd_get") == gets && stat_value(stats, "get_hits") == gets / 2 &&
+               stat_value(stats, "get_misses") == gets / 2,
+           "stats over 4 workers: cmd_get %lld get_hits %lld get_misses %lld, want %lld/%lld/%lld",
+           stat_value(stats, "cmd_get"), stat_value(stats, "get_hits"), stat_value(stats, "get_misses"), gets,
+           gets / 2, gets / 2);
+    close(fd0);
+    int rf = tcp_connect(akvd_resp_port(d));
+    char info[8192];
+    EXPECT(send_all(rf, "INFO\r\n", 6) == 0, "info request");
+    size_t in = recv_upto(rf, info, sizeof(info) - 1, 300);
+    info[in] = '\0';
+    const char *h = strstr(info, "keyspace_hits:");
+    EXPECT(h != NULL && strtoll(h + 14, NULL, 10) == gets / 2, "INFO keyspace_hits: %.40s", h ? h : "absent");
+    close(rf);
+    akvd_stop(d);
+}
+
 int main(void) {
     akvd_config cfg;
     base_config(&cfg);
@@ -930,6 +1000,7 @@ int main(void) {
         test_native_batches(d);
         akvd_stop(d);
     }
+    test_counters();
     test_limits();
     test_snapshot();
     test_native_auth();

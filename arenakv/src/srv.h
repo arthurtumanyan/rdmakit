@@ -93,6 +93,12 @@ struct session {
 void resp_session_free(struct session *ss);
 
 /* Server statistics updated by all threads. */
+/*
+ * Server counters. The request counters (cmd_* to auth_failures) are kept per worker thread: a worker adds
+ * to its own block without a locked instruction, other threads add to the server's shared block
+ * atomically, and readers sum all blocks (akvd_counters_sum). The connection counters are only kept in the
+ * shared block.
+ */
 struct srv_counters {
     unsigned long long cmd_get;
     unsigned long long cmd_set;
@@ -107,10 +113,30 @@ struct srv_counters {
     unsigned curr_connections;
 };
 
-/* Counter update (relaxed atomic add). */
-#define SRV_COUNT(d, field, n) __atomic_fetch_add(&akvd_counters(d)->field, (n), __ATOMIC_RELAXED)
+/* Counter block of the calling worker thread and its server; NULL on other threads. */
+extern __thread struct srv_counters *tl_counters;
+extern __thread const akvd *tl_counters_owner;
 
+/*
+ * Request counter update: a plain relaxed load and store on the calling worker's own block (one writer),
+ * a relaxed atomic add on the shared block from any other thread.
+ */
+#define SRV_COUNT(d, field, n)                                                                               \
+    do {                                                                                                     \
+        struct srv_counters *srv_c_ = tl_counters;                                                           \
+        if (__builtin_expect(srv_c_ != NULL && tl_counters_owner == (d), 1)) {                               \
+            __atomic_store_n(&srv_c_->field, __atomic_load_n(&srv_c_->field, __ATOMIC_RELAXED) + (n),        \
+                             __ATOMIC_RELAXED);                                                              \
+        } else {                                                                                             \
+            __atomic_fetch_add(&akvd_counters(d)->field, (n), __ATOMIC_RELAXED);                             \
+        }                                                                                                    \
+    } while (0)
+
+/* The shared counter block (connection counters, and request counters of threads that are not workers). */
 struct srv_counters *akvd_counters(akvd *d);
+
+/* Sums the request counters of all blocks into out and copies the connection counters. */
+void akvd_counters_sum(akvd *d, struct srv_counters *out);
 
 /* Returns 1 when access control is configured (an ACL file or a credentials file). */
 int akvd_acl_enabled(const akvd *d);

@@ -125,6 +125,9 @@ Threads (`src/server.c`):
   raises no descriptor event (messages already received by rdmaduct, complete commands in its buffer, TLS-buffered
   input) goes on the worker's ready list and is served in the next iteration, which polls epoll without waiting. A
   connection closed while on the ready list is released when the list is processed.
+- **counters**: each worker counts the requests it serves (commands, gets, hits, misses, stores) in its own block on
+  separate cache lines, without locked instructions; `stats`, `INFO` and native `STATS` report the sums over all
+  workers. Connection counters are shared.
 - **saver**: periodic snapshots; `BGSAVE` runs on its own thread; a mutex serializes snapshots.
 
 Protocol modules (`proto_mc.c`, `proto_resp.c`) are functions over byte buffers: `*_execute(server, session,

@@ -151,6 +151,9 @@ struct worker {
     size_t nwaits;
     size_t waits_cap;
     atomic_int has_waits;
+    /* request counters of this worker (SRV_COUNT); on their own cache lines, written by this thread only */
+    _Alignas(64) struct srv_counters counters;
+    char counters_pad[64];
 };
 
 struct akvd {
@@ -323,8 +326,36 @@ void ob_free(struct obuf *b) {
 
 /* ---- small accessors used by the protocol modules ----------------------------------------------------- */
 
+__thread struct srv_counters *tl_counters;
+__thread const akvd *tl_counters_owner;
+
 struct srv_counters *akvd_counters(akvd *d) {
     return &d->counters;
+}
+
+void akvd_counters_sum(akvd *d, struct srv_counters *out) {
+#define LD(c, f) __atomic_load_n(&(c)->f, __ATOMIC_RELAXED)
+#define ADD_ALL(c)                                                                                           \
+    do {                                                                                                     \
+        out->cmd_get += LD(c, cmd_get);                                                                      \
+        out->cmd_set += LD(c, cmd_set);                                                                      \
+        out->cmd_touch += LD(c, cmd_touch);                                                                  \
+        out->cmd_flush += LD(c, cmd_flush);                                                                  \
+        out->get_hits += LD(c, get_hits);                                                                    \
+        out->get_misses += LD(c, get_misses);                                                                \
+        out->commands += LD(c, commands);                                                                    \
+        out->auth_failures += LD(c, auth_failures);                                                          \
+    } while (0)
+    memset(out, 0, sizeof(*out));
+    ADD_ALL(&d->counters);
+    for (unsigned i = 0; i < d->nworkers; i++) {
+        ADD_ALL(&d->workers[i].counters);
+    }
+    out->total_connections = LD(&d->counters, total_connections);
+    out->rejected_connections = LD(&d->counters, rejected_connections);
+    out->curr_connections = LD(&d->counters, curr_connections);
+#undef ADD_ALL
+#undef LD
 }
 
 int akvd_acl_enabled(const akvd *d) {
@@ -1320,6 +1351,8 @@ size_t akvd_native_execute(akvd *d, struct session *ss, const uint8_t *msg, size
             }
             akv_stats st;
             akv_stats_get(s, &st);
+            struct srv_counters sum;
+            akvd_counters_sum(d, &sum);
             const uint64_t f[AKVP_STATS_FIELDS] = {
                 st.entries,
                 st.arena_bytes,
@@ -1336,9 +1369,9 @@ size_t akvd_native_execute(akvd *d, struct session *ss, const uint8_t *msg, size
                 st.expired,
                 st.index_bytes,
                 st.index_grows,
-                __atomic_load_n(&d->counters.curr_connections, __ATOMIC_RELAXED),
-                __atomic_load_n(&d->counters.total_connections, __ATOMIC_RELAXED),
-                __atomic_load_n(&d->counters.commands, __ATOMIC_RELAXED),
+                sum.curr_connections,
+                sum.total_connections,
+                sum.commands,
                 akvd_uptime(d),
             };
             for (unsigned i = 0; i < AKVP_STATS_FIELDS; i++) {
@@ -2006,6 +2039,8 @@ static void close_idle(struct worker *w) {
 static void *worker_main(void *arg) {
     struct worker *w = arg;
     akvd *d = w->d;
+    tl_counters = &w->counters;
+    tl_counters_owner = d;
     struct epoll_event evs[128];
     uint64_t last_scan = mono_s();
     while (!atomic_load(&d->stopping)) {

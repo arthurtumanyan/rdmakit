@@ -431,7 +431,9 @@ static void cmd_keys(akvd *d, const struct arg *pattern, int scan, struct obuf *
 static void cmd_info(akvd *d, struct obuf *o) {
     akv_stats st;
     akv_stats_get(akvd_store(d), &st);
-    struct srv_counters *c = akvd_counters(d);
+    struct srv_counters sum;
+    akvd_counters_sum(d, &sum);
+    const struct srv_counters *c = &sum;
     struct obuf b = {0};
     struct obuf repl = {0};
     ob_printf(&repl, "# Cluster\r\ncluster_enabled:%d\r\n\r\n", akvd_cluster(d) != NULL);
