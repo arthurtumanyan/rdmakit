@@ -175,12 +175,17 @@ static void cmd_get(akvd *d, const struct tok *t, int nt, int with_cas, int touc
             continue;
         }
         SRV_COUNT(d, get_hits, 1);
+        ob_add(out, "VALUE ", 6);
+        ob_add(out, t[i].p, t[i].n);
+        ob_add(out, " ", 1);
+        ob_add_u64(out, m.flags);
+        ob_add(out, " ", 1);
+        ob_add_u64(out, vlen);
         if (with_cas) {
-            ob_printf(out, "VALUE %.*s %u %zu %llu\r\n", (int)t[i].n, t[i].p, m.flags, vlen,
-                      (unsigned long long)m.cas);
-        } else {
-            ob_printf(out, "VALUE %.*s %u %zu\r\n", (int)t[i].n, t[i].p, m.flags, vlen);
+            ob_add(out, " ", 1);
+            ob_add_u64(out, m.cas);
         }
+        ob_add(out, "\r\n", 2);
         ob_add(out, val, vlen);
         ob_add(out, "\r\n", 2);
     }
@@ -457,7 +462,8 @@ static void cmd_mg(akvd *d, const struct tok *t, int nt, struct obuf *out) {
     }
     SRV_COUNT(d, get_hits, 1);
     if (r.want_value) {
-        ob_printf(out, "VA %zu", vlen);
+        ob_add(out, "VA ", 3);
+        ob_add_u64(out, vlen);
         meta_flags(out, &r, &t[1], &m, vlen);
         ob_add(out, "\r\n", 2);
         ob_add(out, val, vlen);

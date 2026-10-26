@@ -194,6 +194,27 @@ static void test_resp(akvd *d) {
     free(run(d, r, "INCR a\r\nINCRBY a 10\r\nDECR a\r\nDECRBY a -3\r\nINCR fresh\r\n",
              ":2\r\n:12\r\n:11\r\n:14\r\n:1\r\n", 1));
     run2(d, r, "INCR k\r\n", "-ERR value is not an integer or out of range\r\n");
+    /* negative integers and the most negative one through the integer reply writer */
+    free(run(d, r, "SET m -9223372036854775807\r\nDECR m\r\nSET z 0\r\nDECRBY z 5\r\n",
+             "+OK\r\n:-9223372036854775808\r\n+OK\r\n:-5\r\n", 1));
+    /* a pipelined batch longer than the prefetch group, with keys prefetched for GET, SET, MGET and DEL
+     * and commands without keys in between; fed whole and byte by byte (incomplete commands are skipped
+     * by the prefetch scan and parsed once complete) */
+    free(run(d, r,
+             "*3\r\n$3\r\nSET\r\n$2\r\np1\r\n$1\r\na\r\n*3\r\n$3\r\nset\r\n$2\r\np2\r\n$2\r\nbb\r\n"
+             "*1\r\n$4\r\nPING\r\n*2\r\n$3\r\nGET\r\n$2\r\np1\r\n*4\r\n$4\r\nMGET\r\n$2\r\np1\r\n$2\r\np2\r\n"
+             "$2\r\np3\r\n*2\r\n$3\r\nDEL\r\n$2\r\np1\r\n*2\r\n$3\r\nGET\r\n$2\r\np1\r\n*2\r\n$3\r\nget\r\n"
+             "$2\r\np2\r\n*2\r\n$6\r\nSTRLEN\r\n$2\r\np2\r\n*2\r\n$3\r\nGET\r\n$0\r\n\r\n",
+             "+OK\r\n+OK\r\n+PONG\r\n$1\r\na\r\n*3\r\n$1\r\na\r\n$2\r\nbb\r\n$-1\r\n:1\r\n$-1\r\n$"
+             "2\r\nbb\r\n:2\r\n"
+             "$-1\r\n",
+             1));
+    run2(d, r,
+         "*2\r\n$3\r\nGET\r\n$2\r\np2\r\n*2\r\n$3\r\nGET\r\n$2\r\np2\r\n*2\r\n$3\r\nGET\r\n$2\r\np2\r\n"
+         "*2\r\n$3\r\nGET\r\n$2\r\np2\r\n*2\r\n$3\r\nGET\r\n$2\r\np2\r\n*2\r\n$3\r\nGET\r\n$2\r\np2\r\n"
+         "*2\r\n$3\r\nGET\r\n$2\r\np2\r\n*2\r\n$3\r\nGET\r\n$2\r\np2\r\n*2\r\n$3\r\nGET\r\n$2\r\np9\r\n",
+         "$2\r\nbb\r\n$2\r\nbb\r\n$2\r\nbb\r\n$2\r\nbb\r\n$2\r\nbb\r\n$2\r\nbb\r\n$2\r\nbb\r\n$2\r\nbb\r\n$-"
+         "1\r\n");
     free(run(d, r, "SET big 9223372036854775807\r\nINCR big\r\n",
              "+OK\r\n-ERR increment or decrement would overflow\r\n", 1));
     free(run(d, r, "APPEND s ab\r\nAPPEND s cd\r\nSTRLEN s\r\nGET s\r\n", ":2\r\n:4\r\n:4\r\n$4\r\nabcd\r\n",

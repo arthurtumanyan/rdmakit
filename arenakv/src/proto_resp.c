@@ -92,11 +92,11 @@ static void r_err(struct obuf *o, const char *msg) {
 }
 
 static void r_int(struct obuf *o, long long v) {
-    ob_printf(o, ":%lld\r\n", v);
+    ob_add_line(o, ':', v);
 }
 
 static void r_bulk(struct obuf *o, const void *p, size_t n) {
-    ob_printf(o, "$%zu\r\n", n);
+    ob_add_line(o, '$', (int64_t)n);
     ob_add(o, p, n);
     ob_add(o, "\r\n", 2);
 }
@@ -122,7 +122,7 @@ static void r_null(struct obuf *o) {
 /* The null array of RESP2 (an aborted EXEC); RESP3 has one null. */
 /* An out-of-band frame: RESP3 push, RESP2 array (pub/sub confirmations). */
 static void r_push(struct obuf *o, long long n) {
-    ob_printf(o, "%c%lld\r\n", tl_resp3 ? '>' : '*', n);
+    ob_add_line(o, tl_resp3 ? '>' : '*', n);
 }
 
 static void r_null_array(struct obuf *o) {
@@ -135,7 +135,7 @@ static void r_null_array(struct obuf *o) {
 
 /* A map of n pairs: RESP3 map, RESP2 array of 2n elements. */
 static void r_map(struct obuf *o, long long n) {
-    ob_printf(o, tl_resp3 ? "%%%lld\r\n" : "*%lld\r\n", tl_resp3 ? n : 2 * n);
+    ob_add_line(o, tl_resp3 ? '%' : '*', tl_resp3 ? n : 2 * n);
 }
 
 /* Text for humans (INFO): RESP3 verbatim string of format "txt", RESP2 bulk string. */
@@ -152,7 +152,7 @@ static void r_verbatim(struct obuf *o, const void *p, size_t n) {
 }
 
 static void r_array(struct obuf *o, long long n) {
-    ob_printf(o, "*%lld\r\n", n);
+    ob_add_line(o, '*', n);
 }
 
 static void r_arity(struct obuf *o, const struct arg *cmd) {
@@ -2034,10 +2034,82 @@ static ssize_t parse_array(akvd *d, const uint8_t *p, size_t left, size_t *nargs
     return used;
 }
 
+/* Commands whose first argument is a key; MGET prefetches all of its arguments. */
+static int prefetch_command(const uint8_t *name, size_t n, int *all) {
+    static const char *const one[] = {"get",    "set",    "getex", "getdel", "incr", "decr",
+                                      "incrby", "decrby", "setex", "setnx",  "del",  "exists",
+                                      "append", "strlen", "ttl",   "pttl"};
+    *all = n == 4 && strncasecmp((const char *)name, "mget", 4) == 0;
+    if (*all) {
+        return 1;
+    }
+    for (size_t i = 0; i < sizeof(one) / sizeof(one[0]); i++) {
+        if (strlen(one[i]) == n && strncasecmp((const char *)name, one[i], n) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Prefetches the index buckets (akv_prefetch), then the entries (akv_prefetch_entry), of the keys of up to
+ * RESP_PREFETCH keys in the complete array commands starting at in, so that the lookups of pipelined
+ * commands overlap their cache misses. Stops at an inline command, an incomplete or malformed command, or
+ * when RESP_PREFETCH keys were found. Does not use the argument array of the parser. Returns the offset
+ * after the last command examined.
+ */
+#define RESP_PREFETCH 8
+static size_t resp_prefetch(akvd *d, const uint8_t *in, size_t len) {
+    const uint8_t *keys[RESP_PREFETCH];
+    size_t klens[RESP_PREFETCH];
+    int nk = 0;
+    size_t off = 0;
+    akv *s = akvd_store(d);
+    while (nk < RESP_PREFETCH && off < len && in[off] == '*') {
+        long long count;
+        ssize_t used = parse_len_line(in + off, len - off, '*', &count);
+        if (used <= 0 || count < 1 || count > RESP_MAX_ARGS) {
+            break;
+        }
+        int want = 0;
+        int all = 0;
+        long long i = 0;
+        for (; i < count; i++) {
+            long long blen;
+            ssize_t h = parse_len_line(in + off + (size_t)used, len - off - (size_t)used, '$', &blen);
+            if (h <= 0 || blen < 0 || (size_t)used + (size_t)h + (size_t)blen + 2 > len - off) {
+                break;
+            }
+            const uint8_t *data = in + off + (size_t)used + (size_t)h;
+            if (i == 0) {
+                want = prefetch_command(data, (size_t)blen, &all);
+            } else if (want && (i == 1 || all) && blen > 0 && nk < RESP_PREFETCH) {
+                akv_prefetch(s, data, (size_t)blen);
+                keys[nk] = data;
+                klens[nk] = (size_t)blen;
+                nk++;
+            }
+            used += h + (ssize_t)blen + 2;
+        }
+        if (i < count) {
+            break; /* incomplete or malformed: the parser decides */
+        }
+        off += (size_t)used;
+    }
+    for (int i = 0; nk > 1 && i < nk; i++) {
+        akv_prefetch_entry(s, keys[i], klens[i]);
+    }
+    return off;
+}
+
 size_t resp_execute(akvd *d, struct session *ss, const uint8_t *in, size_t len, struct obuf *out) {
     size_t used = 0;
+    size_t prefetched = 0; /* input before this offset had its keys prefetched */
     tl_resp3 = ss->proto == 3;
     while (used < len && !ss->close && ob_pending(out) <= OB_SOFT_LIMIT) {
+        if (used >= prefetched) {
+            prefetched = used + resp_prefetch(d, in + used, len - used);
+        }
         size_t nargs = 0;
         ssize_t n = in[used] == '*' ? parse_array(d, in + used, len - used, &nargs)
                                     : parse_inline(in + used, len - used, &nargs);

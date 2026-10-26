@@ -33,6 +33,10 @@ struct obuf {
 int ob_add(struct obuf *b, const void *data, size_t n);
 /* Appends formatted text. Returns 0 or -ENOMEM. */
 int ob_printf(struct obuf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+/* Appends the decimal text of v, without the formatting machinery of ob_printf. Returns 0 or -ENOMEM. */
+int ob_add_u64(struct obuf *b, uint64_t v);
+/* Appends "<prefix><decimal v>\r\n" (RESP type and length lines). Returns 0 or -ENOMEM. */
+int ob_add_line(struct obuf *b, char prefix, int64_t v);
 /* Returns a pointer to n writable bytes at the end of the buffer (not yet counted), or NULL. */
 uint8_t *ob_reserve(struct obuf *b, size_t n);
 /* Counts n bytes written into the space returned by ob_reserve(). */

@@ -51,8 +51,10 @@ This document is for people who change or review the code. Usage is in [USAGE.md
   without counting them as evictions. The coarse clock is read from the vDSO without the timestamp counter; its
   resolution is one scheduler tick (`clock_getres`, 1 to 10 ms), so an entry can outlive its time to live by up to one
   tick. memcached checks expiry against a clock of one-second resolution.
-- **Prefetch**: `akv_prefetch()` loads the first index bucket of a key without the lock. The server calls it for a
-  group of up to 8 pipelined native requests before executing them, so that their index cache misses overlap.
+- **Prefetch**: `akv_prefetch()` loads the first index bucket of a key without the lock, and `akv_prefetch_entry()`
+  then loads the key's entry. The server calls both for the keys of up to 8 pipelined requests before executing them,
+  so that their cache misses overlap: native requests, memcached retrieval lines (`get`, `gets`, `mg`), and complete
+  RESP array commands whose first argument is a key (GET, SET, DEL and other single-key commands; every key of MGET).
 - **CAS**: per-shard counter shifted left by 10 bits, ORed with the shard number; versions are unique in the engine.
 - **Increments** (`akv_incr`): memcached semantics (unsigned, wrap on increment, floor at 0, absent key is an error)
   or RESP semantics (signed, absent key counts as 0, overflow error); the result is stored as decimal text with flags

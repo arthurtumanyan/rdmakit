@@ -267,6 +267,35 @@ int ob_printf(struct obuf *b, const char *fmt, ...) {
     return 0;
 }
 
+/* Writes the decimal text of v to the end of dst (at most 20 bytes before dst) and returns its start. */
+static char *u64_text(char *dst, uint64_t v) {
+    do {
+        *--dst = (char)('0' + v % 10);
+        v /= 10;
+    } while (v != 0);
+    return dst;
+}
+
+int ob_add_u64(struct obuf *b, uint64_t v) {
+    char buf[20];
+    char *s = u64_text(buf + sizeof(buf), v);
+    return ob_add(b, s, (size_t)(buf + sizeof(buf) - s));
+}
+
+int ob_add_line(struct obuf *b, char prefix, int64_t v) {
+    char buf[24]; /* prefix, sign, 19 digits, CR LF */
+    char *end = buf + sizeof(buf) - 2;
+    end[0] = '\r';
+    end[1] = '\n';
+    uint64_t mag = v < 0 ? (uint64_t)0 - (uint64_t)v : (uint64_t)v;
+    char *s = u64_text(end, mag);
+    if (v < 0) {
+        *--s = '-';
+    }
+    *--s = prefix;
+    return ob_add(b, s, (size_t)(buf + sizeof(buf) - s));
+}
+
 uint8_t *ob_reserve(struct obuf *b, size_t n) {
     return ob_grow(b, n) == 0 ? b->p + b->len : NULL;
 }
