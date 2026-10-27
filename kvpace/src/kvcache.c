@@ -142,12 +142,24 @@ void pace_kvcache_begin(pace_kvcache_state *st, pace_kvcache_req *r) {
     r->stats.requests = 1;
 }
 
+/* Group of trace blocks in the key derivation: above every group of the conversation model (< 2^32). */
+#define TRACE_GROUP UINT64_MAX
+
+void pace_kvcache_begin_chain(pace_kvcache_state *st, pace_kvcache_req *r, const uint64_t *ids, uint32_t n) {
+    (void)st;
+    memset(r, 0, sizeof(*r));
+    r->ids = ids;
+    r->total = n;
+    r->stats.requests = 1;
+}
+
 int pace_kvcache_op(pace_kvcache_state *st, pace_kvcache_req *r, pace_req *op) {
     if (r->index >= r->total) {
         return 0;
     }
-    const struct conv_slot *s = &st->slots[r->slot];
-    size_t klen = chain_key(st, s, r->index, r->key);
+    size_t klen = r->ids != NULL
+                      ? pace_kvcache_block_key(st->cfg.seed, TRACE_GROUP, 0, r->ids[r->index], r->key)
+                      : chain_key(st, &st->slots[r->slot], r->index, r->key);
     *op = (pace_req){.key = r->key, .klen = klen};
     if (!r->putting) {
         op->type = PACE_OP_GET;
@@ -190,9 +202,15 @@ int pace_kvcache_result(pace_kvcache_state *st, pace_kvcache_req *r, int status,
 int pace_kvcache_request(pace_kvcache_state *st, const pace_driver *drv, pace_conn *conn,
                          pace_kvcache_stats *out) {
     pace_kvcache_req r;
+    pace_kvcache_begin(st, &r);
+    return pace_kvcache_run(st, &r, drv, conn, out);
+}
+
+int pace_kvcache_run(pace_kvcache_state *st, pace_kvcache_req *rq, const pace_driver *drv, pace_conn *conn,
+                     pace_kvcache_stats *out) {
+    pace_kvcache_req r = *rq;
     pace_req op;
     int rc = PACE_OK;
-    pace_kvcache_begin(st, &r);
     while (rc == PACE_OK && pace_kvcache_op(st, &r, &op)) {
         if (op.type == PACE_OP_GET) {
             size_t got = 0;

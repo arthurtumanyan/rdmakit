@@ -8,7 +8,9 @@
  * asynchronous interface (several connections and pipeline slots per thread), request machines produce
  * the same requests as synchronous threads of the same identities: with no template blocks (so that no
  * two identities share a key) the counters of both runners are equal; with templates, hits are verified
- * byte for byte and open-loop runs complete.
+ * byte for byte and open-loop runs complete. Trace replay: the loader accepts the Mooncake trace format and
+ * rejects malformed lines; a trace whose requests share prefixes produces exactly the expected hits, misses
+ * and writes through both runners; a timed replay takes the trace time divided by the speed.
  */
 #include <pthread.h>
 #include <stdio.h>
@@ -20,6 +22,7 @@
 
 #include "kvcache.h"
 #include "runner.h"
+#include "trace.h"
 
 static int failures;
 
@@ -423,6 +426,124 @@ static void test_async_open_loop(void) {
            "open loop: %.0f requests/s at 2000/s, %llu errors", rate, (unsigned long long)res.errors);
 }
 
+/* ---- trace replay -------------------------------------------------------------------------------- */
+
+/* Writes text to a new temporary file and returns its path (static storage). */
+static const char *temp_file(const char *text) {
+    static char path[64];
+    snprintf(path, sizeof(path), "/tmp/kvpace-trace-XXXXXX");
+    int fd = mkstemp(path);
+    if (fd >= 0) {
+        if (write(fd, text, strlen(text)) != (ssize_t)strlen(text)) {
+            path[0] = '\0';
+        }
+        close(fd);
+    }
+    return path;
+}
+
+static void test_trace_loader(void) {
+    char err[256];
+    pace_trace t;
+    const char *p = temp_file(
+        "{\"timestamp\": 0, \"input_length\": 1536, \"output_length\": 7, \"hash_ids\": [1, 2, 3]}\n"
+        "\n"
+        "{\"hash_ids\":[1,2,3,4], \"timestamp\":250}\n");
+    EXPECT(pace_trace_load(p, &t, err, sizeof(err)) == 0 && t.n == 2 && t.nids == 7 && t.t_us[1] == 250000 &&
+               t.nblocks[0] == 3 && t.nblocks[1] == 4 && t.ids[t.first[1] + 3] == 4,
+           "valid trace: %s", err);
+    pace_trace_free(&t);
+    unlink(p);
+    static const char *const bad[] = {
+        "{\"timestamp\": 5, \"hash_ids\": [1, x]}\n",
+        "{\"timestamp\": 5, \"hash_ids\": [1]}\n{\"timestamp\": 4, \"hash_ids\": [2]}\n",
+        "{\"timestamp\": 5, \"hash_ids\": []}\n",
+        "{\"hash_ids\": [1]}\n",
+        "{\"timestamp\": 5}\n",
+        "\n",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        p = temp_file(bad[i]);
+        err[0] = '\0';
+        EXPECT(pace_trace_load(p, &t, err, sizeof(err)) == -1 && err[0] != '\0',
+               "malformed trace %zu accepted", i);
+        unlink(p);
+    }
+}
+
+/* Runs a trace through pace_run() and returns the counters. */
+static pace_kvcache_stats run_trace(const pace_trace *t, unsigned threads, unsigned conns, unsigned pipeline,
+                                    double speed, double *seconds) {
+    cache_reset(4096);
+    corrupt_reads = 0;
+    pace_config cfg;
+    pace_config_default(&cfg);
+    cfg.driver = &fake;
+    cfg.threads = threads;
+    cfg.conns_per_thread = conns;
+    cfg.pipeline = pipeline;
+    cfg.scenario = PACE_SCENARIO_KVCACHE;
+    cfg.kvcache = test_cfg();
+    cfg.preload = 0;
+    cfg.trace = t;
+    cfg.trace_speed = speed;
+    static pace_result res;
+    EXPECT(pace_run(&cfg, &res) == 0 && res.errors == 0, "trace run %u/%u/%u", threads, conns, pipeline);
+    if (seconds != NULL) {
+        *seconds = res.seconds;
+    }
+    return res.kvcache;
+}
+
+/*
+ * Requests [1 2 3], [1 2 3 4], [1 2 5], [6], one after another: 0 + 3 + 2 + 0 hits; 1 + 4 + 3 + 1 GETs;
+ * 3 + 1 + 1 + 1 PUTs. One request machine (synchronous, or one asynchronous slot) runs them in order.
+ */
+static void test_trace_replay(void) {
+    const char *p = temp_file("{\"timestamp\": 0, \"hash_ids\": [1, 2, 3]}\n"
+                              "{\"timestamp\": 100, \"hash_ids\": [1, 2, 3, 4]}\n"
+                              "{\"timestamp\": 200, \"hash_ids\": [1, 2, 5]}\n"
+                              "{\"timestamp\": 300, \"hash_ids\": [6]}\n");
+    char err[256];
+    pace_trace t;
+    EXPECT(pace_trace_load(p, &t, err, sizeof(err)) == 0, "trace: %s", err);
+    unlink(p);
+    if (t.n == 0) {
+        return;
+    }
+    for (int async = 0; async < 2; async++) {
+        pace_kvcache_stats s = run_trace(&t, 1, async ? 1 : 1, async ? 2 : 1, 0.0, NULL);
+        if (async) {
+            /* two slots may run two requests at once; only totals that do not depend on the order hold */
+            EXPECT(s.requests == 4 && s.corrupt == 0 && s.block_hits + s.block_puts == 3 + 4 + 3 + 1,
+                   "async trace: %llu requests, %llu hits, %llu puts", (unsigned long long)s.requests,
+                   (unsigned long long)s.block_hits, (unsigned long long)s.block_puts);
+        } else {
+            EXPECT(s.requests == 4 && s.block_gets == 9 && s.block_hits == 5 && s.block_puts == 6 &&
+                       s.corrupt == 0,
+                   "sync trace: %llu requests, %llu gets, %llu hits, %llu puts",
+                   (unsigned long long)s.requests, (unsigned long long)s.block_gets,
+                   (unsigned long long)s.block_hits, (unsigned long long)s.block_puts);
+        }
+    }
+    pace_kvcache_stats one = run_trace(&t, 1, 1, 1, 0.0, NULL);
+    EXPECT(one.block_hits == 5, "repeatable");
+    /* back to back through the asynchronous runner: no wait for an epoll timeout at the end */
+    double fast = 1.0;
+    pace_kvcache_stats quick = run_trace(&t, 1, 2, 2, 0.0, &fast);
+    EXPECT(quick.requests == 4 && fast < 0.02, "untimed async replay: %llu requests in %.3f s",
+           (unsigned long long)quick.requests, fast);
+    /* timed: 300 ms of trace at speed 10 takes at least 30 ms */
+    double secs = 0;
+    pace_kvcache_stats timed = run_trace(&t, 2, 1, 1, 10.0, &secs);
+    EXPECT(timed.requests == 4 && secs >= 0.029 && secs < 1.0, "timed replay: %llu requests in %.3f s",
+           (unsigned long long)timed.requests, secs);
+    timed = run_trace(&t, 1, 2, 2, 10.0, &secs);
+    EXPECT(timed.requests == 4 && secs >= 0.029 && secs < 1.0, "timed async replay: %llu requests in %.3f s",
+           (unsigned long long)timed.requests, secs);
+    pace_trace_free(&t);
+}
+
 /* The runner counts block operations as the operations of the result. */
 static void test_runner_counts(void) {
     cache_reset(4096);
@@ -456,6 +577,8 @@ int main(void) {
     test_runner_counts();
     test_async_equivalence();
     test_async_open_loop();
+    test_trace_loader();
+    test_trace_replay();
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

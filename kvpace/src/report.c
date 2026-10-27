@@ -256,6 +256,13 @@ void pace_report_json(FILE *f, const pace_config *cfg, const pace_result *res, c
                     : 0.0,
                 (unsigned long long)r->block_puts, (unsigned long long)r->bytes_get,
                 (unsigned long long)r->bytes_put, (unsigned long long)r->corrupt);
+        if (cfg->trace != NULL) {
+            fputs("      \"trace\": {\"path\": ", f);
+            pace_json_str(f, cfg->trace_path != NULL ? cfg->trace_path : "");
+            fprintf(f, ", \"requests\": %llu, \"blocks\": %llu, \"duration_s\": %.3f, \"speed\": %.3f},\n",
+                    (unsigned long long)cfg->trace->n, (unsigned long long)cfg->trace->nids,
+                    (double)cfg->trace->t_us[cfg->trace->n - 1] / 1e6, cfg->trace_speed);
+        }
         json_named_hist(f, "request_latency_ns", &res->req_lat, pc);
         fputs("}", f);
     }
@@ -283,7 +290,16 @@ void pace_report_text(FILE *f, const pace_config *cfg, const pace_result *res, c
     uint64_t ops = pace_result_ops(res);
     char vs[256];
     vsize_text(&cfg->wl, vs, sizeof(vs));
-    if (cfg->scenario == PACE_SCENARIO_KVCACHE) {
+    if (cfg->scenario == PACE_SCENARIO_KVCACHE && cfg->trace != NULL) {
+        fprintf(f,
+                "driver=%s threads=%u conns/thread=%u pipeline=%u scenario=kvcache block=%uB trace=%s "
+                "(%llu requests, %llu blocks, %.1f s at speed %g)\n",
+                cfg->driver->name, cfg->threads, cfg->conns_per_thread ? cfg->conns_per_thread : 1,
+                cfg->pipeline ? cfg->pipeline : 1, cfg->kvcache.block_size,
+                cfg->trace_path != NULL ? cfg->trace_path : "", (unsigned long long)cfg->trace->n,
+                (unsigned long long)cfg->trace->nids, (double)cfg->trace->t_us[cfg->trace->n - 1] / 1e6,
+                cfg->trace_speed);
+    } else if (cfg->scenario == PACE_SCENARIO_KVCACHE) {
         const pace_kvcache_cfg *k = &cfg->kvcache;
         fprintf(f,
                 "driver=%s threads=%u scenario=kvcache block=%uB groups=%u shared-blocks=%u turn-blocks=%u "

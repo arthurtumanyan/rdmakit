@@ -24,8 +24,21 @@ struct shared {
     atomic_int failed;
     atomic_uint ready;
     atomic_int go;
-    atomic_uint finished; /* count mode: workers done */
+    atomic_uint finished;            /* count mode: workers done */
+    atomic_uint_fast64_t trace_next; /* next trace request to start */
 };
+
+/* Count mode: the run ends when every worker has finished (requests per connection, or a trace replay). */
+static int count_mode(const pace_config *cfg) {
+    return cfg->requests > 0 || cfg->trace != NULL;
+}
+
+/* Intended start of trace request idx: its trace time scaled by trace_speed after the measurement start. */
+static uint64_t trace_time(const struct shared *sh, uint64_t idx) {
+    const pace_config *cfg = sh->cfg;
+    uint64_t start = atomic_load_explicit(&sh->measure_start_ns, memory_order_relaxed);
+    return start + (uint64_t)((double)cfg->trace->t_us[idx] * 1000.0 / cfg->trace_speed);
+}
 
 struct worker {
     struct shared *sh;
@@ -76,6 +89,7 @@ void pace_config_default(pace_config *cfg) {
     pace_wl_default(&cfg->wl);
     cfg->seed = 1;
     cfg->preload = 1;
+    cfg->trace_speed = 1.0;
 }
 
 size_t pace_key_text(const pace_config *cfg, uint64_t idx, int counter, char *out) {
@@ -306,7 +320,26 @@ static void *sync_main(void *arg) {
         unsigned hits = 0;
         if (kvc != NULL) {
             pace_kvcache_stats req_stats = {0};
-            int rc = pace_kvcache_request(kvc, drv, conn, &req_stats);
+            int rc;
+            if (cfg->trace != NULL) {
+                uint64_t idx = atomic_fetch_add(&sh->trace_next, 1);
+                if (idx >= cfg->trace->n) {
+                    break;
+                }
+                if (cfg->trace_speed > 0.0) {
+                    intended = trace_time(sh, idx);
+                    wait_until(sh, intended);
+                    t0 = now_ns();
+                } else {
+                    intended = t0;
+                }
+                pace_kvcache_req r;
+                pace_kvcache_begin_chain(kvc, &r, cfg->trace->ids + cfg->trace->first[idx],
+                                         cfg->trace->nblocks[idx]);
+                rc = pace_kvcache_run(kvc, &r, drv, conn, &req_stats);
+            } else {
+                rc = pace_kvcache_request(kvc, drv, conn, &req_stats);
+            }
             uint64_t t1 = now_ns();
             done++;
             if (!atomic_load_explicit(&sh->measuring, memory_order_relaxed)) {
@@ -339,7 +372,7 @@ static void *sync_main(void *arg) {
         done++;
         record(w, op.type, rc, intended, t0, t1, hits, op.nkeys);
     }
-    if (cfg->requests > 0) {
+    if (count_mode(cfg)) {
         atomic_fetch_add(&sh->finished, 1);
     }
     if (conn != NULL) {
@@ -478,10 +511,18 @@ static int kv_advance(const pace_config *cfg, struct aslot *s, unsigned m) {
     return 1;
 }
 
-/* Starts a request on the idle machine m of s with the given intended send time. Returns 0 or -1. */
-static int kv_start(const pace_config *cfg, struct aslot *s, unsigned m, uint64_t intended) {
+/*
+ * Starts a request on the idle machine m of s with the given intended send time: trace request idx when a
+ * trace is replayed, else a request of the conversation model. Returns 0 or -1.
+ */
+static int kv_start(const pace_config *cfg, struct aslot *s, unsigned m, uint64_t intended, uint64_t idx) {
     struct kvm *k = &s->kvm[m];
-    pace_kvcache_begin(k->st, &k->r);
+    if (cfg->trace != NULL) {
+        pace_kvcache_begin_chain(k->st, &k->r, cfg->trace->ids + cfg->trace->first[idx],
+                                 cfg->trace->nblocks[idx]);
+    } else {
+        pace_kvcache_begin(k->st, &k->r);
+    }
     k->active = 1;
     k->intended = intended;
     k->sent = 0;
@@ -683,9 +724,13 @@ static void *async_main(void *arg) {
     unsigned rr = 0;
     pace_op op;
     struct epoll_event evs[256];
+    const pace_trace *trace = kvmode ? cfg->trace : NULL;
+    int64_t pend = -1;   /* trace request claimed and not yet started */
+    uint64_t pend_t = 0; /* its intended start */
+    int exhausted = 0;   /* every trace request has been claimed */
     while (ok && !atomic_load(&sh->failed) && !atomic_load_explicit(&sh->stop, memory_order_relaxed)) {
         uint64_t now = now_ns();
-        int all_done = cfg->requests > 0;
+        int all_done = count_mode(cfg);
         if (open_loop) {
             while (next_intended <= now) {
                 if (backlog_push(&bl, next_intended) != 0) {
@@ -699,7 +744,7 @@ static void *async_main(void *arg) {
                 struct aslot *s = &slots[rr % nconn];
                 int m = kvmode ? kv_idle(cfg, s) : -1;
                 if (kvmode && m >= 0) {
-                    if (kv_start(cfg, s, (unsigned)m, bl.t[bl.head]) != 0) {
+                    if (kv_start(cfg, s, (unsigned)m, bl.t[bl.head], 0) != 0) {
                         atomic_store(&sh->failed, 1);
                         break;
                     }
@@ -722,10 +767,40 @@ static void *async_main(void *arg) {
                 rr++;
             }
         } else {
-            for (unsigned i = 0; i < nconn && kvmode; i++) {
+            /* Trace replay: the next request is claimed ahead and started on an idle machine at its time. */
+            while (trace != NULL) {
+                if (pend < 0 && !exhausted) {
+                    uint64_t idx = atomic_fetch_add(&sh->trace_next, 1);
+                    if (idx >= trace->n) {
+                        exhausted = 1;
+                    } else {
+                        pend = (int64_t)idx;
+                        pend_t = cfg->trace_speed > 0.0 ? trace_time(sh, idx) : 0;
+                    }
+                }
+                if (pend < 0 || (cfg->trace_speed > 0.0 && now_ns() < pend_t)) {
+                    break;
+                }
+                int m = -1;
+                unsigned i = 0;
+                for (; i < nconn && (m = kv_idle(cfg, &slots[(rr + i) % nconn])) < 0; i++) {
+                }
+                if (m < 0) {
+                    break;
+                }
+                struct aslot *s = &slots[(rr + i) % nconn];
+                rr++;
+                if (kv_start(cfg, s, (unsigned)m, cfg->trace_speed > 0.0 ? pend_t : now_ns(),
+                             (uint64_t)pend) != 0) {
+                    atomic_store(&sh->failed, 1);
+                    break;
+                }
+                pend = -1;
+            }
+            for (unsigned i = 0; i < nconn && kvmode && trace == NULL; i++) {
                 struct aslot *s = &slots[i];
                 for (int m; (m = kv_idle(cfg, s)) >= 0;) {
-                    if (kv_start(cfg, s, (unsigned)m, now_ns()) != 0) {
+                    if (kv_start(cfg, s, (unsigned)m, now_ns(), 0) != 0) {
                         atomic_store(&sh->failed, 1);
                         break;
                     }
@@ -742,6 +817,8 @@ static void *async_main(void *arg) {
                 }
             }
         }
+        /* after the issue phase, which may have found the trace exhausted in this iteration */
+        all_done = all_done && (trace == NULL || (exhausted && pend < 0));
         int ready_now = 0;
         for (unsigned i = 0; i < nconn; i++) {
             struct aslot *s = &slots[i];
@@ -752,7 +829,8 @@ static void *async_main(void *arg) {
             }
             if (kvmode) {
                 for (unsigned m = 0; m < s->depth; m++) {
-                    all_done = all_done && !s->kvm[m].active && s->kvm[m].started >= cfg->requests;
+                    all_done = all_done && !s->kvm[m].active &&
+                               (trace != NULL || s->kvm[m].started >= cfg->requests);
                 }
             } else {
                 all_done = all_done && s->completed >= cfg->requests;
@@ -770,6 +848,9 @@ static void *async_main(void *arg) {
             /* A free pipeline slot that may be filled now: submit again instead of waiting. Replies that
              * arrive before this drain would otherwise leave the connection idle until the next event. */
             int may_issue = kvmode ? kv_idle(cfg, s) >= 0 : cfg->requests == 0 || s->issued < cfg->requests;
+            if (trace != NULL) {
+                may_issue = may_issue && pend >= 0 && (cfg->trace_speed == 0.0 || now_ns() >= pend_t);
+            }
             if ((kvmode || s->count < s->depth) && may_issue && (!open_loop || bl.count > 0)) {
                 ready_now = 1;
             }
@@ -780,6 +861,12 @@ static void *async_main(void *arg) {
         struct timespec ts = {.tv_sec = 0, .tv_nsec = 50000000};
         if (ready_now) {
             ts.tv_nsec = 0;
+        } else if (trace != NULL && pend >= 0 && cfg->trace_speed > 0.0) {
+            uint64_t t = now_ns();
+            uint64_t left = pend_t > t ? pend_t - t : 0;
+            if (left < (uint64_t)ts.tv_nsec) {
+                ts.tv_nsec = (long)left;
+            }
         } else if (open_loop) {
             uint64_t t = now_ns();
             uint64_t left = next_intended > t ? next_intended - t : 0;
@@ -799,7 +886,7 @@ static void *async_main(void *arg) {
             }
         }
     }
-    if (cfg->requests > 0) {
+    if (count_mode(cfg)) {
         atomic_fetch_add(&sh->finished, 1);
     }
     for (unsigned i = 0; slots != NULL && i < nconn; i++) {
@@ -853,6 +940,12 @@ int pace_run(pace_config *cfg, pace_result *res) {
     if (cfg->scenario == PACE_SCENARIO_KV && check_ops(cfg, async) != 0) {
         return -1;
     }
+    if (cfg->trace != NULL && (cfg->scenario != PACE_SCENARIO_KVCACHE || cfg->rate > 0.0 ||
+                               cfg->requests > 0 || cfg->trace_speed < 0.0)) {
+        fprintf(stderr,
+                "a trace is replayed by the kvcache scenario at its own times (no --rate or --requests)\n");
+        return -1;
+    }
     char err[160];
     if (pace_wl_init(&cfg->wl, err, sizeof(err)) != 0) {
         fprintf(stderr, "%s\n", err);
@@ -865,6 +958,7 @@ int pace_run(pace_config *cfg, pace_result *res) {
     atomic_init(&sh.ready, 0);
     atomic_init(&sh.go, 0);
     atomic_init(&sh.finished, 0);
+    atomic_init(&sh.trace_next, 0);
 
     struct worker *ws = calloc(cfg->threads, sizeof(*ws));
     if (ws == NULL) {
@@ -910,7 +1004,7 @@ int pace_run(pace_config *cfg, pace_result *res) {
     pace_proc_sample srv_after;
     int srv_ok = 0;
     uint64_t t_start;
-    if (cfg->requests > 0) {
+    if (count_mode(cfg)) {
         /* Count mode: no warm-up; the measurement ends when every worker has finished. */
         srv_ok = cfg->server_pid > 0 && pace_proc_sample_pid(cfg->server_pid, &srv_before) == 0;
         t_start = now_ns();
@@ -978,7 +1072,7 @@ int pace_run(pace_config *cfg, pace_result *res) {
     }
     res->seconds = (double)(t_end - t_start) / 1e9;
     res->nseries = (unsigned)ceil(res->seconds - 1e-9);
-    if (cfg->requests == 0) {
+    if (!count_mode(cfg)) {
         res->nseries = (unsigned)(res->seconds + 0.5);
     }
     if (res->nseries > PACE_MAX_SERIES) {

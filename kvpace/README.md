@@ -15,7 +15,7 @@ its result files.
 - Duration or request-count runs; synchronized start on several hosts and `kvpace merge` to combine their results.
 - Authentication (RESP `AUTH`, memcached ASCII authentication, native `AUTH`), RESP `SELECT`, and optional TLS for
   the RESP and memcached drivers (`TLS=1`).
-- A KV-cache scenario: prefix-chain requests with reuse accounting.
+- A KV-cache scenario: prefix-chain requests with reuse accounting, modeled or replayed from a request trace.
 - Latency histograms with at most 0.8% relative error, configurable percentiles, per-operation latencies;
   per-second throughput series; server CPU and memory sampling.
 - One JSON result file per run (schema in [`docs/USAGE.md`](docs/USAGE.md#result-files)), plus CSV and
@@ -185,7 +185,7 @@ and arm64, and the TLS build on x86-64.
 | `test_runner` | closed- and open-loop timing with a synthetic driver whose throughput and latency are known analytically, for one and for several connections per thread with pipelining; request-count mode |
 | `test_merge` | JSON round trip, `kvpace merge` (summed counters and series, merged histograms, idempotent percentiles, schema check), CSV and `.hgrm` output |
 | `test_tls` | TLS round trips and 200 pipelined requests with certificate verification, refusal of an untrusted certificate, `--tls-skip-verify` (`TLS=1` builds) |
-| `test_kvcache` | request structure, hit rates, determinism, key sharing and separation, corruption detection |
+| `test_kvcache` | request structure, hit rates, determinism, key sharing and separation, corruption detection, request machines of the multiplexed runner, trace loading and replay |
 
 ## Quick start
 
@@ -242,7 +242,7 @@ The main options; `kvpace --help` prints the complete list.
 | `--multi-get N` | 1 | keys per MGET |
 | `--workload NAME` | | `ycsb-a`, `ycsb-b`, `ycsb-c`, `ycsb-d`, `ycsb-f` |
 | `--rate N`, `--arrival NAME`, `--spin` | 0, `constant` | open loop: aggregate operations per second, `constant` or `poisson`, busy-wait |
-| `--scenario NAME` | `kv` | `kv` or `kvcache` (parameters: `--block-size`, `--groups`, `--shared-blocks`, `--turn-blocks`, `--active-conv`, `--max-turns`, `--new-conv-prob`) |
+| `--scenario NAME` | `kv` | `kv` or `kvcache` (parameters: `--block-size`, `--groups`, `--shared-blocks`, `--turn-blocks`, `--active-conv`, `--max-turns`, `--new-conv-prob`; `--trace FILE` and `--trace-speed X` replay a request trace) |
 | `--server-pid PID` | | sample the server's CPU time and resident memory |
 | `--pin LIST` | | CPU list for client threads (thread i uses entry i mod length) |
 | `--label TEXT`, `--out FILE` | | name stored in the result; JSON output path |
@@ -284,7 +284,7 @@ The benchmark suite in [`../benchmarks`](../benchmarks) orchestrates these for t
 
 | Path | Content |
 |---|---|
-| `src/` | tool and library code (`runner`, `workload`, `hist`, `zipf`, `kvcache`, drivers, `sock`, `report`, `json`, `merge`, `main`) |
+| `src/` | tool and library code (`runner`, `workload`, `hist`, `zipf`, `kvcache`, `trace`, drivers, `sock`, `report`, `json`, `merge`, `main`) |
 | `tests/` | unit tests |
 | `scripts/` | helper scripts |
 | `docs/` | usage, architecture, scenario and validation documents |

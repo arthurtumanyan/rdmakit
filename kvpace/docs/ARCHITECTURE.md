@@ -52,6 +52,12 @@ records the request when its chain is complete. Machine identities are numbered 
 1` and seeded like synchronous threads of the same number, so a multiplexed run makes the same requests as a
 synchronous run with that many threads. The block steps are shared with the synchronous runner (`kvcache.h`).
 
+With a trace (`trace.c`, loaded once by `main` into arrays of arrival times and block ids), both runners take
+requests from a shared atomic cursor in trace order. A synchronous worker claims the next request, waits for its
+scaled trace time and runs it; a multiplexed worker claims one request ahead and starts it on the first idle request
+machine once its time has come. The run is a count run that ends when the cursor has passed the last request and
+every machine is idle.
+
 The main thread waits until all workers are ready, sets the start flag, sleeps for the warm-up, takes the first
 server sample and a timestamp, sets the `measuring` flag, sleeps for the measurement duration (or, with
 `--requests`, waits until every worker has finished its count), clears the flag, takes the second server sample and

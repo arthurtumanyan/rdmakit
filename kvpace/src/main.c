@@ -58,6 +58,8 @@ enum {
     OPT_TURN_BLOCKS,
     OPT_ACTIVE_CONV,
     OPT_MAX_TURNS,
+    OPT_TRACE,
+    OPT_TRACE_SPEED,
     OPT_NEW_CONV_PROB,
     OPT_RATE,
     OPT_ARRIVAL,
@@ -108,6 +110,10 @@ static const char usage[] =
     "(src/kvcache.h)\n"
     "  --block-size N, --groups N, --shared-blocks N, --turn-blocks N, --active-conv N, --max-turns N,\n"
     "  --new-conv-prob X      kvcache parameters (defaults in kvcache.h; --theta sets the Zipf skew)\n"
+    "  --trace FILE           replay the request chains of a KV-cache trace (JSON lines with timestamp in "
+    "ms\n"
+    "                         and hash_ids, the Mooncake trace format; src/trace.h) instead of the model\n"
+    "  --trace-speed X        trace time is divided by X (default: 1; 0: requests back to back)\n"
     "Load:\n"
     "  --duration SEC         measurement length (default: 10)\n"
     "  --warmup SEC           warm-up length (default: 2)\n"
@@ -169,6 +175,8 @@ static const struct option long_opts[] = {
     {"turn-blocks", required_argument, NULL, OPT_TURN_BLOCKS},
     {"active-conv", required_argument, NULL, OPT_ACTIVE_CONV},
     {"max-turns", required_argument, NULL, OPT_MAX_TURNS},
+    {"trace", required_argument, NULL, OPT_TRACE},
+    {"trace-speed", required_argument, NULL, OPT_TRACE_SPEED},
     {"new-conv-prob", required_argument, NULL, OPT_NEW_CONV_PROB},
     {"rate", required_argument, NULL, OPT_RATE},
     {"arrival", required_argument, NULL, OPT_ARRIVAL},
@@ -279,6 +287,7 @@ int main(int argc, char **argv) {
     pace_default_percentiles(&pc);
     const char *label = "unlabeled";
     const char *out_path = NULL;
+    const char *trace_path = NULL;
     const char *csv_path = NULL;
     const char *hdr_prefix = NULL;
     const char *workload = NULL;
@@ -524,6 +533,14 @@ int main(int argc, char **argv) {
                 return bad_num(opt, optarg, "a probability from 0 to 1");
             }
             break;
+        case OPT_TRACE:
+            trace_path = optarg;
+            break;
+        case OPT_TRACE_SPEED:
+            if (num_double(optarg, 0.0, 1e9, 0, &cfg.trace_speed) != 0) {
+                return bad_num(opt, optarg, "a factor, 0 or more (0: requests back to back)");
+            }
+            break;
         case OPT_RATE:
             if (num_double(optarg, 0.0, 1e10, 0, &cfg.rate) != 0) {
                 return bad_num(opt, optarg, "operations per second, 0 or more (0: closed loop)");
@@ -596,6 +613,16 @@ int main(int argc, char **argv) {
 
     cfg.kvcache.theta = cfg.wl.theta < 1.0 ? cfg.wl.theta : 0.9;
     cfg.kvcache.seed = cfg.seed;
+    static pace_trace trace;
+    if (trace_path != NULL) {
+        char err[512];
+        if (pace_trace_load(trace_path, &trace, err, sizeof(err)) != 0) {
+            fprintf(stderr, "%s\n", err);
+            return 1;
+        }
+        cfg.trace = &trace;
+        cfg.trace_path = trace_path;
+    }
     static pace_result res;
     if (pace_run(&cfg, &res) != 0) {
         return 1;

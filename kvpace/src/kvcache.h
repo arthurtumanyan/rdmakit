@@ -80,16 +80,23 @@ void pace_kvcache_destroy(pace_kvcache_state *st);
  * before), and result() applies a reply. The synchronous pace_kvcache_request() runs the same steps.
  */
 typedef struct pace_kvcache_req {
-    uint32_t slot;  /* conversation slot */
-    uint32_t total; /* blocks in the chain */
-    uint32_t index; /* block of the next operation */
-    int putting;    /* probing has ended: the blocks from index on are written */
+    uint32_t slot;       /* conversation slot */
+    uint32_t total;      /* blocks in the chain */
+    uint32_t index;      /* block of the next operation */
+    int putting;         /* probing has ended: the blocks from index on are written */
+    const uint64_t *ids; /* trace replay: block ids of the chain (pace_kvcache_begin_chain), else NULL */
     char key[PACE_KVCACHE_KEY_LEN];
     pace_kvcache_stats stats; /* counters of this request */
 } pace_kvcache_req;
 
 /* Starts a request on the state: chooses (and possibly renews) a conversation slot and advances its turn. */
 void pace_kvcache_begin(pace_kvcache_state *st, pace_kvcache_req *r);
+
+/*
+ * Starts a request whose chain is the n block ids at ids (trace replay, trace.h); ids must stay valid
+ * until the request ends. Keys of trace blocks are distinct from the keys of the conversation model.
+ */
+void pace_kvcache_begin_chain(pace_kvcache_state *st, pace_kvcache_req *r, const uint64_t *ids, uint32_t n);
 
 /*
  * Fills *op with the next block operation of r (a GET while probing, a SET while writing; key and value
@@ -113,6 +120,10 @@ int pace_kvcache_result(pace_kvcache_state *st, pace_kvcache_req *r, int status,
  */
 int pace_kvcache_request(pace_kvcache_state *st, const pace_driver *drv, pace_conn *conn,
                          pace_kvcache_stats *out);
+
+/* As pace_kvcache_request() for a request already started with a begin function. */
+int pace_kvcache_run(pace_kvcache_state *st, pace_kvcache_req *r, const pace_driver *drv, pace_conn *conn,
+                     pace_kvcache_stats *out);
 size_t pace_kvcache_block_key(uint64_t workload_seed, uint64_t group, uint64_t conv, uint64_t index,
                               char *key);
 

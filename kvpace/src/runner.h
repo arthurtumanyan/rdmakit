@@ -18,8 +18,11 @@
  * is reported separately.
  *
  * With scenario KVCACHE one unit of work is a whole request (a chain of block GETs followed by PUTs of the
- * missing tail, see kvcache.h) instead of a single operation; it uses the synchronous interface. Rates,
- * latencies and the per-second series then count requests; gets, puts and misses count block operations.
+ * missing tail, see kvcache.h) instead of a single operation. Rates, latencies and the per-second series
+ * then count requests; gets, puts and misses count block operations. With a trace (trace.h) the chains
+ * come from its requests, taken in trace order by all workers; each is started at its trace time divided
+ * by trace_speed after the start of the run (0: as fast as possible), and the run ends with the trace
+ * (no warm-up, like a count run).
  *
  * A run has three phases:
  *   1. preload: every key of the key space is written once (optional).
@@ -39,6 +42,7 @@
 #include "driver.h"
 #include "hist.h"
 #include "kvcache.h"
+#include "trace.h"
 #include "workload.h"
 
 typedef enum { PACE_SCENARIO_KV = 0, PACE_SCENARIO_KVCACHE = 1 } pace_scenario;
@@ -65,10 +69,14 @@ typedef struct pace_config {
     unsigned npin;
     pace_scenario scenario;   /* KV: single-key operations; KVCACHE: prefix-chain requests (kvcache.h) */
     pace_kvcache_cfg kvcache; /* parameters of the KVCACHE scenario */
-    double rate;              /* aggregate operations per second; 0 selects the closed loop */
-    pace_arrival arrival;     /* inter-arrival distribution of the open loop */
-    int spin;                 /* open loop: busy-wait for the intended time instead of sleeping */
-    int server_pid;           /* host PID of the server for CPU and memory sampling; 0 = off */
+    const pace_trace
+        *trace;         /* KVCACHE: request chains replayed from a trace instead of the model; NULL = off */
+    double trace_speed; /* trace time is divided by this; 0 = requests back to back */
+    const char *trace_path; /* file of the trace, for the report */
+    double rate;            /* aggregate operations per second; 0 selects the closed loop */
+    pace_arrival arrival;   /* inter-arrival distribution of the open loop */
+    int spin;               /* open loop: busy-wait for the intended time instead of sleeping */
+    int server_pid;         /* host PID of the server for CPU and memory sampling; 0 = off */
 } pace_config;
 
 typedef struct pace_result {

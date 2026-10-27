@@ -186,6 +186,20 @@ service latency us: mean 1632.5  p50 1466.4  p90 2687.0  p99 4358.1  p99.9 5046.
 request latency us: mean 1632.5  p50 1466.4  p90 2687.0  p99 4358.1  p99.9 5046.3  p99.99 5931.0  max 6190.5
 ```
 
+**Trace replay.** `--trace FILE` takes the request chains of the KV-cache scenario from a trace instead of the
+model: JSON lines in the layout of the Mooncake traces, one request per line with its arrival `timestamp` in
+milliseconds and the `hash_ids` of its prompt blocks in order (other fields are ignored; `src/trace.h`). Requests are
+started in trace order at their trace time divided by `--trace-speed` (default 1; `0` starts each request as soon
+as a request machine is free), probe their blocks until the first miss and write the rest, as modeled requests
+do. The run ends with the trace: there is no warm-up, and `--rate`, `--requests` and `--duration` do not apply.
+`--block-size` sets the bytes per block id. The JSON result names the trace, its request and block counts and the
+speed (`kvcache.trace`).
+
+```
+kvpace --driver resp --port 6379 --scenario kvcache --trace conversation_trace.jsonl --block-size 16384 \
+       --threads 4 --conns-per-thread 4 --pipeline 4
+```
+
 ## 6. Load control
 
 | Option | Effect |
@@ -349,6 +363,8 @@ threads versus multiplexed connections) must not be compared with each other ([v
 | `--shared-blocks` | 32 | 0 to 1048576 |
 | `--turn-blocks`, `--active-conv`, `--max-turns` | 8, 256, 16 | 1 to 1048576 |
 | `--new-conv-prob` | 0.05 | 0 to 1 |
+| `--trace` | | file of JSON lines (`timestamp`, `hash_ids`) |
+| `--trace-speed` | 1 | 0 or more (0: back to back) |
 | `--duration` | 10 | seconds, greater than 0 |
 | `--warmup` | 2 | seconds, 0 or more |
 | `--requests` | | 1 or more, per connection |

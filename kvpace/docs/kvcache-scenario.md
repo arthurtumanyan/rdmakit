@@ -9,6 +9,15 @@
 - With `--conns-per-thread` or `--pipeline` above 1, each pipeline slot runs the requests of one such thread, with one block operation in flight; `T x C x P` slots make the requests of `T x C x P` synchronous threads.
 - Block content is a deterministic function of the key; hits are compared byte for byte (`corrupt` counts mismatches).
 
+## Trace replay
+
+With `--trace FILE` the chains come from a request trace instead of the model: each line of the file (JSON, in the
+layout of the Mooncake traces) gives an arrival time and the block ids of a prompt, and requests that share a
+prefix share its ids. Each request is probed and written exactly as a modeled one; requests start in trace order at
+their scaled trace times, so the arrival pattern and the prefix sharing are those of the trace. Block ids are
+mapped to keys in a namespace of their own, so trace blocks never meet modeled blocks. Usage:
+[`USAGE.md`](USAGE.md#5-workloads).
+
 ## Metrics
 | Metric | Definition |
 |---|---|
@@ -25,8 +34,8 @@ are in [`../../benchmarks/README.md`](../../benchmarks/README.md); the method is
 
 ## Limits of the model
 
-- The request structure (template prefix, conversation turns, Zipfian reuse) is a model with explicit parameters; it
-  is not derived from a production trace.
+- The request structure of the model (template prefix, conversation turns, Zipfian reuse) has explicit parameters;
+  it is not derived from a production trace. Trace replay (above) takes the structure from a trace instead.
 - Block content is a deterministic function of the key, so servers that compress values would benefit unrealistically
   (none of the supported servers compress by default).
 - A request costs a PUT per missing block; in an inference system a missing block costs computation, not a write.

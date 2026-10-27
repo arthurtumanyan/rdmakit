@@ -61,7 +61,7 @@ EXTRA_DEP := $(AKV_LIB) $(DUCT_LIB)
 endif
 
 LIB_SRC := src/hist.c src/zipf.c src/sock.c src/netbuf.c src/abuf.c src/workload.c src/driver.c src/drv_resp.c \
-	src/drv_memcached.c $(EXTRA_SRC) src/runner.c src/report.c src/proc.c src/kvcache.c src/json.c src/merge.c
+	src/drv_memcached.c $(EXTRA_SRC) src/runner.c src/report.c src/proc.c src/kvcache.c src/trace.c src/json.c src/merge.c
 LIB_OBJ := $(patsubst src/%.c,$(OUT)/%.o,$(LIB_SRC))
 TESTS := $(patsubst tests/%.c,$(OUT)/%,$(wildcard tests/test_*.c))
 
