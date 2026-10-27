@@ -132,8 +132,9 @@ up).
 With `--conns-per-thread 1 --pipeline 1` (the default) each thread calls the driver synchronously. Any other setting
 selects the multiplexed runner: each thread serves its connections from one epoll loop and keeps up to `--pipeline`
 requests in flight on each. Requests on one connection complete in order, so a slow response delays the responses
-queued behind it; this delay is part of the measured latency, as it is for an application that pipelines. The
-KV-cache scenario always uses the synchronous runner.
+queued behind it; this delay is part of the measured latency, as it is for an application that pipelines. In the
+KV-cache scenario every pipeline slot runs its own sequence of requests with one block operation in flight, so
+`--threads T --conns-per-thread C --pipeline P` makes the requests of `T x C x P` synchronous threads.
 
 ## 5. Workloads
 

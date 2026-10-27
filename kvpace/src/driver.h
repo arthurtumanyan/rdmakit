@@ -45,6 +45,9 @@ typedef struct pace_req {
 typedef struct pace_reply {
     int status;    /* PACE_OK, PACE_NOTFOUND or PACE_ERR */
     unsigned hits; /* MGET: keys found */
+    /* GET hit: the value, valid until the next io() or next() call on the connection; NULL otherwise */
+    const void *val;
+    size_t vlen;
 } pace_reply;
 
 typedef struct pace_adriver {

@@ -657,6 +657,8 @@ static int aresp_next(pace_aconn *c, pace_reply *out) {
         return 0;
     }
     out->hits = 0;
+    out->val = NULL;
+    out->vlen = 0;
     size_t used;
     if (p[0] == '-') {
         used = line_len(p, n);
@@ -673,6 +675,11 @@ static int aresp_next(pace_aconn *c, pace_reply *out) {
         used = (size_t)u;
         out->status = found ? PACE_OK : PACE_NOTFOUND;
         out->hits = (unsigned)found;
+        if (found) {
+            size_t hl = line_len(p, n); /* "$<len>\r\n" */
+            out->val = p + hl;
+            out->vlen = used - hl - 2;
+        }
     } else if (type == PACE_OP_SET) {
         used = line_len(p, n);
         if (used == 0) {

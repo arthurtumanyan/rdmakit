@@ -6,6 +6,7 @@
 - A prompt is a chain of blocks: `shared_blocks` template blocks (identical for all requests of a prefix group) followed by `(t + 1) * turn_blocks` conversation blocks for turn `t` of a conversation.
 - The store is probed with GET in chain order until the first miss. Every block from the first miss to the end of the chain is then written with PUT (the recomputed tail).
 - Each thread holds `active_conv` conversation slots, selected with a Zipfian distribution (`--theta`). A slot is replaced by a new conversation with probability `new_conv_prob` per request or after `max_turns` turns. Prefix groups are drawn with the same distribution. Threads share no state.
+- With `--conns-per-thread` or `--pipeline` above 1, each pipeline slot runs the requests of one such thread, with one block operation in flight; `T x C x P` slots make the requests of `T x C x P` synchronous threads.
 - Block content is a deterministic function of the key; hits are compared byte for byte (`corrupt` counts mismatches).
 
 ## Metrics

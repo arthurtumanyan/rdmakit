@@ -296,6 +296,8 @@ static int amc_next(pace_aconn *c, pace_reply *out) {
     size_t n = pace_abuf_avail(&c->b);
     size_t used = 0;
     out->hits = 0;
+    out->val = NULL;
+    out->vlen = 0;
     if (type == PACE_OP_GET || type == PACE_OP_MGET) {
         for (;;) {
             size_t ll = line_len(p + used, n - used);
@@ -318,6 +320,10 @@ static int amc_next(pace_aconn *c, pace_reply *out) {
             size_t bytes = (size_t)strtoul((const char *)p + used + s, NULL, 10);
             if (used + ll + bytes + 2 > n) {
                 return 0;
+            }
+            if (out->hits == 0 && type == PACE_OP_GET) {
+                out->val = p + used + ll;
+                out->vlen = bytes;
             }
             used += ll + bytes + 2;
             out->hits++;

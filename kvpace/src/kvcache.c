@@ -128,46 +128,86 @@ static size_t chain_key(const pace_kvcache_state *st, const struct conv_slot *s,
     return pace_kvcache_block_key(st->cfg.seed, s->group, s->id, i - st->cfg.shared_blocks + 1, key);
 }
 
-int pace_kvcache_request(pace_kvcache_state *st, const pace_driver *drv, pace_conn *conn,
-                         pace_kvcache_stats *out) {
+void pace_kvcache_begin(pace_kvcache_state *st, pace_kvcache_req *r) {
     const pace_kvcache_cfg *cfg = &st->cfg;
-    struct conv_slot *s = &st->slots[pace_zipf_next(&st->slot_zipf, &st->rng)];
+    uint32_t slot = (uint32_t)pace_zipf_next(&st->slot_zipf, &st->rng);
+    struct conv_slot *s = &st->slots[slot];
     if (pace_rng_double(&st->rng) < cfg->new_conv_prob || s->turns >= cfg->max_turns) {
         slot_renew(st, s);
     }
-    uint32_t total = cfg->shared_blocks + (s->turns + 1) * cfg->turn_blocks;
+    memset(r, 0, sizeof(*r));
+    r->slot = slot;
+    r->total = cfg->shared_blocks + (s->turns + 1) * cfg->turn_blocks;
     s->turns++;
-    out->requests++;
+    r->stats.requests = 1;
+}
 
-    char key[PACE_KVCACHE_KEY_LEN];
-    uint32_t first_miss = total;
-    for (uint32_t i = 0; i < total; i++) {
-        size_t klen = chain_key(st, s, i, key);
-        size_t got = 0;
-        out->block_gets++;
-        int rc = drv->get(conn, key, klen, st->got, cfg->block_size + 64, &got);
-        if (rc == PACE_ERR) {
-            return PACE_ERR;
-        }
-        if (rc == PACE_NOTFOUND) {
-            first_miss = i;
-            break;
-        }
-        out->block_hits++;
-        out->bytes_get += got;
-        block_content(key, klen, st->expect, cfg->block_size);
-        if (got != cfg->block_size || memcmp(st->got, st->expect, cfg->block_size) != 0) {
-            out->corrupt++;
-        }
+int pace_kvcache_op(pace_kvcache_state *st, pace_kvcache_req *r, pace_req *op) {
+    if (r->index >= r->total) {
+        return 0;
     }
-    for (uint32_t i = first_miss; i < total; i++) {
-        size_t klen = chain_key(st, s, i, key);
-        block_content(key, klen, st->block, cfg->block_size);
-        if (drv->put(conn, key, klen, st->block, cfg->block_size) != PACE_OK) {
-            return PACE_ERR;
-        }
-        out->block_puts++;
-        out->bytes_put += cfg->block_size;
+    const struct conv_slot *s = &st->slots[r->slot];
+    size_t klen = chain_key(st, s, r->index, r->key);
+    *op = (pace_req){.key = r->key, .klen = klen};
+    if (!r->putting) {
+        op->type = PACE_OP_GET;
+        r->stats.block_gets++;
+    } else {
+        block_content(r->key, klen, st->block, st->cfg.block_size);
+        op->type = PACE_OP_SET;
+        op->val = st->block;
+        op->vlen = st->cfg.block_size;
     }
+    return 1;
+}
+
+int pace_kvcache_result(pace_kvcache_state *st, pace_kvcache_req *r, int status, const void *val,
+                        size_t vlen) {
+    const pace_kvcache_cfg *cfg = &st->cfg;
+    if (status == PACE_ERR) {
+        return PACE_ERR;
+    }
+    if (r->putting) {
+        r->stats.block_puts++;
+        r->stats.bytes_put += cfg->block_size;
+        r->index++;
+        return PACE_OK;
+    }
+    if (status == PACE_NOTFOUND) {
+        r->putting = 1; /* the recomputed tail starts at the first miss */
+        return PACE_OK;
+    }
+    r->stats.block_hits++;
+    r->stats.bytes_get += vlen;
+    block_content(r->key, PACE_KVCACHE_KEY_LEN, st->expect, cfg->block_size);
+    if (val == NULL || vlen != cfg->block_size || memcmp(val, st->expect, cfg->block_size) != 0) {
+        r->stats.corrupt++;
+    }
+    r->index++;
     return PACE_OK;
+}
+
+int pace_kvcache_request(pace_kvcache_state *st, const pace_driver *drv, pace_conn *conn,
+                         pace_kvcache_stats *out) {
+    pace_kvcache_req r;
+    pace_req op;
+    int rc = PACE_OK;
+    pace_kvcache_begin(st, &r);
+    while (rc == PACE_OK && pace_kvcache_op(st, &r, &op)) {
+        if (op.type == PACE_OP_GET) {
+            size_t got = 0;
+            int g = drv->get(conn, op.key, op.klen, st->got, st->cfg.block_size + 64, &got);
+            rc = pace_kvcache_result(st, &r, g, st->got, got);
+        } else {
+            rc = pace_kvcache_result(st, &r, drv->put(conn, op.key, op.klen, op.val, op.vlen), NULL, 0);
+        }
+    }
+    out->requests += r.stats.requests;
+    out->block_gets += r.stats.block_gets;
+    out->block_hits += r.stats.block_hits;
+    out->block_puts += r.stats.block_puts;
+    out->bytes_get += r.stats.bytes_get;
+    out->bytes_put += r.stats.bytes_put;
+    out->corrupt += r.stats.corrupt;
+    return rc;
 }

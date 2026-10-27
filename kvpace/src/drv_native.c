@@ -300,12 +300,18 @@ static int anative_next(pace_aconn *a, pace_reply *out) {
     a->head = (a->head + 1) % 4096;
     a->count--;
     out->hits = 0;
+    out->val = NULL;
+    out->vlen = 0;
     out->status = status_of(r.status);
     if (type == PACE_OP_MGET && r.status == AKVP_OK) {
         out->hits = mget_hits(r.payload, r.len);
     }
     if (type == PACE_OP_GET) {
         out->hits = r.status == AKVP_OK;
+        if (r.status == AKVP_OK) {
+            out->val = r.payload;
+            out->vlen = r.len;
+        }
     }
     return 1;
 }

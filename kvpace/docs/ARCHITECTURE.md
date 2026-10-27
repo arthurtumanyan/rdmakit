@@ -33,8 +33,8 @@ This document is for people who change or review the tool. Usage is in the [READ
 
 Step 3 has two implementations:
 
-- **Synchronous** (`--conns-per-thread 1 --pipeline 1`, and always for the KV-cache scenario): one connection, one
-  request in flight; the worker calls the blocking driver functions.
+- **Synchronous** (`--conns-per-thread 1 --pipeline 1`): one connection, one request in flight; the worker calls the
+  blocking driver functions.
 - **Multiplexed** (any other setting): the worker owns `C` connections registered in one epoll set. Each connection
   has a ring of up to `--pipeline` in-flight records (operation type, intended time, send time). In the closed loop
   every free slot is filled at once. In the open loop the schedule produces intended times into a per-thread
@@ -43,6 +43,14 @@ Step 3 has two implementations:
   taken in request order and matched with the head of the ring. The worker blocks in `epoll_pwait2` only when no
   connection can make progress; the timeout is the next intended time in the open loop (50 ms otherwise, to notice
   the stop flag).
+
+In the KV-cache scenario a request is a chain of block operations, each depending on the reply to the one before
+(probing stops at the first miss). The multiplexed runner therefore gives every pipeline slot a request machine with
+its own scenario state and at most one block operation in flight: a slot starts a request (with an intended time
+from the backlog in the open loop), submits its next block operation whenever the previous reply arrives, and
+records the request when its chain is complete. Machine identities are numbered `0 .. threads x conns x pipeline -
+1` and seeded like synchronous threads of the same number, so a multiplexed run makes the same requests as a
+synchronous run with that many threads. The block steps are shared with the synchronous runner (`kvcache.h`).
 
 The main thread waits until all workers are ready, sets the start flag, sleeps for the warm-up, takes the first
 server sample and a timestamp, sets the `measuring` flag, sleeps for the measurement duration (or, with

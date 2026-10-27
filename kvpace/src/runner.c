@@ -361,6 +361,22 @@ struct inflight {
     uint16_t nkeys;
     unsigned hits;
     int rc;
+    unsigned machine; /* KV-cache scenario: request machine of the operation */
+};
+
+/*
+ * KV-cache scenario on the asynchronous interface: each pipeline slot of a connection runs one request
+ * machine, which has its own scenario state (conversation slots, random stream) and at most one block
+ * operation in flight, because each operation depends on the reply to the one before. A machine therefore
+ * generates the same requests as a thread of the synchronous runner with the same identity.
+ */
+struct kvm {
+    pace_kvcache_state *st;
+    pace_kvcache_req r;
+    int active;
+    uint64_t intended; /* intended send time of the request */
+    uint64_t sent;     /* send time of its first operation */
+    uint64_t started;  /* requests started (count mode) */
 };
 
 struct aslot {
@@ -372,6 +388,7 @@ struct aslot {
     uint64_t issued;
     uint64_t completed;
     unsigned events; /* registered epoll events */
+    struct kvm *kvm; /* KV-cache scenario: depth request machines, NULL otherwise */
 };
 
 /* Encodes one operation on connection s. Returns 0 or -1. */
@@ -439,9 +456,83 @@ static int async_submit(const pace_config *cfg, struct aslot *s, const pace_op *
     return 0;
 }
 
+/* Submits the next block operation of machine m of s, if any. Returns 1 (submitted), 0 (request complete) or -1. */
+static int kv_advance(const pace_config *cfg, struct aslot *s, unsigned m) {
+    struct kvm *k = &s->kvm[m];
+    pace_req op;
+    if (!pace_kvcache_op(k->st, &k->r, &op)) {
+        return 0;
+    }
+    if (cfg->driver->async->submit(s->c, &op) != PACE_OK) {
+        return -1;
+    }
+    uint64_t now = now_ns();
+    if (k->sent == 0) {
+        k->sent = now;
+    }
+    struct inflight *f = &s->ring[(s->head + s->count) % s->depth];
+    *f = (struct inflight){
+        .intended = k->intended, .sent = now, .type = (uint8_t)op.type, .parts = 1, .machine = m};
+    s->count++;
+    s->issued++;
+    return 1;
+}
+
+/* Starts a request on the idle machine m of s with the given intended send time. Returns 0 or -1. */
+static int kv_start(const pace_config *cfg, struct aslot *s, unsigned m, uint64_t intended) {
+    struct kvm *k = &s->kvm[m];
+    pace_kvcache_begin(k->st, &k->r);
+    k->active = 1;
+    k->intended = intended;
+    k->sent = 0;
+    k->started++;
+    return kv_advance(cfg, s, m) == 1 ? 0 : -1; /* a chain has at least one block */
+}
+
+/* Records the end of the request of machine m (rc PACE_OK or PACE_ERR) and makes the machine idle. */
+static void kv_finish(struct worker *w, struct kvm *k, int rc) {
+    struct shared *sh = w->sh;
+    k->active = 0;
+    if (!atomic_load_explicit(&sh->measuring, memory_order_relaxed)) {
+        return;
+    }
+    if (rc == PACE_ERR) {
+        w->errors++;
+        return;
+    }
+    uint64_t t = now_ns();
+    pace_hist_record(&w->svc_lat, t - k->sent);
+    uint64_t start = atomic_load_explicit(&sh->measure_start_ns, memory_order_relaxed);
+    if (t >= start && (t - start) / 1000000000ull < PACE_MAX_SERIES) {
+        w->series[(t - start) / 1000000000ull]++;
+    }
+    if (k->sent > k->intended && k->sent - k->intended > w->max_lag_ns) {
+        w->max_lag_ns = k->sent - k->intended;
+    }
+    pace_hist_record(&w->req_lat, t - k->intended);
+    w->akv.requests += k->r.stats.requests;
+    w->akv.block_gets += k->r.stats.block_gets;
+    w->akv.block_hits += k->r.stats.block_hits;
+    w->akv.block_puts += k->r.stats.block_puts;
+    w->akv.bytes_get += k->r.stats.bytes_get;
+    w->akv.bytes_put += k->r.stats.bytes_put;
+    w->akv.corrupt += k->r.stats.corrupt;
+}
+
+/* Index of an idle machine of s that may start a request, or -1. */
+static int kv_idle(const pace_config *cfg, const struct aslot *s) {
+    for (unsigned m = 0; m < s->depth; m++) {
+        if (!s->kvm[m].active && (cfg->requests == 0 || s->kvm[m].started < cfg->requests)) {
+            return (int)m;
+        }
+    }
+    return -1;
+}
+
 /* Takes available replies of s and records completed operations. Returns 0 or -1. */
 static int async_drain(struct worker *w, struct aslot *s) {
-    const pace_adriver *ad = w->sh->cfg->driver->async;
+    const pace_config *cfg = w->sh->cfg;
+    const pace_adriver *ad = cfg->driver->async;
     for (;;) {
         pace_reply rep;
         int n = ad->next(s->c, &rep);
@@ -452,6 +543,22 @@ static int async_drain(struct worker *w, struct aslot *s) {
             return -1;
         }
         struct inflight *f = &s->ring[s->head];
+        if (s->kvm != NULL) {
+            unsigned m = f->machine;
+            struct kvm *k = &s->kvm[m];
+            s->head = (s->head + 1) % s->depth;
+            s->count--;
+            s->completed++;
+            int rc = pace_kvcache_result(k->st, &k->r, rep.status, rep.val, rep.vlen);
+            int next = rc == PACE_OK ? kv_advance(cfg, s, m) : 0;
+            if (next < 0) {
+                return -1;
+            }
+            if (next == 0) {
+                kv_finish(w, k, rc);
+            }
+            continue;
+        }
         if (rep.status == PACE_ERR) {
             f->rc = PACE_ERR;
         } else if (f->rc != PACE_ERR && f->parts == 1) {
@@ -509,6 +616,7 @@ static void *async_main(void *arg) {
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     struct backlog bl = {0};
     int fail = slots == NULL || vbuf == NULL || epfd < 0;
+    int kvmode = cfg->scenario == PACE_SCENARIO_KVCACHE;
     int needs_two = cfg->wl.weight[PACE_OP_RMW] > 0.0;
     for (unsigned i = 0; i < nconn && !fail; i++) {
         struct aslot *s = &slots[i];
@@ -529,6 +637,21 @@ static void *async_main(void *arg) {
         }
         s->depth = depth;
         s->ring = calloc(depth, sizeof(*s->ring));
+        if (kvmode) {
+            s->kvm = calloc(depth, sizeof(*s->kvm));
+            for (unsigned m = 0; s->kvm != NULL && m < depth && !fail; m++) {
+                /* identities 0 .. threads * conns * pipeline - 1, seeded as synchronous threads are */
+                unsigned id = (i * (cfg->pipeline ? cfg->pipeline : 1) + m) * cfg->threads + w->id;
+                s->kvm[m].st = pace_kvcache_create(&cfg->kvcache, id, cfg->seed + id * 0x2545f4914f6cdd1dull);
+                if (s->kvm[m].st == NULL) {
+                    fprintf(stderr, "worker %u: invalid kvcache parameters\n", w->id);
+                    fail = 1;
+                }
+            }
+            if (s->kvm == NULL) {
+                fail = 1;
+            }
+        }
         struct epoll_event ev = {.events = EPOLLIN, .data.u32 = i};
         if (s->ring == NULL || epoll_ctl(epfd, EPOLL_CTL_ADD, ad->fd(s->c), &ev) != 0) {
             fail = 1;
@@ -536,7 +659,7 @@ static void *async_main(void *arg) {
         s->events = EPOLLIN;
     }
     /* Preload over a synchronous connection, which every driver offers. */
-    if (!fail && cfg->preload) {
+    if (!fail && cfg->preload && !kvmode) {
         pace_conn *pc = cfg->driver->connect(cfg->host, cfg->port);
         if (pc == NULL || preload(w, pc, vbuf) != 0) {
             fail = 1;
@@ -574,7 +697,17 @@ static void *async_main(void *arg) {
             /* Requests waiting for a free pipeline slot keep their intended send time. */
             for (unsigned tries = 0; bl.count > 0 && tries < nconn;) {
                 struct aslot *s = &slots[rr % nconn];
-                if (s->count < s->depth && (cfg->requests == 0 || s->issued < cfg->requests)) {
+                int m = kvmode ? kv_idle(cfg, s) : -1;
+                if (kvmode && m >= 0) {
+                    if (kv_start(cfg, s, (unsigned)m, bl.t[bl.head]) != 0) {
+                        atomic_store(&sh->failed, 1);
+                        break;
+                    }
+                    bl.head = (bl.head + 1) % bl.cap;
+                    bl.count--;
+                    tries = 0;
+                } else if (!kvmode && s->count < s->depth &&
+                           (cfg->requests == 0 || s->issued < cfg->requests)) {
                     pace_wl_next(&cfg->wl, &wt, &rng, &op);
                     if (async_submit(cfg, s, &op, vbuf, bl.t[bl.head]) != 0) {
                         atomic_store(&sh->failed, 1);
@@ -589,7 +722,16 @@ static void *async_main(void *arg) {
                 rr++;
             }
         } else {
-            for (unsigned i = 0; i < nconn; i++) {
+            for (unsigned i = 0; i < nconn && kvmode; i++) {
+                struct aslot *s = &slots[i];
+                for (int m; (m = kv_idle(cfg, s)) >= 0;) {
+                    if (kv_start(cfg, s, (unsigned)m, now_ns()) != 0) {
+                        atomic_store(&sh->failed, 1);
+                        break;
+                    }
+                }
+            }
+            for (unsigned i = 0; i < nconn && !kvmode; i++) {
                 struct aslot *s = &slots[i];
                 while (s->count < s->depth && (cfg->requests == 0 || s->issued < cfg->requests)) {
                     pace_wl_next(&cfg->wl, &wt, &rng, &op);
@@ -608,7 +750,13 @@ static void *async_main(void *arg) {
                 atomic_store(&sh->failed, 1);
                 break;
             }
-            all_done = all_done && s->completed >= cfg->requests;
+            if (kvmode) {
+                for (unsigned m = 0; m < s->depth; m++) {
+                    all_done = all_done && !s->kvm[m].active && s->kvm[m].started >= cfg->requests;
+                }
+            } else {
+                all_done = all_done && s->completed >= cfg->requests;
+            }
             /* Arming may change the events to wait for (rdmaduct direct waiting), so it comes first. */
             if (s->count > 0 && ad->arm(s->c) != 0) {
                 ready_now = 1;
@@ -621,8 +769,8 @@ static void *async_main(void *arg) {
             }
             /* A free pipeline slot that may be filled now: submit again instead of waiting. Replies that
              * arrive before this drain would otherwise leave the connection idle until the next event. */
-            int may_issue = cfg->requests == 0 || s->issued < cfg->requests;
-            if (s->count < s->depth && may_issue && (!open_loop || bl.count > 0)) {
+            int may_issue = kvmode ? kv_idle(cfg, s) >= 0 : cfg->requests == 0 || s->issued < cfg->requests;
+            if ((kvmode || s->count < s->depth) && may_issue && (!open_loop || bl.count > 0)) {
                 ready_now = 1;
             }
         }
@@ -658,6 +806,10 @@ static void *async_main(void *arg) {
         if (slots[i].c != NULL) {
             ad->close(slots[i].c);
         }
+        for (unsigned m = 0; slots[i].kvm != NULL && m < slots[i].depth; m++) {
+            pace_kvcache_destroy(slots[i].kvm[m].st);
+        }
+        free(slots[i].kvm);
         free(slots[i].ring);
     }
     free(slots);
@@ -692,8 +844,10 @@ static int check_ops(const pace_config *cfg, int async) {
 
 int pace_run(pace_config *cfg, pace_result *res) {
     int async = cfg->conns_per_thread > 1 || cfg->pipeline > 1;
-    if (cfg->scenario == PACE_SCENARIO_KVCACHE && async) {
-        fprintf(stderr, "the kvcache scenario uses one connection per thread and no pipelining\n");
+    if (cfg->scenario == PACE_SCENARIO_KVCACHE && async && cfg->driver->async == NULL) {
+        fprintf(stderr,
+                "driver %s has no asynchronous interface (needed for --conns-per-thread/--pipeline)\n",
+                cfg->driver->name);
         return -1;
     }
     if (cfg->scenario == PACE_SCENARIO_KV && check_ops(cfg, async) != 0) {
