@@ -344,7 +344,8 @@ int pace_barrier_main(int argc, char **argv) {
     const char *out = NULL;
     unsigned long count = 0;
     double timeout_s = 3600.0;
-    for (int i = 1; i < argc; i++) {
+    /* every option takes a value: options are at odd positions, values at even ones */
+    for (int i = 1; i < argc; i += 2) {
         const char *a = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
         char *end = NULL;
@@ -369,7 +370,6 @@ int pace_barrier_main(int argc, char **argv) {
                             "[--timeout SEC]\n");
             return 2;
         }
-        i++;
     }
     if (listen_at == NULL || out == NULL || count == 0) {
         fprintf(stderr,
