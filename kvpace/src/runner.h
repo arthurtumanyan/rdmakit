@@ -77,6 +77,12 @@ typedef struct pace_config {
     pace_arrival arrival;   /* inter-arrival distribution of the open loop */
     int spin;               /* open loop: busy-wait for the intended time instead of sleeping */
     int server_pid;         /* host PID of the server for CPU and memory sampling; 0 = off */
+    /*
+     * Called once every worker is ready (connected, preloaded), before the run starts; a non-zero return
+     * stops the run as failed. Coordinated runs wait here for the coordinator's start message (coord.h).
+     */
+    int (*start_hook)(void *arg);
+    void *start_hook_arg;
 } pace_config;
 
 typedef struct pace_result {
@@ -99,6 +105,8 @@ typedef struct pace_result {
     double server_cpu_seconds;    /* server CPU time consumed during the measurement phase */
     double server_system_seconds; /* its kernel-mode part (proc(5): stime) */
     uint64_t server_rss_bytes;    /* server resident set size at the end */
+    uint64_t wall_start_ns;       /* CLOCK_REALTIME at the start and end of the measurement phase, so that */
+    uint64_t wall_end_ns;         /* merged results of several generators can be checked for overlap */
 } pace_result;
 
 /* Total operations of a result (all types). */

@@ -7,6 +7,11 @@
  * histograms; the per-second series are added element by element. Minimum and maximum latencies come from
  * the input summaries. Server samples are per host and are not merged. Inputs must be schema 2 files
  * (they carry the histogram buckets).
+ *
+ * Inputs that record the wall-clock window of their measurement (measure_start_unix_ns,
+ * measure_end_unix_ns) are checked for overlap: the merged file records the time during which all inputs
+ * were measuring (tool.measure_overlap_s), and a warning is printed when it is shorter than 90% of the
+ * shortest input, because the sum of the throughputs then describes no single interval.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -103,7 +108,11 @@ int pace_merge_main(int argc, char **argv) {
     pace_hist_reset(&req);
     uint64_t ops_of[PACE_OP_COUNT] = {0};
     uint64_t gets = 0, puts = 0, misses = 0, errors = 0, mget_keys = 0, mget_hits = 0, max_lag = 0;
-    uint64_t kv[6] = {0}; /* requests, block_gets, block_hits, block_puts, bytes_get, bytes_put */
+    uint64_t kv[7] = {0}; /* requests, block_gets, block_hits, block_puts, bytes_get, bytes_put, corrupt */
+    uint64_t latest_start = 0;
+    uint64_t earliest_end = UINT64_MAX;
+    double shortest = 0.0;
+    int have_window = 1; /* every input records its measurement window */
     int have_kv = 0;
     double seconds = 0.0;
     uint64_t series[PACE_MAX_SERIES] = {0};
@@ -166,10 +175,20 @@ int pace_merge_main(int argc, char **argv) {
         max_lag = lag > max_lag ? lag : max_lag;
         double s = pace_json_num(res, "seconds", 0.0);
         seconds = s > seconds ? s : seconds;
+        uint64_t ws = u64_of(res, "measure_start_unix_ns");
+        uint64_t we = u64_of(res, "measure_end_unix_ns");
+        if (ws == 0 || we <= ws) {
+            have_window = 0;
+        } else {
+            latest_start = ws > latest_start ? ws : latest_start;
+            earliest_end = we < earliest_end ? we : earliest_end;
+            double len = (double)(we - ws) / 1e9;
+            shortest = ninputs == 0 || len < shortest ? len : shortest;
+        }
         if (kvc != NULL) {
-            static const char *const f[6] = {"requests",   "block_gets", "block_hits",
-                                             "block_puts", "bytes_get",  "bytes_put"};
-            for (int k = 0; k < 6; k++) {
+            static const char *const f[7] = {"requests",  "block_gets", "block_hits", "block_puts",
+                                             "bytes_get", "bytes_put",  "corrupt"};
+            for (int k = 0; k < 7; k++) {
                 kv[k] += u64_of(kvc, f[k]);
             }
             have_kv = 1;
@@ -224,7 +243,15 @@ int pace_merge_main(int argc, char **argv) {
         pace_json_str(f, stamps[i]);
     }
     free(stamps);
-    fprintf(f, "], \"inputs\": %d, \"threads_total\": %u},\n  \"environment\": ", ninputs, threads);
+    double overlap =
+        have_window && earliest_end > latest_start ? (double)(earliest_end - latest_start) / 1e9 : 0.0;
+    fprintf(f, "], \"inputs\": %d, \"threads_total\": %u, \"measure_overlap_s\": ", ninputs, threads);
+    if (have_window) {
+        fprintf(f, "%.3f", overlap);
+    } else {
+        fputs("null", f);
+    }
+    fputs("},\n  \"environment\": ", f);
     pace_json_write(f, pace_json_get(base, "environment"));
     fputs(",\n  \"config\": ", f);
     pace_json_write(f, pace_json_get(base, "config"));
@@ -266,11 +293,11 @@ int pace_merge_main(int argc, char **argv) {
                 ",\n    \"kvcache\": {\"requests\": %llu, \"block_gets\": %llu, \"block_hits\": %llu, "
                 "\"hit_rate\": "
                 "%.4f, \"reuse_rate\": %.4f, \"block_puts\": %llu, \"bytes_get\": %llu, \"bytes_put\": %llu, "
-                "\"request_latency_ns\": ",
+                "\"corrupt\": %llu, \"request_latency_ns\": ",
                 (unsigned long long)kv[0], (unsigned long long)kv[1], (unsigned long long)kv[2],
                 kv[1] ? (double)kv[2] / (double)kv[1] : 0.0,
                 kv[2] + kv[3] ? (double)kv[2] / (double)(kv[2] + kv[3]) : 0.0, (unsigned long long)kv[3],
-                (unsigned long long)kv[4], (unsigned long long)kv[5]);
+                (unsigned long long)kv[4], (unsigned long long)kv[5], (unsigned long long)kv[6]);
         pace_json_hist(f, &req, &pc);
         fputs("}", f);
     }
@@ -287,5 +314,15 @@ int pace_merge_main(int argc, char **argv) {
     pace_json_free(base);
     printf("merged %d results: %llu ops in %.2f s -> %.0f ops/s\n", ninputs, (unsigned long long)ops, seconds,
            seconds > 0 ? (double)ops / seconds : 0.0);
+    if (have_window) {
+        printf("measured together for %.2f s (shortest input %.2f s)\n", overlap, shortest);
+        if (overlap < 0.9 * shortest) {
+            fprintf(
+                stderr,
+                "warning: the inputs measured together for only %.2f s of %.2f s; their throughputs do not "
+                "add up to one interval (start them together: --start-at or --coordinator)\n",
+                overlap, shortest);
+        }
+    }
     return 0;
 }

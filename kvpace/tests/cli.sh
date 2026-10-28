@@ -28,4 +28,13 @@ for bad in "--threads abc" "--threads 0" "--conns-per-thread 0" "--pipeline 0" "
     "$k" --port 1 $bad >/dev/null 2>&1
     check "rejects '$bad'" 2 $?
 done
+# kvpace barrier and --coordinator: argument errors exit with status 2 before any connection is made.
+"$k" barrier >/dev/null 2>&1
+check "barrier without arguments" 2 $?
+"$k" barrier --listen 1 --count 0 --out /dev/null >/dev/null 2>&1
+check "barrier --count 0" 2 $?
+"$k" barrier --listen 1 --count 2 --out /dev/null --timeout x >/dev/null 2>&1
+check "barrier --timeout x" 2 $?
+"$k" --port 1 --coordinator nocolon >/dev/null 2>&1
+check "rejects '--coordinator nocolon'" 2 $?
 exit $fail

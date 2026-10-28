@@ -207,11 +207,13 @@ void pace_report_json(FILE *f, const pace_config *cfg, const pace_result *res, c
             "]},\n  \"results\": {\n    \"seconds\": %.3f, \"ops\": %llu, \"gets\": %llu, \"puts\": %llu, "
             "\"misses\": %llu, \"errors\": %llu, \"ops_per_sec\": %.1f, \"mget_keys\": %llu, \"mget_hits\": "
             "%llu,\n"
+            "    \"measure_start_unix_ns\": %llu, \"measure_end_unix_ns\": %llu,\n"
             "    \"ops_by_type\": {",
             res->seconds, (unsigned long long)ops, (unsigned long long)res->gets,
             (unsigned long long)res->puts, (unsigned long long)res->misses, (unsigned long long)res->errors,
             res->seconds > 0 ? (double)ops / res->seconds : 0.0, (unsigned long long)res->mget_keys,
-            (unsigned long long)res->mget_hits);
+            (unsigned long long)res->mget_hits, (unsigned long long)res->wall_start_ns,
+            (unsigned long long)res->wall_end_ns);
     for (unsigned i = 0; i < PACE_OP_COUNT; i++) {
         fprintf(f, "%s\"%s\": %llu", i ? ", " : "", pace_op_name((pace_op_type)i),
                 (unsigned long long)res->ops_of[i]);

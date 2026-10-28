@@ -4,7 +4,9 @@
  * Two synthetic results with known histograms are written as JSON and merged. The merged file must hold
  * the summed counters, the input timestamps, the longer measurement time, the element-wise sum of the per-second series, the
  * summed histogram buckets, and percentiles equal to those of the histograms merged in memory. A schema-1
- * file is refused. The CSV and .hgrm writers are checked for their header and the final percentile.
+ * file is refused. Inputs with measurement windows record their overlap (none without windows, the
+ * common part of overlapping windows, zero for disjoint ones), and KV-cache counters including corrupt
+ * blocks are summed. The CSV and .hgrm writers are checked for their header and the final percentile.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -111,6 +113,8 @@ int main(void) {
                "series summed element-wise");
         const pace_json *inputs = pace_json_get(pace_json_get(m, "tool"), "inputs");
         EXPECT(pace_json_u64(inputs) == 2, "two inputs recorded");
+        const pace_json *ov = pace_json_get(pace_json_get(m, "tool"), "measure_overlap_s");
+        EXPECT(ov != NULL && ov->type == PJ_NULL, "no overlap without measurement windows");
         const pace_json *stamps = pace_json_get(pace_json_get(m, "tool"), "input_timestamps");
         EXPECT(stamps != NULL && stamps->n == 2 && stamps->items[0]->type == PJ_STR &&
                    strlen(stamps->items[0]->text) == 20,
@@ -134,6 +138,48 @@ int main(void) {
     fclose(f);
     char *argv3[] = {"merge", "--out", out, old};
     EXPECT(pace_merge_main(4, argv3) != 0, "schema 1 refused");
+
+    /* measurement windows: [1000 s, 1002 s] and [1000.5 s, 1003.5 s] overlap for 1.5 s; [1005 s, 1008 s] not */
+    static const uint64_t s = 1000000000ull;
+    ra.wall_start_ns = 1000 * s;
+    ra.wall_end_ns = 1002 * s;
+    rb.wall_start_ns = 1000 * s + s / 2;
+    rb.wall_end_ns = 1003 * s + s / 2;
+    write_json(a, &cfg, &ra, &pc);
+    write_json(b, &cfg, &rb, &pc);
+    char *argv4[] = {"merge", "--out", out, a, b};
+    EXPECT(pace_merge_main(5, argv4) == 0, "merge with windows");
+    pace_json *w = pace_json_load(out, err, sizeof(err));
+    EXPECT(w != NULL && pace_json_num(pace_json_get(w, "tool"), "measure_overlap_s", -1) == 1.5,
+           "overlap 1.5 s");
+    pace_json_free(w);
+    rb.wall_start_ns = 1005 * s;
+    rb.wall_end_ns = 1008 * s;
+    write_json(b, &cfg, &rb, &pc);
+    EXPECT(pace_merge_main(5, argv4) == 0, "merge of disjoint runs (warning only)");
+    w = pace_json_load(out, err, sizeof(err));
+    EXPECT(w != NULL && pace_json_num(pace_json_get(w, "tool"), "measure_overlap_s", -1) == 0.0,
+           "no overlap");
+    pace_json_free(w);
+
+    /* KV-cache counters, including corrupt blocks, are summed */
+    pace_config kcfg = cfg;
+    kcfg.scenario = PACE_SCENARIO_KVCACHE;
+    ra.kvcache = (pace_kvcache_stats){
+        .requests = 10, .block_gets = 40, .block_hits = 30, .block_puts = 12, .corrupt = 2};
+    rb.kvcache = (pace_kvcache_stats){
+        .requests = 5, .block_gets = 20, .block_hits = 10, .block_puts = 8, .corrupt = 3};
+    write_json(a, &kcfg, &ra, &pc);
+    write_json(b, &kcfg, &rb, &pc);
+    EXPECT(pace_merge_main(5, argv4) == 0, "merge of kvcache results");
+    w = pace_json_load(out, err, sizeof(err));
+    const pace_json *kv = pace_json_get(pace_json_get(w, "results"), "kvcache");
+    EXPECT(w != NULL && pace_json_u64(pace_json_get(kv, "requests")) == 15 &&
+               pace_json_u64(pace_json_get(kv, "block_hits")) == 40 &&
+               pace_json_u64(pace_json_get(kv, "corrupt")) == 5,
+           "kvcache counters summed (corrupt %llu)",
+           (unsigned long long)pace_json_u64(pace_json_get(kv, "corrupt")));
+    pace_json_free(w);
 
     /* CSV and HdrHistogram outputs */
     char csv[256];

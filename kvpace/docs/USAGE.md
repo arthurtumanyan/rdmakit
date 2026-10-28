@@ -212,6 +212,7 @@ kvpace --driver resp --port 6379 --scenario kvcache --trace conversation_trace.j
 | `--arrival constant\|poisson` | open-loop inter-arrival times |
 | `--spin` | open loop: busy-wait until each intended send time instead of sleeping (more accurate schedule, one busy core per thread) |
 | `--start-at UNIXTIME` | after the preload, wait until this wall-clock time (synchronized start on several hosts) |
+| `--coordinator HOST:PORT` | after the preload, wait for the start message of a coordinator and send it the result ([section 9](#9-several-load-generators)) |
 | `--pin LIST` | pin thread i to CPU `LIST[i mod length]` |
 
 In the open loop each operation has an intended send time derived from the rate. Latency is measured from that
@@ -246,12 +247,13 @@ Written with `--out FILE`. Schema version 2. Fields (times in nanoseconds unless
 | Path | Content |
 |---|---|
 | `schema` | 2 |
-| `tool.name`, `tool.commit`, `tool.timestamp` | `kvpace`, git description of the build, UTC time; merged files add `tool.inputs`, `tool.merged_from` (input paths), `tool.input_timestamps` and `tool.threads_total` |
+| `tool.name`, `tool.commit`, `tool.timestamp` | `kvpace`, git description of the build, UTC time; merged files add `tool.inputs`, `tool.merged_from` (input paths), `tool.input_timestamps`, `tool.threads_total` and `tool.measure_overlap_s` |
 | `environment` | `cpu`, `logical_cpus`, `kernel`, `machine`, `compiler` |
 | `config` | all options, including `conns_per_thread`, `pipeline`, `mix`, `value_sizes`, `key_prefix`, `tls`, `auth` (a flag, never the secret), `label`, `argv` |
 | `results.seconds`, `ops`, `gets`, `puts`, `misses`, `errors`, `ops_per_sec` | counters of the measurement phase |
 | `results.ops_by_type` | completed operations per type: `get`, `set`, `del`, `incr`, `mget`, `rmw`, `insert` |
 | `results.mget_keys`, `mget_hits` | keys requested and found by MGET |
+| `results.measure_start_unix_ns`, `measure_end_unix_ns` | wall-clock (CLOCK_REALTIME) start and end of the measurement phase |
 | `results.get_latency_ns`, `put_latency_ns`, `service_time_ns` | `count`, `min`, `mean`, `p50`, `p90`, `p99`, `p999`, `max`, and `percentiles` (the values of `--percentiles`) |
 | `results.latency_ns.<op>` | the same summary for every operation type with samples |
 | `results.max_lag_ns` | largest delay of an actual send behind its intended time |
@@ -289,7 +291,28 @@ host as `kvpace`.
 
 ## 9. Several load generators
 
-One client host can be the bottleneck. To load a server from several hosts:
+One client host can be the bottleneck. To load a server from several hosts, either let a coordinator start them
+and collect the results:
+
+1. on one host, `kvpace barrier --listen 7000 --count N --out all.json` waits for N generators (`--timeout SEC`
+   bounds the whole run, default 3600; 0 waits without bound);
+2. start kvpace on every generator host with the same options, its own `--seed`, `--no-preload` on all but one, and
+   `--coordinator HOST:7000`. Each generator connects, preloads, reports ready and waits; once all N are ready the
+   coordinator sends the start message to all of them, which replaces a start time, so the clocks need not be
+   synchronized. At the end each generator sends its JSON result to the coordinator (and still writes `--out`, if
+   given);
+3. the coordinator stores the results as `all-1.json` .. `all-N.json` next to `all.json` and merges them into
+   `all.json`. A generator that fails or disconnects ends the coordinated run with exit status 1.
+
+```
+$ kvpace barrier --listen 7000 --count 3 --out all.json
+barrier: waiting for 3 generators on port 7000
+barrier: 3 generators started
+merged 3 results: 1125002 ops in 2.00 s -> 562501 ops/s
+measured together for 2.00 s (shortest input 2.00 s)
+```
+
+or start them at a common wall-clock time and merge the files afterwards:
 
 1. start kvpace on every host with the same options, its own `--seed` and `--out`, and the same
    `--start-at UNIXTIME` (a time after the preload completes on all hosts; the clocks must be synchronized, for
@@ -303,9 +326,11 @@ merged 2 results: 450722 ops in 1.00 s -> 450722 ops/s
 
 `kvpace merge` sums the counters and the per-second series element by element, takes the longest measurement time,
 merges the histograms bucket by bucket and recomputes all percentiles from the merged histograms. The result is a
-schema-2 file that `kvpace merge` accepts again. Files of schema 1 have no histograms and are refused. The merge
-does not check that the inputs overlapped in time; the `tool.timestamp` of every input is kept in
-`tool.input_timestamps` for that check.
+schema-2 file that `kvpace merge` accepts again. Files of schema 1 have no histograms and are refused. Every result
+records the wall-clock start and end of its measurement (`results.measure_start_unix_ns`,
+`results.measure_end_unix_ns`); the merge records how long all inputs measured together in `tool.measure_overlap_s`
+(`null` when an input has no window) and warns when that is less than 90% of the shortest input, because the summed
+throughput then describes no single interval. With `--start-at` the overlap depends on the clocks of the hosts.
 
 ## 10. Pinning and CPU assignment
 
@@ -369,6 +394,7 @@ threads versus multiplexed connections) must not be compared with each other ([v
 | `--warmup` | 2 | seconds, 0 or more |
 | `--requests` | | 1 or more, per connection |
 | `--start-at` | | Unix time in seconds |
+| `--coordinator` | | `HOST:PORT` of a `kvpace barrier` |
 | `--rate` | 0 | operations per second, 0 or more |
 | `--arrival` | constant | `constant`, `poisson` |
 | `--spin` | | |

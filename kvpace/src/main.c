@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "coord.h"
 #include "merge.h"
 #include "report.h"
 #include "runner.h"
@@ -37,6 +38,7 @@ enum {
     OPT_WARMUP,
     OPT_REQUESTS,
     OPT_START_AT,
+    OPT_COORDINATOR,
     OPT_KEYS,
     OPT_KEY_PREFIX,
     OPT_DIST,
@@ -78,6 +80,8 @@ enum {
 static const char usage[] =
     "Usage: kvpace [options]   (-h, --help: this text; --version: build revision)\n"
     "       kvpace merge --out MERGED.json RESULT.json [RESULT.json ...]\n"
+    "       kvpace barrier --listen [ADDR:]PORT --count N --out MERGED.json [--timeout SEC]\n"
+    "                              (coordinator: starts N generators together, merges their results)\n"
     "\n"
     "Connection:\n"
     "  --driver NAME          protocol driver: resp | resp-cluster | memcached | native (default: resp)\n"
@@ -119,6 +123,9 @@ static const char usage[] =
     "  --warmup SEC           warm-up length (default: 2)\n"
     "  --requests N           requests per connection instead of a duration (no warm-up)\n"
     "  --start-at UNIXTIME    wait until this time after the preload (synchronized start on several hosts)\n"
+    "  --coordinator H:P      after the preload, wait for the start message of a coordinator (kvpace "
+    "barrier)\n"
+    "                         and send it the JSON result at the end\n"
     "  --rate N               open loop: aggregate operations per second (default 0 = closed loop)\n"
     "  --arrival NAME         open-loop inter-arrival times: constant | poisson (default: constant)\n"
     "  --spin                 open loop: busy-wait instead of sleeping until the intended send time\n"
@@ -154,6 +161,7 @@ static const struct option long_opts[] = {
     {"warmup", required_argument, NULL, OPT_WARMUP},
     {"requests", required_argument, NULL, OPT_REQUESTS},
     {"start-at", required_argument, NULL, OPT_START_AT},
+    {"coordinator", required_argument, NULL, OPT_COORDINATOR},
     {"keys", required_argument, NULL, OPT_KEYS},
     {"key-prefix", required_argument, NULL, OPT_KEY_PREFIX},
     {"dist", required_argument, NULL, OPT_DIST},
@@ -279,6 +287,9 @@ int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "merge") == 0) {
         return pace_merge_main(argc - 1, argv + 1);
     }
+    if (argc >= 2 && strcmp(argv[1], "barrier") == 0) {
+        return pace_barrier_main(argc - 1, argv + 1);
+    }
     pace_config cfg;
     pace_config_default(&cfg);
     pace_kvcache_defaults(&cfg.kvcache);
@@ -288,6 +299,7 @@ int main(int argc, char **argv) {
     const char *label = "unlabeled";
     const char *out_path = NULL;
     const char *trace_path = NULL;
+    const char *coord_addr = NULL;
     const char *csv_path = NULL;
     const char *hdr_prefix = NULL;
     const char *workload = NULL;
@@ -401,6 +413,12 @@ int main(int argc, char **argv) {
             if (num_double(optarg, 0.0, 1e12, 0, &cfg.start_at) != 0) {
                 return bad_num(opt, optarg, "a Unix time in seconds");
             }
+            break;
+        case OPT_COORDINATOR:
+            if (strchr(optarg, ':') == NULL) {
+                return bad("coordinator address (HOST:PORT)", optarg);
+            }
+            coord_addr = optarg;
             break;
         case OPT_KEYS:
             if (num_u64(optarg, 1, UINT64_MAX / 2, &cfg.wl.nkeys) != 0) {
@@ -623,11 +641,44 @@ int main(int argc, char **argv) {
         cfg.trace = &trace;
         cfg.trace_path = trace_path;
     }
+    pace_coord *coord = NULL;
+    if (coord_addr != NULL) {
+        char err[512];
+        coord = pace_coord_connect(coord_addr, err, sizeof(err));
+        if (coord == NULL) {
+            fprintf(stderr, "%s\n", err);
+            return 1;
+        }
+        cfg.start_hook = pace_coord_start;
+        cfg.start_hook_arg = coord;
+    }
     static pace_result res;
     if (pace_run(&cfg, &res) != 0) {
+        if (coord != NULL) {
+            pace_coord_failed(coord);
+            pace_coord_close(coord);
+        }
         return 1;
     }
     pace_report_text(stdout, &cfg, &res, &pc);
+    if (coord != NULL) {
+        char *json = NULL;
+        size_t jlen = 0;
+        FILE *mf = open_memstream(&json, &jlen);
+        int sent = -1;
+        if (mf != NULL) {
+            pace_report_json(mf, &cfg, &res, &pc, label, argc, argv);
+            if (fclose(mf) == 0) {
+                sent = pace_coord_result(coord, json, jlen);
+            }
+        }
+        free(json);
+        pace_coord_close(coord);
+        if (sent != 0) {
+            fprintf(stderr, "coordinator: sending the result failed\n");
+            return 1;
+        }
+    }
     if (out_path != NULL) {
         FILE *f = fopen(out_path, "w");
         if (f == NULL) {

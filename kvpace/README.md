@@ -12,7 +12,8 @@ its result files.
   as presets.
 - Key distributions: uniform, Zipfian, sequential, Gaussian, latest. Value sizes: fixed, uniform range or weighted
   list. Key prefixes.
-- Duration or request-count runs; synchronized start on several hosts and `kvpace merge` to combine their results.
+- Duration or request-count runs; several load generators started together by a coordinator (`kvpace barrier`) or
+  at a common time, and `kvpace merge` to combine their results with an overlap check.
 - Authentication (RESP `AUTH`, memcached ASCII authentication, native `AUTH`), RESP `SELECT`, and optional TLS for
   the RESP and memcached drivers (`TLS=1`).
 - A KV-cache scenario: prefix-chain requests with reuse accounting, modeled or replayed from a request trace.
@@ -67,7 +68,7 @@ generation, HTTP. See
 | KV-cache prefix-chain scenario with reuse accounting | yes | no | no |
 | Server CPU time and memory per operation | yes (`--server-pid`) | no | no |
 | Hardware and software environment in every result file | yes | no | no |
-| Multi-host load generation | synchronized start, `kvpace merge` of the result files | no | separate client processes |
+| Multi-host load generation | coordinator start and result collection, or synchronized start; merge with overlap check | no | separate client processes |
 | Cluster-aware clients | Redis Cluster (`--driver resp-cluster`, one connection per thread) | Redis Cluster | per binding |
 
 Statements about other systems reflect their public documentation at the time of writing.
@@ -183,7 +184,8 @@ and arm64, and the TLS build on x86-64.
 | `test_resp`, `test_memcached` | drivers against in-process servers: round trips, missing keys, binary-safe and empty values, oversize values |
 | `test_drivers` | all three drivers against an in-process arenakv server: DEL, INCR, MGET, authentication, and pipelined asynchronous requests compared with the synchronous results |
 | `test_runner` | closed- and open-loop timing with a synthetic driver whose throughput and latency are known analytically, for one and for several connections per thread with pipelining; request-count mode |
-| `test_merge` | JSON round trip, `kvpace merge` (summed counters and series, merged histograms, idempotent percentiles, schema check), CSV and `.hgrm` output |
+| `test_merge` | JSON round trip, `kvpace merge` (summed counters and series, merged histograms, idempotent percentiles, schema check, measurement overlap, KV-cache counters), CSV and `.hgrm` output |
+| `test_coord` | coordinated runs: generators started together, results collected and merged, failed and missing generators |
 | `test_tls` | TLS round trips and 200 pipelined requests with certificate verification, refusal of an untrusted certificate, `--tls-skip-verify` (`TLS=1` builds) |
 | `test_kvcache` | request structure, hit rates, determinism, key sharing and separation, corruption detection, request machines of the multiplexed runner, trace loading and replay |
 
@@ -205,9 +207,9 @@ build/x86_64/kvpace --port 6379 --threads 4 --conns-per-thread 4 --pipeline 8 --
 # YCSB workload A (50% read, 50% update, Zipfian, 1000-byte values) over TLS with a password
 build/x86_64-tls/kvpace --port 6380 --tls --cacert ca.pem --auth secret --workload ycsb-a --threads 8
 
-# two load-generator hosts started together, results combined afterwards
-build/x86_64/kvpace --host 192.0.2.10 --threads 8 --start-at 1793000000 --out a.json    # on each host
-build/x86_64/kvpace merge --out all.json a.json b.json
+# two load-generator hosts started together by a coordinator, which merges their results into all.json
+build/x86_64/kvpace barrier --listen 7000 --count 2 --out all.json                              # coordinator
+build/x86_64/kvpace --host 192.0.2.10 --threads 8 --coordinator 192.0.2.20:7000                 # on each host
 
 # KV-cache scenario against a memcached server
 build/x86_64/kvpace --driver memcached --port 11211 --scenario kvcache --threads 8 --block-size 16384
@@ -235,6 +237,7 @@ The main options; `kvpace --help` prints the complete list.
 | `--duration SEC`, `--warmup SEC` | 10, 2 | measurement and warm-up length |
 | `--requests N` | | requests per connection instead of a duration (no warm-up) |
 | `--start-at UNIXTIME` | | start the warm-up at this time after the preload |
+| `--coordinator HOST:PORT` | | start when a coordinator (`kvpace barrier`) says so, and send it the result |
 | `--keys N`, `--key-prefix TEXT` | 100000, `k` | key space size (preloaded unless `--no-preload`); key prefix |
 | `--dist NAME`, `--theta X`, `--gauss-sd X` | `uniform`, 0.99, 1/6 | `uniform`, `zipf`, `sequential`, `gaussian`, `latest` |
 | `--value-size SPEC` | 64 | `N`, `A-B` or `S:W,S:W,...` |
@@ -277,14 +280,13 @@ The benchmark suite in [`../benchmarks`](../benchmarks) orchestrates these for t
   hashing over several servers and no memcached binary protocol.
 - The native driver encrypts with `--tls` only in `TLS=1` builds, and needs `--cacert` or `--tls-skip-verify`.
 - Keys are the prefix followed by 15 digits; the prefix is at most 32 bytes.
-- `kvpace merge` adds throughput and merges histograms; it does not check that the inputs ran at the same time.
 - Server CPU sampling has the 10 ms granularity of `/proc` and needs the server's host PID.
 
 ## Layout
 
 | Path | Content |
 |---|---|
-| `src/` | tool and library code (`runner`, `workload`, `hist`, `zipf`, `kvcache`, `trace`, drivers, `sock`, `report`, `json`, `merge`, `main`) |
+| `src/` | tool and library code (`runner`, `workload`, `hist`, `zipf`, `kvcache`, `trace`, drivers, `sock`, `report`, `json`, `merge`, `coord`, `main`) |
 | `tests/` | unit tests |
 | `scripts/` | helper scripts |
 | `docs/` | usage, architecture, scenario and validation documents |

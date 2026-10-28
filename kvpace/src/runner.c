@@ -63,6 +63,13 @@ static uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* CLOCK_REALTIME in nanoseconds. */
+static uint64_t wall_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 static void sleep_s(double s) {
     struct timespec ts = {.tv_sec = (time_t)s, .tv_nsec = (long)((s - (double)(time_t)s) * 1e9)};
     nanosleep(&ts, NULL);
@@ -1000,14 +1007,25 @@ int pace_run(pace_config *cfg, pace_result *res) {
             sleep_s(cfg->start_at - now);
         }
     }
+    if (cfg->start_hook != NULL && cfg->start_hook(cfg->start_hook_arg) != 0) {
+        atomic_store(&sh.failed, 1);
+        atomic_store(&sh.stop, 1);
+        for (unsigned i = 0; i < started; i++) {
+            pthread_join(ws[i].thread, NULL);
+        }
+        free(ws);
+        return -1;
+    }
     pace_proc_sample srv_before;
     pace_proc_sample srv_after;
     int srv_ok = 0;
     uint64_t t_start;
+    uint64_t wall_start;
     if (count_mode(cfg)) {
         /* Count mode: no warm-up; the measurement ends when every worker has finished. */
         srv_ok = cfg->server_pid > 0 && pace_proc_sample_pid(cfg->server_pid, &srv_before) == 0;
         t_start = now_ns();
+        wall_start = wall_ns();
         atomic_store(&sh.measure_start_ns, t_start);
         atomic_store(&sh.measuring, 1);
         atomic_store(&sh.go, 1);
@@ -1019,12 +1037,14 @@ int pace_run(pace_config *cfg, pace_result *res) {
         sleep_s(cfg->warmup_s);
         srv_ok = cfg->server_pid > 0 && pace_proc_sample_pid(cfg->server_pid, &srv_before) == 0;
         t_start = now_ns();
+        wall_start = wall_ns();
         atomic_store(&sh.measure_start_ns, t_start);
         atomic_store(&sh.measuring, 1);
         sleep_s(cfg->duration_s);
     }
     atomic_store(&sh.measuring, 0);
     uint64_t t_end = now_ns();
+    uint64_t wall_end = wall_ns();
     srv_ok = srv_ok && pace_proc_sample_pid(cfg->server_pid, &srv_after) == 0;
     atomic_store(&sh.stop, 1);
 
@@ -1071,6 +1091,8 @@ int pace_run(pace_config *cfg, pace_result *res) {
         res->misses = res->kvcache.block_gets - res->kvcache.block_hits;
     }
     res->seconds = (double)(t_end - t_start) / 1e9;
+    res->wall_start_ns = wall_start;
+    res->wall_end_ns = wall_end;
     res->nseries = (unsigned)ceil(res->seconds - 1e-9);
     if (!count_mode(cfg)) {
         res->nseries = (unsigned)(res->seconds + 0.5);
