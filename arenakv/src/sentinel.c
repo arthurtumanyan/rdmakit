@@ -1036,6 +1036,13 @@ sentinel *sentinel_start(const sentinel_cfg *cfg, char *err, size_t errlen) {
                                                  : ((struct sockaddr_in *)&ss)->sin_port);
     }
     s->sdown_since = mono_ms();
+    /* logged before the threads start: afterwards they may change the primary and the epoch */
+    const sentinel_node_cfg *p = &cfg->nodes[s->primary];
+    slog(cfg->name,
+         "monitoring primary %s %d (configuration epoch %llu), %u nodes, %u other monitors, quorum %u, "
+         "id %s, port %d",
+         p->host, p->resp_port, (unsigned long long)s->config_epoch, cfg->nnodes, cfg->npeers, quorum(s),
+         s->id, s->port);
     if (pthread_create(&s->listener, NULL, listener_main, s) != 0) {
         snprintf(err, errlen, "thread: %s", strerror(errno));
         sentinel_stop(s);
@@ -1049,12 +1056,6 @@ sentinel *sentinel_start(const sentinel_cfg *cfg, char *err, size_t errlen) {
         sentinel_stop(s);
         return NULL;
     }
-    const sentinel_node_cfg *p = &cfg->nodes[s->primary];
-    slog(cfg->name,
-         "monitoring primary %s %d (configuration epoch %llu), %u nodes, %u other monitors, quorum %u, "
-         "id %s, port %d",
-         p->host, p->resp_port, (unsigned long long)s->config_epoch, cfg->nnodes, cfg->npeers, quorum(s),
-         s->id, s->port);
     return s;
 }
 

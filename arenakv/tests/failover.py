@@ -28,8 +28,11 @@ import time
 
 BUILD = sys.argv[1] if len(sys.argv) > 1 else "build/x86_64"
 failures = 0
-DOWN_AFTER_MS = 1000
-FAILOVER_TIMEOUT_MS = 4000
+# Sanitizer builds run several times slower (ThreadSanitizer 5 to 15 times): detection times and waits are
+# scaled, so that a slow but correct failover is not reported as a failure.
+SLOW = 4 if "-tsan" in BUILD else 2 if "-san" in BUILD else 1
+DOWN_AFTER_MS = 1000 * SLOW
+FAILOVER_TIMEOUT_MS = 4000 * SLOW
 
 
 def check(name, ok, detail=""):
@@ -96,7 +99,7 @@ class Resp:
 
 def call(port, *args):
     try:
-        r = Resp(port, timeout=2)
+        r = Resp(port, timeout=2 * SLOW)
         try:
             return r.call(*args)
         finally:
@@ -163,7 +166,7 @@ class Monitor:
 
 
 def wait_for(cond, seconds):
-    deadline = time.time() + seconds
+    deadline = time.time() + seconds * SLOW
     while time.time() < deadline:
         v = cond()
         if v:
@@ -229,7 +232,7 @@ def main():
         took = time.time() - t0
         check("every monitor names the promoted replica", bool(new),
               "%.1f s, monitors %s" % (took, [m.primary() for m in monitors]))
-        check("failover within down-after + 5 s", took < DOWN_AFTER_MS / 1000 + 5, "%.1f s" % took)
+        check("failover within down-after + 5 s", took < DOWN_AFTER_MS / 1000 + 5 * SLOW, "%.1f s" % took)
         check("the replica with the highest offset is the new primary",
               wait_for(lambda: (nodes[1].role() or [b""])[0] == b"master", 5))
         check("the other replica follows the new primary", wait_for(lambda: follows(nodes[2], nodes[1]), 10))
@@ -259,7 +262,7 @@ def main():
         monitors[1].stop()
         monitors[2].stop()
         nodes[1].stop(signal.SIGKILL)
-        time.sleep(DOWN_AFTER_MS / 1000 + 3)
+        time.sleep(DOWN_AFTER_MS / 1000 + 3 * SLOW)
         check("no failover with one of three monitors",
               monitors[0].primary() == nodes[1].resp and (nodes[0].role() or [b""])[0] == b"slave" and
               (nodes[2].role() or [b""])[0] == b"slave")
@@ -300,6 +303,9 @@ def main():
                 n.stop()
             except Exception:
                 pass
+        races = [i for i in range(3) if os.path.exists(os.path.join(workdir, "sentinel%d.log" % i)) and
+                 "ThreadSanitizer" in open(os.path.join(workdir, "sentinel%d.log" % i)).read()]
+        check("no sanitizer report in the monitors' logs", not races, "monitors %s" % races)
         if failures:
             for i in range(3):
                 path = os.path.join(workdir, "sentinel%d.log" % i)
