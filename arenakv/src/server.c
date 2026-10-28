@@ -707,6 +707,13 @@ int akvd_cluster_setslot(akvd *d, unsigned slot, enum akvd_setslot kind, int nod
             cluster_set_migrating(cl, slot, -1);
             cluster_set_importing(cl, slot, -1);
             slot_cache_drop(d, slot);
+            if (cl->nodes[self].primary && atomic_load_explicit(&d->repl_active, memory_order_relaxed)) {
+                akv_change c = {.kind = (enum akv_change_kind)AOF_SLOT_NODE,
+                                .key = cl->nodes[node].id,
+                                .klen = strlen(cl->nodes[node].id),
+                                .flags = slot};
+                repl_backlog_append(repl_backlog_of(d->repl), &c);
+            }
             if (d->cfg.cluster_config != NULL) {
                 char msg[512];
                 if (cluster_save(cl, d->cfg.cluster_config, 0, msg, sizeof(msg)) != 0) {

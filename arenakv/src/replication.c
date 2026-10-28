@@ -352,6 +352,17 @@ static int apply_one(void *arg, const akv_change *c) {
         akv_unlock(s, &set);
         return 0;
     }
+    if (c->kind == (enum akv_change_kind)AOF_SLOT_NODE) {
+        const cluster *cl = akvd_cluster(a->d);
+        int node = cl != NULL ? cluster_find(cl, c->key, c->klen) : -1;
+        char err[128];
+        if (node < 0 || c->flags >= CLUSTER_SLOTS ||
+            akvd_cluster_setslot(a->d, c->flags, AKVD_SLOT_NODE, node, err, sizeof(err)) != 0) {
+            akvd_log(a->d, AKVD_LOG_WARN, "replication: slot %u not assigned to %.*s from the stream",
+                     c->flags, (int)c->klen, (const char *)c->key);
+        }
+        return 0;
+    }
     if (c->txn != 0) {
         uint8_t id[8];
         memcpy(id, &c->txn, 8);

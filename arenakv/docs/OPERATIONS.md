@@ -549,8 +549,14 @@ It follows the Redis Cluster procedure ("Live reconfiguration"), and the same co
    is copied, the engine shards of its keys stay locked on the source, so no command sees or changes a key between
    its copy and its deletion; commands on a slot being moved wait for that, at most the `MIGRATE` timeout.
 3. `CLUSTER SETSLOT <slot> NODE <target id>` on the target, the source and every other node (replicas included)
-   makes the target the owner; the source refuses while it still holds keys of the slot. Each node then rewrites its
-   map file; `CLUSTER SAVECONFIG` forces it to disk (fsync), which `akv_reshard` sends at the end.
+   makes the target the owner; the source refuses while it still holds keys of the slot. A primary also passes the
+   new owner to its replicas in the replication stream, so sending the command to the primaries only is enough.
+   Each node then rewrites its map file; `CLUSTER SAVECONFIG` forces it to disk (fsync), which `akv_reshard` sends
+   at the end.
+
+`valkey-cli --cluster reshard` (Valkey 9) runs the same procedure and works against arenakv nodes; it informs
+primaries only and relies on the replication stream for replicas. `valkey-cli --cluster` commands that change the
+membership (`add-node`, `del-node`, `create`) need `CLUSTER MEET` and gossip, which arenakv does not have.
 
 An interrupted `akv_reshard` is completed by running the same command again. `CLUSTER SETSLOT <slot> STABLE` ends a
 move without changing the owner. The first listing of a slot's keys scans the engine once for every slot being

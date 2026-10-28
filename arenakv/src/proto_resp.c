@@ -511,6 +511,7 @@ static void cmd_config_get(akvd *d, const struct arg *pattern, struct obuf *o) {
         {"appendonly", akvd_aof_info(d, &ai) == 0 ? "yes" : "no"},
         {"appendfsync", akvd_appendfsync(d)},
         {"databases", "1"},
+        {"cluster-databases", "1"},
         {"io-threads", threads},
     };
     size_t count = 0;

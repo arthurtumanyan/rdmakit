@@ -16,6 +16,7 @@ Three primaries and a replica of the first, each with its own copy of the map fi
               write is readable afterwards with its last value, kvpace reports no error, all 20,000 keys
               loaded before are intact, every node (the replica included) reports the new owner, the moved
               keys are gone from the old owner and present on its replica's new primary
+  valkey-cli  valkey-cli --cluster reshard (Docker) moves 200 more slots with their keys; all keys intact
   persistence every node, restarted, reads the new map from its rewritten file
 Exits 0 when every check passes.
 """
@@ -334,12 +335,35 @@ def main():
         r1, p1 = Resp(n[3].resp).call("DBSIZE"), Resp(n[0].resp).call("DBSIZE")
         check("reshard: the replica of the old owner dropped the moved keys", r1 == p1, "replica %s, primary %s" % (r1, p1))
 
+        vk_moved = False
+        if shutil.which("docker") and subprocess.run(["docker", "info"], capture_output=True).returncode == 0:
+            r = subprocess.run(["docker", "run", "--rm", "--network", "host", "valkey/valkey:latest", "valkey-cli",
+                                "--cluster", "reshard", "127.0.0.1:%d" % n[0].resp, "--cluster-from", "n1",
+                                "--cluster-to", "n3", "--cluster-slots", "200", "--cluster-yes",
+                                "--cluster-pipeline", "50"], capture_output=True, text=True, timeout=300)
+            tail = (r.stdout + r.stderr).strip().splitlines()[-1:]
+            vk_moved = r.returncode == 0
+            check("valkey-cli: --cluster reshard moves slots 2000-2199", r.returncode == 0 and
+                  all(owner_of(x, 2000) == n[2].resp and owner_of(x, 2199) == n[2].resp and
+                      owner_of(x, 2200) == n[0].resp for x in n), str(tail))
+            conns = {x.resp: Resp(x.resp) for x in n[:3]}
+            bad = []
+            for i in range(20000):
+                s = keyslot(b"load%d" % i)
+                port = n[2].resp if 2000 <= s < 2200 else owner_port(s, True)
+                if conns[port].call("GET", "load%d" % i) != b"v%d" % i:
+                    bad.append(i)
+            check("valkey-cli: the 20,000 keys are intact after its reshard", not bad, "%d differ" % len(bad))
+        else:
+            print("reshard: skip valkey-cli (no docker)")
+
         for x in n:
             x.stop()
             x.start()
         check("persistence: every node reads the new map from its file after a restart",
-              all(owner_of(x, 0) == n[1].resp and owner_of(x, 1999) == n[1].resp and owner_of(x, 2000) == n[0].resp
-                  for x in n), open(n[2].conf).read().splitlines()[2][:60])
+              all(owner_of(x, 0) == n[1].resp and owner_of(x, 1999) == n[1].resp and
+                  owner_of(x, 2000) == (n[2].resp if vk_moved else n[0].resp) for x in n),
+              open(n[2].conf).read().splitlines()[2][:60])
 
     finally:
         stop.set()

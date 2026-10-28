@@ -45,6 +45,13 @@ enum aof_fsync {
 /* Record kind of a transaction end; written by the server while it holds the transaction's lock set. */
 #define AOF_TXN_END 100
 
+/*
+ * Record kind of a slot that changed its owner on a primary (CLUSTER SETSLOT ... NODE): the key is the id
+ * of the new owner, flags the slot. Replication stream only (never in the log); replicas apply it to their
+ * own map, so clients that inform primaries only (valkey-cli --cluster) reach the replicas as well.
+ */
+#define AOF_SLOT_NODE 101
+
 /* Size of a record header (see the format above). */
 #define AOF_REC_HDR 28u
 

@@ -254,6 +254,9 @@ int aof_record_decode(const uint8_t *p, akv_change *c) {
     if (c->kind == (enum akv_change_kind)AOF_TXN_END) {
         return 0;
     }
+    if (c->kind == (enum akv_change_kind)AOF_SLOT_NODE) {
+        return c->klen > 0 && c->klen <= 40 ? 0 : -EBADMSG;
+    }
     if (c->kind < AKV_CHG_PUT || c->kind > AKV_CHG_FLUSH || (c->kind != AKV_CHG_FLUSH && c->klen == 0)) {
         return -EBADMSG;
     }
