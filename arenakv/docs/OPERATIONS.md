@@ -451,7 +451,49 @@ host port` starts or changes replication at run time, and `REPLICAOF NO ONE` sto
 
 ### Failover
 
-There is no automatic failover. When a primary fails:
+**Automatic failover** is done by `akv_sentinel` monitors, which follow the procedure of Redis Sentinel. Run at
+least three, on hosts that fail independently of each other and of the nodes; every monitor lists all nodes of the
+group in the same order (the first is the primary until a failover) and the other monitors:
+
+```
+akv_sentinel --name cache --listen 26379 --state /var/lib/arenakv/sentinel.state \
+    --node 10.0.0.1:6379:7600 --node 10.0.0.2:6379:7600 --node 10.0.0.3:6379:7600 \
+    --peer 10.0.0.5:26379 --peer 10.0.0.6:26379 --down-after 5000 --failover-timeout 60000
+```
+
+`--node HOST:RESP_PORT:NATIVE_PORT` gives the address used both by the monitors and by replicas, the RESP port for
+monitoring and commands, and the native port that `REPLICAOF` names. With access control on the nodes,
+`--node-auth USER:PASSWORD` names a user with the `admin` category (`REPLICAOF`). `--state` keeps the epochs, the
+vote and the current primary; without it a restarted monitor forgets them.
+
+1. Each monitor pings the primary every 100 ms. A primary without a valid reply for `--down-after` milliseconds is
+   down for that monitor (`+sdown`); with `--quorum` monitors agreeing (default: a majority) it is objectively down
+   (`+odown`).
+2. A monitor then asks for the votes of the others in a new epoch. Each monitor votes once per epoch, for the
+   first requester, and stores the vote before answering. A monitor with the votes of a majority of all monitors
+   leads the failover (`+elected-leader`); the others wait `--failover-timeout` before a new attempt.
+3. The leader promotes the reachable replica with the highest replication offset (`REPLICAOF NO ONE`), waits until
+   it reports the primary role, records it with the epoch (`+switch-master`), tells the other monitors and points
+   the other replicas at it. They continue from their offsets.
+4. Monitors exchange their configuration every second and adopt a newer one. A monitor that reaches a majority of
+   the monitors points every node that does not follow the configured primary at it (`+convert-to-slave`,
+   `+fix-slave-config`), so a former primary that comes back becomes a replica. Several monitors may send the same
+   `REPLICAOF`; it is idempotent.
+
+Clients ask a monitor for the primary: `SENTINEL GET-MASTER-ADDR-BY-NAME name` returns its address and RESP port,
+and `SENTINEL MASTERS`, `SENTINEL REPLICAS name` and `SENTINEL SENTINELS name` return the state lists that Sentinel
+clients read (redis-py's `Sentinel` works unchanged). `SENTINEL FAILOVER name` moves the primary of a healthy group
+(it still needs a majority of votes); `SENTINEL CKQUORUM name` reports whether a majority is reachable. Events go
+to standard error.
+
+What a failover cannot do: changes that the old primary acknowledged but had not sent to the promoted replica are
+lost (`WAIT` bounds that for the writes that need it); a primary cut off from the monitors but reachable by clients
+keeps accepting writes until it is demoted, and those writes are discarded when it rejoins. Without a majority of
+the monitors no failover happens. A monitor watches one replicated group; the Redis Cluster protocol's slot map
+(below) is not changed by a failover. Monitors accept requests without authentication: bind them to a trusted
+network.
+
+**Manual failover**, without monitors:
 
 1. Choose the replica with the highest `slave_repl_offset` (`INFO replication`).
 2. Promote it: `REPLICAOF NO ONE`. It keeps the old replication id as its second id (`master_replid2`).
@@ -483,7 +525,7 @@ node r1 10.0.0.4 6379 7600 replica-of n1
 - A replica in the map follows its primary automatically (through the primary's native port) and serves reads of
   its primary's slots to connections that send `READONLY`; other commands are redirected to the primary.
 - `CLUSTER SLOTS`, `SHARDS`, `NODES`, `INFO`, `MYID`, `KEYSLOT` and `COUNTKEYSINSLOT` describe the map. There is no
-  gossip, no automatic failover and no resharding: the map changes only when the file is edited and `CLUSTER
+  gossip, no automatic failover of slot owners and no resharding: the map changes only when the file is edited and `CLUSTER
   RELOAD` is sent to every node. To move slots, copy their keys to the new owner first, then reload the edited map
   everywhere.
 - The memcached and native listeners do not check slots; their clients distribute keys themselves (`akvc_pool`).

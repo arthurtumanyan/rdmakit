@@ -1,5 +1,5 @@
 # arenakv build. Targets: all, test, install, clean, format.
-#   make install [PREFIX=/usr/local] [DESTDIR=]   installs arenakvd, akv_cli and akv_bench into $(DESTDIR)$(PREFIX)/bin
+#   make install [PREFIX=/usr/local] [DESTDIR=]   installs arenakvd, akv_cli, akv_bench and akv_sentinel into $(DESTDIR)$(PREFIX)/bin
 #   make SAN=1       AddressSanitizer + UndefinedBehaviorSanitizer
 #   make TSAN=1      ThreadSanitizer
 #   make TLS=1       TLS listeners for the text protocols (needs OpenSSL headers, links -lssl -lcrypto)
@@ -52,12 +52,12 @@ CFLAGS += -fsanitize=thread -fno-omit-frame-pointer
 LDFLAGS += -fsanitize=thread
 endif
 
-LIB_SRC := src/akv.c src/server.c src/client.c src/proto_mc.c src/proto_resp.c src/snapshot.c src/aof.c src/acl.c src/sha256.c src/pubsub.c src/repl.c src/replication.c src/cluster.c
+LIB_SRC := src/akv.c src/server.c src/client.c src/proto_mc.c src/proto_resp.c src/snapshot.c src/aof.c src/acl.c src/sha256.c src/pubsub.c src/repl.c src/replication.c src/cluster.c src/sentinel.c
 LIB_OBJ := $(patsubst src/%.c,$(OUT)/%.o,$(LIB_SRC))
 LIB := $(OUT)/libarenakv.a
 TESTS := $(patsubst tests/%.c,$(OUT)/%,$(wildcard tests/test_*.c))
 
-all: $(LIB) $(OUT)/arenakvd $(OUT)/akv_bench $(OUT)/akv_cli
+all: $(LIB) $(OUT)/arenakvd $(OUT)/akv_bench $(OUT)/akv_cli $(OUT)/akv_sentinel
 
 # The transport library is built by its own makefile, which is always consulted (FORCE) so that changes
 # to the transport sources are linked in.
@@ -68,6 +68,9 @@ $(OUT)/akv_bench: tools/akv_bench.c $(LIB) $(DUCT_LIB) $(wildcard src/*.h)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIB) $(DUCT_LIB) $(LDLIBS)
 
 $(OUT)/akv_cli: tools/akv_cli.c $(LIB) $(DUCT_LIB)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIB) $(DUCT_LIB) $(LDLIBS)
+
+$(OUT)/akv_sentinel: tools/akv_sentinel.c $(LIB) $(DUCT_LIB)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIB) $(DUCT_LIB) $(LDLIBS)
 
 $(OUT)/arenakvd: tools/arenakvd.c $(LIB) $(DUCT_LIB)
@@ -96,17 +99,19 @@ endif
 # ThreadSanitizer cannot map its shadow memory under high ASLR entropy; run those binaries with ASLR off.
 RUN := $(if $(TSAN),setarch $(ARCH) -R,)
 
-test: $(TESTS) $(OUT)/arenakvd $(OUT)/akv_cli
+test: $(TESTS) $(OUT)/arenakvd $(OUT)/akv_cli $(OUT)/akv_sentinel
 	@set -e; for t in $(TESTS); do echo "== $$t"; DUCT_TEST_ADDR="$(ADDR)" $(RUN) $$t; done
 	@echo "== tests/cli.sh"; $(RUN) tests/cli.sh $(OUT)
 	@echo "== tests/durability.py"; $(RUN) python3 tests/durability.py $(OUT)
 	@echo "== tests/replication.py"; $(RUN) python3 tests/replication.py $(OUT)
 	@echo "== tests/cluster.py"; $(RUN) python3 tests/cluster.py $(OUT)
+	@echo "== tests/failover.py"; $(RUN) python3 tests/failover.py $(OUT)
 
-install: $(OUT)/arenakvd $(OUT)/akv_bench $(OUT)/akv_cli
+install: $(OUT)/arenakvd $(OUT)/akv_bench $(OUT)/akv_cli $(OUT)/akv_sentinel
 	install -D -m 755 $(OUT)/arenakvd $(DESTDIR)$(PREFIX)/bin/arenakvd
 	install -D -m 755 $(OUT)/akv_cli $(DESTDIR)$(PREFIX)/bin/akv_cli
 	install -D -m 755 $(OUT)/akv_bench $(DESTDIR)$(PREFIX)/bin/akv_bench
+	install -D -m 755 $(OUT)/akv_sentinel $(DESTDIR)$(PREFIX)/bin/akv_sentinel
 
 format:
 	clang-format -i src/*.c src/*.h include/*.h tools/*.c tests/*.c tests/fuzz/*.c
