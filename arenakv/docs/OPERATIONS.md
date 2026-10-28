@@ -508,7 +508,7 @@ need it.
 ### Cluster protocol
 
 `--cluster-config FILE --cluster-node-id ID` makes the RESP listener speak the Redis Cluster protocol with a slot
-map from FILE, the same file on every node:
+map from FILE (a copy on every node, or one file that the nodes of one host share):
 
 ```
 # id  host      resp-port native-port role
@@ -524,10 +524,41 @@ node r1 10.0.0.4 6379 7600 replica-of n1
   the redirections.
 - A replica in the map follows its primary automatically (through the primary's native port) and serves reads of
   its primary's slots to connections that send `READONLY`; other commands are redirected to the primary.
-- `CLUSTER SLOTS`, `SHARDS`, `NODES`, `INFO`, `MYID`, `KEYSLOT` and `COUNTKEYSINSLOT` describe the map. There is no
-  gossip, no automatic failover of slot owners and no resharding: the map changes only when the file is edited and `CLUSTER
-  RELOAD` is sent to every node. To move slots, copy their keys to the new owner first, then reload the edited map
-  everywhere.
+- `CLUSTER SLOTS`, `SHARDS`, `NODES`, `INFO`, `MYID`, `KEYSLOT`, `COUNTKEYSINSLOT` and `GETKEYSINSLOT` describe
+  the map. There is no gossip and no automatic failover of slot owners. The map changes when the file is edited and
+  `CLUSTER RELOAD` is sent to every node, or slot by slot during resharding (below).
+
+#### Resharding
+
+`akv_reshard` moves slots with their keys from one primary to another while clients keep working:
+
+```
+akv_reshard --from 10.0.0.1:6379 --to 10.0.0.2:6379 --slots 0-999,4000 [--batch 100] [--timeout 5000] \
+    [--auth USER:PASSWORD]
+```
+
+It follows the Redis Cluster procedure ("Live reconfiguration"), and the same commands can be sent by hand:
+
+1. `CLUSTER SETSLOT <slot> IMPORTING <source id>` on the target and `CLUSTER SETSLOT <slot> MIGRATING <target id>`
+   on the source, for every slot. From then on the source serves keys of the slot that it still holds, answers
+   `ASK <slot> <target>` for keys it does not hold (and `TRYAGAIN` for a command whose keys are partly moved), and
+   the target serves the slot to a connection that sent `ASKING` just before. Cluster clients (redis-py
+   `RedisCluster`, kvpace `--driver resp-cluster`) follow `ASK`.
+2. `CLUSTER GETKEYSINSLOT <slot> <count>` on the source lists keys, and `MIGRATE <target host> <port> "" 0 <timeout>
+   REPLACE KEYS <key> ...` moves them: the source copies them with `RESTORE-ASKING` and deletes them. While a batch
+   is copied, the engine shards of its keys stay locked on the source, so no command sees or changes a key between
+   its copy and its deletion; commands on a slot being moved wait for that, at most the `MIGRATE` timeout.
+3. `CLUSTER SETSLOT <slot> NODE <target id>` on the target, the source and every other node (replicas included)
+   makes the target the owner; the source refuses while it still holds keys of the slot. Each node then rewrites its
+   map file; `CLUSTER SAVECONFIG` forces it to disk (fsync), which `akv_reshard` sends at the end.
+
+An interrupted `akv_reshard` is completed by running the same command again. `CLUSTER SETSLOT <slot> STABLE` ends a
+move without changing the owner. The first listing of a slot's keys scans the engine once for every slot being
+moved, so marking all slots before moving keys (as `akv_reshard` does) costs one scan. `MIGRATE`, `DUMP` and
+`RESTORE` belong to the `dangerous` category; `DUMP` and `RESTORE` use arenakv's own value format (with a CRC32C), so
+they exchange values only between arenakv nodes. Map files are rewritten on every ownership change without fsync,
+which a process crash does not lose; after an operating-system crash between the change and `CLUSTER SAVECONFIG`
+a node can start with an older map.
 - The memcached and native listeners do not check slots; their clients distribute keys themselves (`akvc_pool`).
 
 ### Monitoring replication

@@ -36,6 +36,7 @@
 static const acl_cmd CMDS[] = {
     /* RESP */
     {ACL_RESP, "APPEND", W, 1, 1, 1, KW},
+    {ACL_RESP, "ASKING", CN, 0, 0, 0, 0},
     {ACL_RESP, "AUTH", CN, 0, 0, 0, 0},
     {ACL_RESP, "BGREWRITEAOF", AD | DG, 0, 0, 0, 0},
     {ACL_RESP, "BGSAVE", AD | DG, 0, 0, 0, 0},
@@ -48,6 +49,7 @@ static const acl_cmd CMDS[] = {
     {ACL_RESP, "DECRBY", W, 1, 1, 1, KR | KW},
     {ACL_RESP, "DEL", W | KS, 1, -1, 1, KW},
     {ACL_RESP, "DISCARD", TX, 0, 0, 0, 0},
+    {ACL_RESP, "DUMP", R | KS, 1, 1, 1, KR},
     {ACL_RESP, "ECHO", CN, 0, 0, 0, 0},
     {ACL_RESP, "EXEC", TX, 0, 0, 0, 0},
     {ACL_RESP, "EXISTS", R | KS, 1, -1, 1, KR},
@@ -66,6 +68,7 @@ static const acl_cmd CMDS[] = {
     {ACL_RESP, "KEYS", KS | R | DG, 0, 0, 0, 0},
     {ACL_RESP, "LASTSAVE", AD | DG, 0, 0, 0, 0},
     {ACL_RESP, "MGET", R, 1, -1, 1, KR},
+    {ACL_RESP, "MIGRATE", W | KS | DG, 0, 0, 0, 0},
     {ACL_RESP, "MSET", W, 1, -1, 2, KW},
     {ACL_RESP, "MULTI", TX, 0, 0, 0, 0},
     {ACL_RESP, "PERSIST", W | KS, 1, 1, 1, KW},
@@ -82,6 +85,8 @@ static const acl_cmd CMDS[] = {
     {ACL_RESP, "READONLY", CN, 0, 0, 0, 0},
     {ACL_RESP, "READWRITE", CN, 0, 0, 0, 0},
     {ACL_RESP, "REPLICAOF", AD | DG, 0, 0, 0, 0},
+    {ACL_RESP, "RESTORE", W | KS | DG, 1, 1, 1, KW},
+    {ACL_RESP, "RESTORE-ASKING", W | KS | DG, 1, 1, 1, KW},
     {ACL_RESP, "ROLE", AD | DG, 0, 0, 0, 0},
     {ACL_RESP, "SAVE", AD | DG, 0, 0, 0, 0},
     {ACL_RESP, "SCAN", KS | R, 0, 0, 0, 0},

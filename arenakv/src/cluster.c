@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 uint16_t cluster_crc16(const void *data, size_t n) {
     const uint8_t *p = data;
@@ -93,6 +94,8 @@ cluster *cluster_load(const char *path, const char *self_id, char *err, size_t e
     }
     for (unsigned s = 0; s < CLUSTER_SLOTS; s++) {
         c->owner[s] = -1;
+        c->migrating[s] = -1;
+        c->importing[s] = -1;
     }
     c->self = -1;
     char line[8192];
@@ -113,7 +116,7 @@ cluster *cluster_load(const char *path, const char *self_id, char *err, size_t e
         if (nt == 0) {
             continue;
         }
-        if (strcmp(tok[0], "node") != 0 || nt < 7) {
+        if (strcmp(tok[0], "node") != 0 || nt < 6) {
             set_err(
                 err, errlen,
                 "%s: line %d: expected 'node <id> <host> <resp-port> <native-port> primary|replica-of ...'",
@@ -246,4 +249,56 @@ unsigned cluster_assigned(const cluster *c) {
         n += c->owner[s] >= 0;
     }
     return n;
+}
+
+int cluster_find(const cluster *c, const char *id, size_t n) {
+    for (unsigned i = 0; i < c->n; i++) {
+        if (strlen(c->nodes[i].id) == n && memcmp(c->nodes[i].id, id, n) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+int cluster_save(const cluster *c, const char *path, int sync, char *err, size_t errlen) {
+    char tmp[4200];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (f == NULL) {
+        set_err(err, errlen, "%s: %s", tmp, strerror(errno));
+        return -1;
+    }
+    fprintf(f, "# slot map written by arenakvd after a slot changed its owner (CLUSTER SETSLOT ... NODE)\n");
+    for (unsigned i = 0; i < c->n; i++) {
+        const struct cluster_node *nd = &c->nodes[i];
+        fprintf(f, "node %s %s %d %d ", nd->id, nd->host, nd->resp_port, nd->native_port);
+        if (!nd->primary) {
+            fprintf(f, "replica-of %s\n", c->nodes[nd->primary_of].id);
+            continue;
+        }
+        fputs("primary", f);
+        for (unsigned s = 0; s < CLUSTER_SLOTS;) {
+            unsigned e = s;
+            if (cluster_owner(c, s) == (int)i) {
+                while (e + 1 < CLUSTER_SLOTS && cluster_owner(c, e + 1) == (int)i) {
+                    e++;
+                }
+                if (e == s) {
+                    fprintf(f, " %u", s);
+                } else {
+                    fprintf(f, " %u-%u", s, e);
+                }
+            }
+            s = e + 1;
+        }
+        fputc('\n', f);
+    }
+    int ok = fflush(f) == 0 && (!sync || fsync(fileno(f)) == 0);
+    ok = fclose(f) == 0 && ok;
+    if (!ok || rename(tmp, path) != 0) {
+        set_err(err, errlen, "%s: %s", path, strerror(errno));
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
 }

@@ -16,13 +16,15 @@
  * resp-cluster (synchronous only): connects to a node of a Redis Cluster, reads CLUSTER SLOTS, connects to
  * every primary and sends each request to the primary of its key's slot (CRC16 with hash tags, as in the
  * Redis Cluster specification). A MOVED reply reloads the slot map from the node that sent it and the
- * request is sent again once. MGET is split into one MGET per slot, because a cluster refuses keys of
- * several slots in one command.
+ * request is sent again. During resharding, an ASK reply sends the request once to the named node after
+ * ASKING (the slot map stays), and TRYAGAIN repeats it after 1 ms; a request is tried at most five times.
+ * MGET is split into one MGET per slot, because a cluster refuses keys of several slots in one command.
  */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "abuf.h"
 #include "driver.h"
@@ -426,8 +428,27 @@ static struct pace_conn conn_for(struct cluster_conn *cc, unsigned slot) {
     return (struct pace_conn){.net = cc->nodes[i].net};
 }
 
-/* After PACE_ERR: when the error was MOVED, reloads the map from the node that sent it. Returns 1 to retry. */
-static int moved(struct cluster_conn *cc, unsigned slot) {
+/*
+ * After PACE_ERR: MOVED reloads the map from the node that sent it; ASK stores the node to ask in *ask;
+ * TRYAGAIN waits 1 ms. Returns 1 to retry the request, 0 for other errors.
+ */
+static int redirected(struct cluster_conn *cc, unsigned slot, int *ask) {
+    *ask = -1;
+    if (strncmp(last_error, "-TRYAGAIN", 9) == 0) {
+        struct timespec ts = {.tv_nsec = 1000000};
+        nanosleep(&ts, NULL);
+        return 1;
+    }
+    if (strncmp(last_error, "-ASK ", 5) == 0) {
+        char host[256];
+        char port[16];
+        unsigned s;
+        if (sscanf(last_error, "-ASK %u %255[^:]:%15s", &s, host, port) != 3) {
+            return 0;
+        }
+        *ask = node_of(cc, host, port);
+        return *ask >= 0;
+    }
     if (strncmp(last_error, "-MOVED ", 7) != 0) {
         return 0;
     }
@@ -447,13 +468,30 @@ static int moved(struct cluster_conn *cc, unsigned slot) {
     return 1;
 }
 
+/* Sends ASKING on a node (before a request redirected with ASK). Returns 0 or -1. */
+static int asking(struct cluster_conn *cc, int node) {
+    static const char *const argv[1] = {"ASKING"};
+    static const size_t lens[1] = {6};
+    char line[PACE_NET_LINE_MAX];
+    return call_line(cc->nodes[node].net, 1, argv, lens, line, sizeof(line)) == 0 && strcmp(line, "+OK") == 0
+               ? 0
+               : -1;
+}
+
 #define CLUSTER_CALL(cc, slot, call)                                                                         \
     do {                                                                                                     \
-        for (int attempt = 0; attempt < 2; attempt++) {                                                      \
+        int ask_ = -1;                                                                                       \
+        for (int attempt = 0; attempt < 5; attempt++) {                                                      \
             struct pace_conn target = conn_for(cc, slot);                                                    \
+            if (ask_ >= 0) {                                                                                 \
+                target.net = cc->nodes[ask_].net;                                                            \
+            }                                                                                                \
+            if (ask_ >= 0 && asking(cc, ask_) != 0) {                                                        \
+                return PACE_ERR;                                                                             \
+            }                                                                                                \
             last_error[0] = '\0';                                                                            \
             int rc_ = call;                                                                                  \
-            if (rc_ != PACE_ERR || !moved(cc, slot)) {                                                       \
+            if (rc_ != PACE_ERR || !redirected(cc, slot, &ask_)) {                                           \
                 return rc_;                                                                                  \
             }                                                                                                \
         }                                                                                                    \

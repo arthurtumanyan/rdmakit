@@ -83,6 +83,7 @@ struct session {
     int handing_off;
     /* RESP WAIT: the reply is due when `wait_n` replicas acknowledged wait_off or at wait_deadline_ms */
     int readonly; /* RESP READONLY: a replica in cluster mode may serve reads of its primary's slots */
+    int asking;   /* RESP ASKING: the next command may use a slot this node is importing */
     int waiting;
     uint64_t wait_off;
     long long wait_n;
@@ -262,6 +263,32 @@ const cluster *akvd_cluster(akvd *d);
 
 /* Reloads the cluster map file. Returns 0 or -EBADMSG (message in err). */
 int akvd_cluster_reload(akvd *d, char *err, size_t errlen);
+
+/* Kinds of slot changes (CLUSTER SETSLOT). */
+enum akvd_setslot { AKVD_SLOT_IMPORTING, AKVD_SLOT_MIGRATING, AKVD_SLOT_STABLE, AKVD_SLOT_NODE };
+
+/*
+ * Changes the state of a slot in the live map: IMPORTING and MIGRATING name the other node of a move,
+ * STABLE ends one, NODE makes `node` the owner and writes the map file (without fsync; see
+ * akvd_cluster_saveconfig). IMPORTING, MIGRATING and STABLE need a primary; a replica accepts NODE, so that
+ * it redirects to the new owner. A slot this node owns can be given away only when it holds no key of it. Returns 0, or -1 with a message (a RESP error text) in err.
+ */
+int akvd_cluster_setslot(akvd *d, unsigned slot, enum akvd_setslot kind, int node, char *err, size_t errlen);
+
+/* Writes the map file with fsync (CLUSTER SAVECONFIG). Returns 0 or -1 with a message in err. */
+int akvd_cluster_saveconfig(akvd *d, char *err, size_t errlen);
+
+/*
+ * Calls fn for up to `count` keys of `slot` that exist now (CLUSTER GETKEYSINSLOT); returns the number of
+ * keys passed, or -1 when memory is exhausted. Keys of slots that this node is moving to another node come
+ * from a list built by one scan of the engine for all such slots (no new key enters such a slot here:
+ * requests for missing keys are redirected); other slots are scanned for each call.
+ */
+long akvd_slot_keys(akvd *d, unsigned slot, unsigned count,
+                    void (*fn)(void *arg, const void *key, size_t klen), void *arg);
+
+/* Number of keys of a slot (CLUSTER COUNTKEYSINSLOT), from the same list or a scan. */
+long akvd_slot_count(akvd *d, unsigned slot);
 
 /* The server's configuration. */
 const akvd_config *akvd_cfg(const akvd *d);

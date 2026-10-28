@@ -194,6 +194,48 @@ static void test_resp(akvd *d) {
     free(run(d, r, "INCR a\r\nINCRBY a 10\r\nDECR a\r\nDECRBY a -3\r\nINCR fresh\r\n",
              ":2\r\n:12\r\n:11\r\n:14\r\n:1\r\n", 1));
     run2(d, r, "INCR k\r\n", "-ERR value is not an integer or out of range\r\n");
+    /* DUMP and RESTORE: flags and time to live travel with the value; the payload is checksummed */
+    {
+        char *dump = run(d, r, "SET dk hello PX 50000\r\nDUMP dk\r\n", NULL, 1);
+        EXPECT(strncmp(dump, "+OK\r\n$17\r\nAKV\x01", 13) == 0, "DUMP payload: %.12s", dump);
+        free(dump);
+        /* the payload of value "hello" with flags 7, built from the documented format */
+        uint8_t payload[17] = {'A', 'K', 'V', 1, 7, 0, 0, 0, 'h', 'e', 'l', 'l', 'o'};
+        uint32_t crc = akv_crc32c(0, payload, 13);
+        for (int i = 0; i < 4; i++) {
+            payload[13 + i] = (uint8_t)(crc >> (8 * i));
+        }
+        char req[256];
+        int rl = snprintf(req, sizeof(req), "*4\r\n$7\r\nRESTORE\r\n$2\r\nd2\r\n$5\r\n30000\r\n$17\r\n");
+        memcpy(req + rl, payload, 17);
+        memcpy(req + rl + 17, "\r\n", 2);
+        size_t reqlen = (size_t)rl + 19;
+        struct session s1 = {.authed = 1};
+        char *out = feed(d, r, &s1, req, reqlen, 0);
+        EXPECT(strcmp(out, "+OK\r\n") == 0, "RESTORE: %s", out);
+        free(out);
+        out = feed(d, r, &s1, req, reqlen, 0);
+        EXPECT(strncmp(out, "-BUSYKEY", 8) == 0, "RESTORE of an existing key: %s", out);
+        free(out);
+        req[rl + 9] ^= 1; /* one bit of the value: the checksum no longer matches */
+        memcpy(strstr(req, "d2"), "d3", 2);
+        out = feed(d, r, &s1, req, reqlen, 0);
+        EXPECT(strncmp(out, "-ERR DUMP payload", 17) == 0, "damaged payload: %s", out);
+        free(out);
+        resp_session_free(&s1);
+        char *t = run(d, r, "GET d2\r\nPTTL d2\r\nEXISTS d3\r\nDUMP nothere\r\n", NULL, 1);
+        long long pttl = -5;
+        char *ttl = strchr(t + 11, ':');
+        EXPECT(strncmp(t, "$5\r\nhello\r\n:", 12) == 0 && ttl != NULL && sscanf(ttl, ":%lld", &pttl) == 1 &&
+                   pttl > 0 && pttl <= 30000 && strstr(t, ":0\r\n$-1\r\n") != NULL,
+               "restored value and time to live: %s", t);
+        free(t);
+        free(run(d, mc_execute, "get d2\r\n", "VALUE d2 7 5\r\nhello\r\nEND\r\n", 1)); /* flags kept */
+        t = run(d, r, "RESTORE d4 1 x ABSTTL\r\n", NULL, 1);
+        EXPECT(strncmp(t, "-ERR DUMP payload", 17) == 0, "short payload: %s", t);
+        free(t);
+        run2(d, r, "ASKING\r\n", "-ERR This instance has cluster support disabled\r\n");
+    }
     /* negative integers and the most negative one through the integer reply writer */
     free(run(d, r, "SET m -9223372036854775807\r\nDECR m\r\nSET z 0\r\nDECRBY z 5\r\n",
              "+OK\r\n:-9223372036854775808\r\n+OK\r\n:-5\r\n", 1));

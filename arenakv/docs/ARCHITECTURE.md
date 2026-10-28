@@ -166,8 +166,8 @@ engine and server tests under ThreadSanitizer (`make TSAN=1 test`).
 
 ## Not implemented
 
-- Live resharding, gossip between cluster nodes and failover of slot owners (the slot map is a file; `akv_sentinel`
-  fails over one replicated group, see OPERATIONS.md).
+- Gossip between cluster nodes and failover of slot owners (the slot map is a file that changes on `CLUSTER RELOAD`
+  and during resharding; `akv_sentinel` fails over one replicated group, see OPERATIONS.md).
 - Data types other than strings (lists, hashes, sets, sorted sets, streams), scripting.
 - memcached binary protocol.
 - Zero-copy GET from the registered arena and a one-sided GET path (the transport provides the operations; the

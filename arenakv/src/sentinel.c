@@ -4,8 +4,8 @@
  * Threads: the monitor thread polls the nodes and the other monitors and runs elections and failovers;
  * the listener thread answers RESP requests of clients and of the other monitors. Shared state (epochs,
  * vote, configured primary, the latest observations) is guarded by one mutex; network calls are made
- * without holding it. Every call to a node or monitor uses a new TCP connection and a deadline, so that a
- * dead or stalled peer costs at most the call timeout per tick.
+ * without holding it. Every call to a node or monitor uses a new TCP connection and a deadline (respc.h), so
+ * that a dead or stalled peer costs at most the call timeout per tick.
  */
 #include "sentinel.h"
 
@@ -26,6 +26,8 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "respc.h"
 
 #define TICK_MS 100        /* monitor loop period; the primary is pinged every tick */
 #define REFRESH_MS 1000    /* ROLE of every node, configuration exchange, s_down questions */
@@ -109,274 +111,6 @@ static void sb_kvi(struct sbuf *b, const char *k, long long v) {
     char t[32];
     snprintf(t, sizeof(t), "%lld", v);
     sb_kv(b, k, t);
-}
-
-/* ---- RESP client ---------------------------------------------------------------------------------------- */
-
-/* A reply value: '+', '-', ':', '$' (s == NULL for null), '*' (a == NULL for a null array). */
-struct rv {
-    char t;
-    long long i;
-    char *s;
-    size_t n;
-    struct rv **a;
-    size_t na;
-};
-
-static void rv_free(struct rv *v) {
-    if (v == NULL) {
-        return;
-    }
-    for (size_t i = 0; i < v->na; i++) {
-        rv_free(v->a[i]);
-    }
-    free(v->a);
-    free(v->s);
-    free(v);
-}
-
-struct rd {
-    int fd;
-    char buf[8192];
-    size_t len;
-    size_t off;
-    uint64_t deadline;
-};
-
-/* Reads more input until the deadline. Returns 0 or -1. */
-static int rd_fill(struct rd *r) {
-    if (r->off > 0) {
-        memmove(r->buf, r->buf + r->off, r->len - r->off);
-        r->len -= r->off;
-        r->off = 0;
-    }
-    if (r->len == sizeof(r->buf)) {
-        return -1;
-    }
-    for (;;) {
-        uint64_t now = mono_ms();
-        if (now >= r->deadline) {
-            return -1;
-        }
-        struct pollfd pf = {.fd = r->fd, .events = POLLIN};
-        int n = poll(&pf, 1, (int)(r->deadline - now));
-        if (n < 0 && errno == EINTR) {
-            continue;
-        }
-        if (n <= 0) {
-            return -1;
-        }
-        ssize_t got = recv(r->fd, r->buf + r->len, sizeof(r->buf) - r->len, 0);
-        if (got < 0 && errno == EINTR) {
-            continue;
-        }
-        if (got <= 0) {
-            return -1;
-        }
-        r->len += (size_t)got;
-        return 0;
-    }
-}
-
-/* Reads one line (without CR LF) into a fresh string. Returns NULL on failure. */
-static char *rd_line(struct rd *r) {
-    for (;;) {
-        char *nl = memchr(r->buf + r->off, '\n', r->len - r->off);
-        if (nl != NULL && nl > r->buf + r->off && nl[-1] == '\r') {
-            size_t n = (size_t)(nl - 1 - (r->buf + r->off));
-            char *s = malloc(n + 1);
-            if (s == NULL) {
-                return NULL;
-            }
-            memcpy(s, r->buf + r->off, n);
-            s[n] = '\0';
-            r->off += n + 2;
-            return s;
-        }
-        if (rd_fill(r) != 0) {
-            return NULL;
-        }
-    }
-}
-
-static struct rv *rd_value(struct rd *r, int depth) {
-    if (depth > 8) {
-        return NULL;
-    }
-    char *line = rd_line(r);
-    if (line == NULL) {
-        return NULL;
-    }
-    struct rv *v = calloc(1, sizeof(*v));
-    if (v == NULL) {
-        free(line);
-        return NULL;
-    }
-    v->t = line[0];
-    switch (line[0]) {
-    case '+':
-    case '-':
-        v->s = strdup(line + 1);
-        v->n = strlen(line + 1);
-        break;
-    case ':':
-        v->i = strtoll(line + 1, NULL, 10);
-        break;
-    case '$': {
-        long long n = strtoll(line + 1, NULL, 10);
-        if (n < 0) {
-            break;
-        }
-        if (n > 1 << 20) {
-            goto bad;
-        }
-        while (r->len - r->off < (size_t)n + 2) {
-            if (rd_fill(r) != 0) {
-                goto bad;
-            }
-        }
-        v->s = malloc((size_t)n + 1);
-        if (v->s == NULL) {
-            goto bad;
-        }
-        memcpy(v->s, r->buf + r->off, (size_t)n);
-        v->s[n] = '\0';
-        v->n = (size_t)n;
-        r->off += (size_t)n + 2;
-        break;
-    }
-    case '*': {
-        long long n = strtoll(line + 1, NULL, 10);
-        if (n < 0) {
-            break;
-        }
-        if (n > 4096) {
-            goto bad;
-        }
-        v->a = calloc((size_t)n ? (size_t)n : 1, sizeof(*v->a));
-        if (v->a == NULL) {
-            goto bad;
-        }
-        for (long long i = 0; i < n; i++) {
-            v->a[i] = rd_value(r, depth + 1);
-            if (v->a[i] == NULL) {
-                goto bad;
-            }
-            v->na++;
-        }
-        break;
-    }
-    default:
-        goto bad;
-    }
-    free(line);
-    return v;
-bad:
-    free(line);
-    rv_free(v);
-    return NULL;
-}
-
-/* Connects with a deadline. Returns the descriptor or -1. */
-static int connect_to(const char *host, int port, uint64_t deadline) {
-    char ps[16];
-    snprintf(ps, sizeof(ps), "%d", port);
-    struct addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM};
-    struct addrinfo *ai = NULL;
-    if (getaddrinfo(host, ps, &hints, &ai) != 0) {
-        return -1;
-    }
-    int fd = -1;
-    for (struct addrinfo *p = ai; p != NULL && fd < 0; p = p->ai_next) {
-        fd = socket(p->ai_family, p->ai_socktype | SOCK_CLOEXEC | SOCK_NONBLOCK, p->ai_protocol);
-        if (fd < 0) {
-            continue;
-        }
-        if (connect(fd, p->ai_addr, p->ai_addrlen) != 0 && errno != EINPROGRESS) {
-            close(fd);
-            fd = -1;
-            continue;
-        }
-        uint64_t now = mono_ms();
-        struct pollfd pf = {.fd = fd, .events = POLLOUT};
-        int err = 0;
-        socklen_t el = sizeof(err);
-        if (now >= deadline || poll(&pf, 1, (int)(deadline - now)) <= 0 ||
-            getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err != 0) {
-            close(fd);
-            fd = -1;
-        }
-    }
-    freeaddrinfo(ai);
-    if (fd >= 0) {
-        int one = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    }
-    return fd;
-}
-
-/* Sends a command (array of bulk strings) on a non-blocking socket before the deadline. Returns 0 or -1. */
-static int send_cmd(int fd, uint64_t deadline, int argc, const char *const *argv) {
-    struct sbuf b = {0};
-    sb_printf(&b, "*%d\r\n", argc);
-    for (int i = 0; i < argc; i++) {
-        sb_bulk(&b, argv[i]);
-    }
-    size_t off = 0;
-    int rc = 0;
-    while (off < b.len) {
-        ssize_t w = send(fd, b.p + off, b.len - off, MSG_NOSIGNAL);
-        if (w > 0) {
-            off += (size_t)w;
-            continue;
-        }
-        if (w < 0 && errno == EINTR) {
-            continue;
-        }
-        uint64_t now = mono_ms();
-        struct pollfd pf = {.fd = fd, .events = POLLOUT};
-        if (w < 0 && errno == EAGAIN && now < deadline && poll(&pf, 1, (int)(deadline - now)) > 0) {
-            continue;
-        }
-        rc = -1;
-        break;
-    }
-    free(b.p);
-    return rc;
-}
-
-/*
- * Runs one command on host:port over a new connection (after AUTH when user or pass is set) and returns
- * the reply, or NULL when the connection, the authentication or the reply failed within timeout_ms.
- */
-static struct rv *rcall(const char *host, int port, const char *user, const char *pass, unsigned timeout_ms,
-                        int argc, const char *const *argv) {
-    uint64_t deadline = mono_ms() + timeout_ms;
-    int fd = connect_to(host, port, deadline);
-    if (fd < 0) {
-        return NULL;
-    }
-    struct rd r = {.fd = fd, .deadline = deadline};
-    struct rv *v = NULL;
-    if (pass != NULL && pass[0] != '\0') {
-        const char *auth[3] = {"AUTH", user, pass};
-        int na = user != NULL && user[0] != '\0' ? 3 : 2;
-        if (na == 2) {
-            auth[1] = pass;
-        }
-        struct rv *a = send_cmd(fd, deadline, na, auth) == 0 ? rd_value(&r, 0) : NULL;
-        int ok = a != NULL && a->t != '-';
-        rv_free(a);
-        if (!ok) {
-            close(fd);
-            return NULL;
-        }
-    }
-    if (send_cmd(fd, deadline, argc, argv) == 0) {
-        v = rd_value(&r, 0);
-    }
-    close(fd);
-    return v;
 }
 
 /* ---- decision rules ------------------------------------------------------------------------------------- */
@@ -884,25 +618,35 @@ static void *listener_main(void *arg) {
 
 /* ---- monitor --------------------------------------------------------------------------------------------- */
 
-static struct rv *node_call(struct sentinel *s, unsigned i, int argc, const char *const *argv) {
+static respv *node_call(struct sentinel *s, unsigned i, int argc, const char *const *argv) {
     const sentinel_node_cfg *n = &s->cfg.nodes[i];
-    return rcall(n->host, n->resp_port, s->cfg.node_user, s->cfg.node_pass, call_ms(s), argc, argv);
+    return respc_call(n->host, n->resp_port, s->cfg.node_user, s->cfg.node_pass, call_ms(s), argc, argv);
 }
 
-static struct rv *peer_call(struct sentinel *s, unsigned i, int argc, const char *const *argv) {
+/*
+ * REPLICAOF on node i. Changing a node's role stops its replication link thread, which waits up to 1 s in a
+ * receive (replication.c), so the call gets the failover timeout (at most 10 s) instead of the ping timeout.
+ */
+static respv *node_replicaof(struct sentinel *s, unsigned i, int argc, const char *const *argv) {
+    const sentinel_node_cfg *n = &s->cfg.nodes[i];
+    unsigned t = s->cfg.failover_timeout_ms < 10000 ? s->cfg.failover_timeout_ms : 10000;
+    return respc_call(n->host, n->resp_port, s->cfg.node_user, s->cfg.node_pass, t, argc, argv);
+}
+
+static respv *peer_call(struct sentinel *s, unsigned i, int argc, const char *const *argv) {
     const sentinel_peer_cfg *p = &s->cfg.peers[i];
-    return rcall(p->host, p->port, NULL, NULL, call_ms(s), argc, argv);
+    return respc_call(p->host, p->port, NULL, NULL, call_ms(s), argc, argv);
 }
 
 /* A node answer that shows the node is up: anything but a missing reply or an error other than LOADING. */
-static int alive(const struct rv *v) {
+static int alive(const respv *v) {
     return v != NULL && (v->t != '-' || (v->s != NULL && strncmp(v->s, "LOADING", 7) == 0));
 }
 
 /* Refreshes the observation of node i with ROLE. */
 static void refresh_node(struct sentinel *s, unsigned i) {
     static const char *const role[1] = {"ROLE"};
-    struct rv *v = node_call(s, i, 1, role);
+    respv *v = node_call(s, i, 1, role);
     struct node_rt rt = {0};
     if (alive(v)) {
         rt.reachable = 1;
@@ -920,7 +664,7 @@ static void refresh_node(struct sentinel *s, unsigned i) {
             }
         }
     }
-    rv_free(v);
+    respv_free(v);
     pthread_mutex_lock(&s->m);
     if (rt.reachable) {
         s->nodes[i] = rt;
@@ -942,7 +686,7 @@ static void hello_peers(struct sentinel *s) {
     pthread_mutex_unlock(&s->m);
     const char *argv[7] = {"SENTINEL", "AKV-HELLO", s->cfg.name, s->id, cur, cfg_epoch, prim};
     for (unsigned i = 0; i < s->cfg.npeers; i++) {
-        struct rv *v = peer_call(s, i, 7, argv);
+        respv *v = peer_call(s, i, 7, argv);
         if (v != NULL && v->t == '*' && v->na == 4 && v->a[0]->s != NULL) {
             pthread_mutex_lock(&s->m);
             s->peers[i].last_seen_ms = mono_ms();
@@ -954,7 +698,7 @@ static void hello_peers(struct sentinel *s) {
             adopt_config(s, (uint64_t)v->a[2]->i, (unsigned)v->a[3]->i, s->peers[i].id);
             pthread_mutex_unlock(&s->m);
         }
-        rv_free(v);
+        respv_free(v);
     }
 }
 
@@ -976,7 +720,7 @@ static unsigned ask_peers(struct sentinel *s, uint64_t epoch, const char *who, u
     const char *argv[6] = {"SENTINEL", "is-master-down-by-addr", host, port, ep, who};
     *votes = 0;
     for (unsigned i = 0; i < s->cfg.npeers; i++) {
-        struct rv *v = peer_call(s, i, 6, argv);
+        respv *v = peer_call(s, i, 6, argv);
         if (v != NULL && v->t == '*' && v->na == 3) {
             down += v->a[0]->i == 1;
             if (strcmp(who, "*") != 0 && v->a[1]->s != NULL && strcmp(v->a[1]->s, s->id) == 0 &&
@@ -984,7 +728,7 @@ static unsigned ask_peers(struct sentinel *s, uint64_t epoch, const char *who, u
                 (*votes)++;
             }
         }
-        rv_free(v);
+        respv_free(v);
     }
     return down;
 }
@@ -1012,9 +756,9 @@ static int failover(struct sentinel *s, uint64_t epoch) {
     slog(s->cfg.name, "+selected-slave %s %d (offset %llu)", n->host, n->resp_port,
          (unsigned long long)c[pick].offset);
     static const char *const noone[3] = {"REPLICAOF", "NO", "ONE"};
-    struct rv *v = node_call(s, (unsigned)pick, 3, noone);
+    respv *v = node_replicaof(s, (unsigned)pick, 3, noone);
     int ok = v != NULL && v->t == '+';
-    rv_free(v);
+    respv_free(v);
     if (!ok) {
         slog(s->cfg.name, "-failover-abort-slave-refused %s %d", n->host, n->resp_port);
         return -1;
@@ -1056,11 +800,11 @@ static int failover(struct sentinel *s, uint64_t epoch) {
         if (i == (unsigned)pick) {
             continue;
         }
-        struct rv *r = node_call(s, i, 3, repl);
+        respv *r = node_replicaof(s, i, 3, repl);
         if (r != NULL && r->t == '+') {
             slog(s->cfg.name, "+slave-reconf-sent %s %d", s->cfg.nodes[i].host, s->cfg.nodes[i].resp_port);
         }
-        rv_free(r);
+        respv_free(r);
     }
     return 0;
 }
@@ -1098,12 +842,12 @@ static void reconcile(struct sentinel *s) {
         if (follows) {
             continue;
         }
-        struct rv *r = node_call(s, i, 3, repl);
+        respv *r = node_replicaof(s, i, 3, repl);
         if (r != NULL && r->t == '+') {
             slog(s->cfg.name, "%s %s %d", nodes[i].is_primary ? "+convert-to-slave" : "+fix-slave-config",
                  s->cfg.nodes[i].host, s->cfg.nodes[i].resp_port);
         }
-        rv_free(r);
+        respv_free(r);
     }
 }
 
@@ -1123,9 +867,9 @@ static void *monitor_main(void *arg) {
         pthread_mutex_lock(&s->m);
         unsigned p = s->primary;
         pthread_mutex_unlock(&s->m);
-        struct rv *v = node_call(s, p, 1, ping);
+        respv *v = node_call(s, p, 1, ping);
         int ok = alive(v);
-        rv_free(v);
+        respv_free(v);
         uint64_t now = mono_ms();
         int refresh = now >= next_refresh;
         if (refresh) {

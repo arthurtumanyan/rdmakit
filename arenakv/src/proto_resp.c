@@ -14,6 +14,8 @@
  *                MGET MSET APPEND STRLEN INCR INCRBY DECR DECRBY
  *   keys         DEL UNLINK EXISTS TYPE EXPIRE PEXPIRE EXPIREAT PEXPIREAT TTL PTTL PERSIST KEYS SCAN
  *   server       DBSIZE FLUSHALL FLUSHDB INFO SAVE BGSAVE LASTSAVE TIME
+ *   cluster      CLUSTER (KEYSLOT INFO MYID SLOTS NODES SHARDS COUNTKEYSINSLOT GETKEYSINSLOT SETSLOT SAVECONFIG
+ *                RELOAD) READONLY READWRITE ASKING; resharding: DUMP RESTORE RESTORE-ASKING MIGRATE
  * Values are strings; the engine has no other data types (commands of other types answer "unknown
  * command"). Composite commands that read and then write (SET ... GET, GETSET, GETDEL, GETEX, APPEND on a missing
  * key, MSET) run under a lock set on their keys, so they are atomic as in Redis. SCAN returns all matching keys in one reply
@@ -40,6 +42,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "respc.h"
 #include "srv.h"
 
 #define RESP_MAX_ARGS 1048576u
@@ -587,23 +590,6 @@ static int resp_permitted(struct session *ss, const struct arg *a, size_t n, str
 
 static void cmd_acl(akvd *d, struct session *ss, struct arg *a, size_t n, struct obuf *o);
 
-struct slot_count {
-    unsigned slot;
-    size_t n;
-};
-
-static int count_cb(void *arg, const akv_record *r) {
-    struct slot_count *c = arg;
-    c->n += cluster_keyslot(r->key, r->klen) == c->slot;
-    return 0;
-}
-
-/* Keys in a slot (CLUSTER COUNTKEYSINSLOT): a scan of the whole engine. */
-static size_t count_slot(akv *s, unsigned slot) {
-    struct slot_count c = {.slot = slot};
-    akv_foreach(s, count_cb, &c);
-    return c.n;
-}
 static void dispatch(akvd *d, struct session *ss, struct arg *a, size_t n, struct obuf *o);
 
 /* ---- transactions ------------------------------------------------------------------------------------ */
@@ -1040,9 +1026,40 @@ static void cmd_command(struct arg *a, size_t n, struct obuf *o) {
 /* ---- cluster ----------------------------------------------------------------------------------------- */
 
 /*
+ * Argument indexes of the keys of a command, from its table entry (first, last, step). Returns their
+ * number, at most max (max + 1 when there are more), 0 when the command has no key positions.
+ */
+static size_t cmd_key_args(const struct arg *a, size_t n, size_t *idx, size_t max) {
+    int id = acl_cmd_find(ACL_RESP, a[0].p, a[0].n);
+    const acl_cmd *k = id >= 0 ? acl_cmd_at((unsigned)id) : NULL;
+    if (k == NULL || k->first == 0 || (size_t)k->first >= n) {
+        return 0;
+    }
+    long last = k->last < 0 ? (long)n + k->last : k->last;
+    size_t cnt = 0;
+    for (long i = k->first; i <= last && (size_t)i < n; i += k->step) {
+        if (cnt == max) {
+            return max + 1;
+        }
+        idx[cnt++] = (size_t)i;
+    }
+    return cnt;
+}
+
+/*
  * Cluster mode: answers MOVED for keys of slots this node does not serve, CROSSSLOT for keys of several
  * slots, CLUSTERDOWN for unassigned slots. A replica serves reads of its primary's slots to connections that
- * sent READONLY and redirects everything else to the primary. Returns 1 when it replied.
+ * sent READONLY and redirects everything else to the primary.
+ *
+ * Resharding (Redis Cluster specification, "Live reconfiguration"): for a slot this node is moving to
+ * another node (MIGRATING), a command runs here when all its keys are still here, is redirected with ASK
+ * when none is, and answers TRYAGAIN when only some are. That check runs with the shards of the keys locked
+ * (return 2: the caller runs the command through run_locked), so it cannot interleave with MIGRATE, which
+ * holds the same locks while it copies and deletes keys. For a slot this node is taking over (IMPORTING),
+ * a command runs here when the connection sent ASKING just before (or the command is RESTORE-ASKING); with
+ * several keys, all of them must be here already.
+ *
+ * Returns 0 to run the command here, 1 when it replied, 2 to run it with the shards of its keys locked.
  */
 static int cluster_redirect(akvd *d, struct session *ss, const struct arg *a, size_t n, struct obuf *o) {
     const cluster *cl = akvd_cluster(d);
@@ -1056,6 +1073,7 @@ static int cluster_redirect(akvd *d, struct session *ss, const struct arg *a, si
     }
     long last = k->last < 0 ? (long)n + k->last : k->last;
     int slot = -1;
+    size_t nkeys = 0;
     for (long i = k->first; i <= last && (size_t)i < n; i += k->step) {
         int s = (int)cluster_keyslot(a[i].p, a[i].n);
         if (slot >= 0 && s != slot) {
@@ -1063,23 +1081,68 @@ static int cluster_redirect(akvd *d, struct session *ss, const struct arg *a, si
             return 1;
         }
         slot = s;
+        nkeys++;
     }
     if (slot < 0) {
         return 0; /* no key position within the arguments: the command's own arity check answers */
     }
-    int owner = cl->owner[slot];
+    int owner = cluster_owner(cl, (unsigned)slot);
     if (owner < 0) {
         r_err(o, "CLUSTERDOWN Hash slot not served");
         return 1;
     }
     int mine = cluster_shard_of_self(cl);
     int replica = cl->self >= 0 && !cl->nodes[cl->self].primary;
-    if (owner == mine && (!replica || (ss->readonly && (k->cats & ACL_CAT_WRITE) == 0))) {
+    akv *s = akvd_store(d);
+    if (owner == mine && !replica) {
+        int to = cluster_migrating(cl, (unsigned)slot);
+        if (to < 0) {
+            return 0;
+        }
+        if (!tl_locked) {
+            return 2;
+        }
+        size_t present = 0;
+        for (long i = k->first; i <= last && (size_t)i < n; i += k->step) {
+            present += akv_exists(s, a[i].p, a[i].n) != 0;
+        }
+        if (present == nkeys) {
+            return 0;
+        }
+        if (present == 0) {
+            ob_printf(o, "-ASK %d %s:%d\r\n", slot, cl->nodes[to].host, cl->nodes[to].resp_port);
+        } else {
+            r_err(o, "TRYAGAIN Multiple keys request during rehashing of slot");
+        }
+        return 1;
+    }
+    if (owner == mine && ss->readonly && (k->cats & ACL_CAT_WRITE) == 0) {
+        return 0;
+    }
+    if (!replica && cl->self >= 0 && cluster_importing(cl, (unsigned)slot) >= 0 &&
+        (ss->asking || is(&a[0], "RESTORE-ASKING"))) {
+        if (nkeys == 1) {
+            return 0;
+        }
+        if (!tl_locked) {
+            return 2;
+        }
+        for (long i = k->first; i <= last && (size_t)i < n; i += k->step) {
+            if (!akv_exists(s, a[i].p, a[i].n)) {
+                r_err(o, "TRYAGAIN Multiple keys request during rehashing of slot");
+                return 1;
+            }
+        }
         return 0;
     }
     const struct cluster_node *p = &cl->nodes[owner];
     ob_printf(o, "-MOVED %d %s:%d\r\n", slot, p->host, p->resp_port);
     return 1;
+}
+
+/* Appends one key of CLUSTER GETKEYSINSLOT to the reply under construction. */
+static void slot_key_reply(void *arg, const void *key, size_t klen) {
+    r_bulk(arg, key, klen);
 }
 
 /* One node in the form of CLUSTER SLOTS: [host, port, id]. */
@@ -1126,9 +1189,9 @@ static void cmd_cluster(akvd *d, struct arg *a, size_t n, struct obuf *o) {
         struct obuf b = {0};
         unsigned ranges = 0;
         for (unsigned s = 0; s < CLUSTER_SLOTS;) {
-            int owner = cl->owner[s];
+            int owner = cluster_owner(cl, s);
             unsigned e = s;
-            while (e + 1 < CLUSTER_SLOTS && cl->owner[e + 1] == owner) {
+            while (e + 1 < CLUSTER_SLOTS && cluster_owner(cl, e + 1) == owner) {
                 e++;
             }
             if (owner >= 0) {
@@ -1161,8 +1224,8 @@ static void cmd_cluster(akvd *d, struct arg *a, size_t n, struct obuf *o) {
                       nd->primary ? "-" : cl->nodes[nd->primary_of].id);
             for (unsigned s = 0; nd->primary && s < CLUSTER_SLOTS;) {
                 unsigned e = s;
-                if (cl->owner[s] == (int)i) {
-                    while (e + 1 < CLUSTER_SLOTS && cl->owner[e + 1] == (int)i) {
+                if (cluster_owner(cl, s) == (int)i) {
+                    while (e + 1 < CLUSTER_SLOTS && cluster_owner(cl, e + 1) == (int)i) {
                         e++;
                     }
                     if (e == s) {
@@ -1172,6 +1235,16 @@ static void cmd_cluster(akvd *d, struct arg *a, size_t n, struct obuf *o) {
                     }
                 }
                 s = e + 1;
+            }
+            for (unsigned s = 0; (int)i == cl->self && s < CLUSTER_SLOTS; s++) {
+                int to = cluster_migrating(cl, s);
+                int from = cluster_importing(cl, s);
+                if (to >= 0) {
+                    ob_printf(&b, " [%u->-%s]", s, cl->nodes[to].id);
+                }
+                if (from >= 0) {
+                    ob_printf(&b, " [%u-<-%s]", s, cl->nodes[from].id);
+                }
             }
             ob_add(&b, "\n", 1);
         }
@@ -1189,15 +1262,15 @@ static void cmd_cluster(akvd *d, struct arg *a, size_t n, struct obuf *o) {
             }
             unsigned ranges = 0;
             for (unsigned s = 0; s < CLUSTER_SLOTS; s++) {
-                ranges += cl->owner[s] == (int)i && (s == 0 || cl->owner[s - 1] != (int)i);
+                ranges += cluster_owner(cl, s) == (int)i && (s == 0 || cluster_owner(cl, s - 1) != (int)i);
             }
             r_map(o, 2);
             r_bulk_str(o, "slots");
             r_array(o, 2 * ranges);
             for (unsigned s = 0; s < CLUSTER_SLOTS;) {
                 unsigned e = s;
-                if (cl->owner[s] == (int)i) {
-                    while (e + 1 < CLUSTER_SLOTS && cl->owner[e + 1] == (int)i) {
+                if (cluster_owner(cl, s) == (int)i) {
+                    while (e + 1 < CLUSTER_SLOTS && cluster_owner(cl, e + 1) == (int)i) {
                         e++;
                     }
                     r_int(o, s);
@@ -1231,13 +1304,84 @@ static void cmd_cluster(akvd *d, struct arg *a, size_t n, struct obuf *o) {
                 r_bulk_str(o, "online");
             }
         }
-    } else if (is(sub, "COUNTKEYSINSLOT") && n == 3) {
+    } else if ((is(sub, "COUNTKEYSINSLOT") && n == 3) || (is(sub, "GETKEYSINSLOT") && n == 4)) {
         long long slot;
+        long long count = 0;
         if (arg_ll(&a[2], &slot) != 0 || slot < 0 || slot >= (long long)CLUSTER_SLOTS) {
             r_err(o, "ERR Invalid slot");
             return;
         }
-        r_int(o, (long long)count_slot(akvd_store(d), (unsigned)slot));
+        if (n == 4 && (arg_ll(&a[3], &count) != 0 || count < 0 || count > 1000000)) {
+            r_err(o, "ERR Invalid number of keys");
+            return;
+        }
+        if (tl_locked) {
+            r_err(o, "ERR this CLUSTER subcommand is not allowed in a transaction");
+            return;
+        }
+        if (n == 3) {
+            long c = akvd_slot_count(d, (unsigned)slot);
+            if (c < 0) {
+                r_err(o, "ERR out of memory");
+            } else {
+                r_int(o, c);
+            }
+            return;
+        }
+        struct obuf keys = {0};
+        long got = akvd_slot_keys(d, (unsigned)slot, (unsigned)count, slot_key_reply, &keys);
+        if (got < 0) {
+            r_err(o, "ERR out of memory");
+        } else {
+            r_array(o, got);
+            ob_add(o, keys.p, keys.len);
+        }
+        ob_free(&keys);
+    } else if (is(sub, "SETSLOT") && n >= 4) {
+        long long slot;
+        if (arg_ll(&a[2], &slot) != 0 || slot < 0 || slot >= (long long)CLUSTER_SLOTS) {
+            r_err(o, "ERR Invalid or out of range slot");
+            return;
+        }
+        if (tl_locked) {
+            r_err(o, "ERR this CLUSTER subcommand is not allowed in a transaction");
+            return;
+        }
+        enum akvd_setslot kind;
+        int node = -1;
+        if (is(&a[3], "STABLE") && n == 4) {
+            kind = AKVD_SLOT_STABLE;
+        } else if ((is(&a[3], "IMPORTING") || is(&a[3], "MIGRATING") || is(&a[3], "NODE")) && n == 5) {
+            kind = is(&a[3], "IMPORTING")   ? AKVD_SLOT_IMPORTING
+                   : is(&a[3], "MIGRATING") ? AKVD_SLOT_MIGRATING
+                                            : AKVD_SLOT_NODE;
+            node = cluster_find(cl, a[4].p, a[4].n);
+            if (node < 0) {
+                ob_printf(o, "-ERR I don't know about node %.*s\r\n", (int)(a[4].n > 40 ? 40 : a[4].n),
+                          a[4].p);
+                return;
+            }
+            if (kind == AKVD_SLOT_NODE && !cl->nodes[node].primary) {
+                r_err(o, "ERR Target node is not a master");
+                return;
+            }
+        } else {
+            r_err(o, "ERR Invalid CLUSTER SETSLOT action or number of arguments");
+            return;
+        }
+        char err[256];
+        if (akvd_cluster_setslot(d, (unsigned)slot, kind, node, err, sizeof(err)) != 0) {
+            ob_printf(o, "-%s\r\n", err);
+        } else {
+            r_ok(o);
+        }
+    } else if (is(sub, "SAVECONFIG") && n == 2) {
+        char err[512];
+        if (akvd_cluster_saveconfig(d, err, sizeof(err)) != 0) {
+            ob_printf(o, "-ERR %s\r\n", err);
+        } else {
+            r_ok(o);
+        }
     } else if (is(sub, "RELOAD") && n == 2) {
         char err[512];
         if (akvd_cluster_reload(d, err, sizeof(err)) == 0) {
@@ -1269,25 +1413,288 @@ static int composite(const struct arg *a, size_t n) {
     return 0;
 }
 
-/* Runs a composite command with the shards of its keys locked and its change records grouped. */
+/* ---- DUMP, RESTORE, MIGRATE ---------------------------------------------------------------------------- */
+
+/*
+ * Serialized value of DUMP and RESTORE (arenakv's own format, not Redis's RDB encoding, so it is exchanged
+ * only between arenakv nodes): "AKV" 0x01, client flags (4 bytes little-endian), the value, and the CRC32C
+ * of everything before it (4 bytes little-endian).
+ */
+static void dump_payload(struct obuf *b, uint32_t flags, const void *val, size_t vlen) {
+    uint8_t head[8] = {'A',
+                       'K',
+                       'V',
+                       1,
+                       (uint8_t)flags,
+                       (uint8_t)(flags >> 8),
+                       (uint8_t)(flags >> 16),
+                       (uint8_t)(flags >> 24)};
+    size_t start = b->len;
+    ob_add(b, head, sizeof(head));
+    ob_add(b, val, vlen);
+    uint32_t crc = akv_crc32c(0, b->p + start, b->len - start);
+    uint8_t tail[4] = {(uint8_t)crc, (uint8_t)(crc >> 8), (uint8_t)(crc >> 16), (uint8_t)(crc >> 24)};
+    ob_add(b, tail, sizeof(tail));
+}
+
+/* Checks a serialized value and finds its parts. Returns 0 or -1. */
+static int dump_parse(const struct arg *p, uint32_t *flags, const char **val, size_t *vlen) {
+    const uint8_t *b = (const uint8_t *)p->p;
+    if (p->n < 12 || memcmp(b, "AKV\x01", 4) != 0) {
+        return -1;
+    }
+    uint32_t crc = (uint32_t)b[p->n - 4] | ((uint32_t)b[p->n - 3] << 8) | ((uint32_t)b[p->n - 2] << 16) |
+                   ((uint32_t)b[p->n - 1] << 24);
+    if (akv_crc32c(0, b, p->n - 4) != crc) {
+        return -1;
+    }
+    *flags = (uint32_t)b[4] | ((uint32_t)b[5] << 8) | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24);
+    *val = p->p + 8;
+    *vlen = p->n - 12;
+    return 0;
+}
+
+static void cmd_dump(akvd *d, const struct arg *a, size_t n, struct obuf *o) {
+    if (n != 2) {
+        r_arity(o, &a[0]);
+        return;
+    }
+    akv_meta m;
+    const uint8_t *val;
+    size_t vlen;
+    if (srv_fetch(d, a[1].p, a[1].n, &m, AKV_TTL_KEEP, &val, &vlen) != 0) {
+        r_null(o);
+        return;
+    }
+    struct obuf b = {0};
+    dump_payload(&b, m.flags, val, vlen);
+    r_bulk(o, b.p, b.len);
+    ob_free(&b);
+}
+
+/* Current Unix time in milliseconds (RESTORE ... ABSTTL). */
+static int64_t unix_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* RESTORE and RESTORE-ASKING key ttl payload [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency]. */
+static void cmd_restore(akvd *d, const struct arg *a, size_t n, struct obuf *o) {
+    if (n < 4) {
+        r_arity(o, &a[0]);
+        return;
+    }
+    long long ttl;
+    if (arg_ll(&a[2], &ttl) != 0 || ttl < 0) {
+        r_err(o, "ERR Invalid TTL value, must be >= 0");
+        return;
+    }
+    int replace = 0;
+    int absttl = 0;
+    for (size_t i = 4; i < n; i++) {
+        long long ignored;
+        if (is(&a[i], "REPLACE")) {
+            replace = 1;
+        } else if (is(&a[i], "ABSTTL")) {
+            absttl = 1;
+        } else if ((is(&a[i], "IDLETIME") || is(&a[i], "FREQ")) && i + 1 < n &&
+                   arg_ll(&a[i + 1], &ignored) == 0) {
+            i++; /* eviction hints of Redis; the engine keeps its own access bit */
+        } else {
+            r_err(o, "ERR syntax error");
+            return;
+        }
+    }
+    uint32_t flags;
+    const char *val;
+    size_t vlen;
+    if (dump_parse(&a[3], &flags, &val, &vlen) != 0) {
+        r_err(o, "ERR DUMP payload version or checksum are wrong");
+        return;
+    }
+    akv_store_opts opt = {.mode = replace ? AKV_SET : AKV_ADD, .flags = flags};
+    if (ttl > 0) {
+        long long left = absttl ? ttl - unix_ms() : ttl;
+        if (left <= 0) {
+            r_ok(o); /* already expired: nothing is created, as in Redis */
+            return;
+        }
+        opt.ttl_ms = left;
+    }
+    int rc = akv_store(akvd_store(d), a[1].p, a[1].n, val, vlen, &opt, NULL);
+    if (rc == -EEXIST) {
+        r_err(o, "BUSYKEY Target key name already exists.");
+    } else if (rc != 0) {
+        r_store_error(o, rc);
+    } else {
+        r_ok(o);
+    }
+}
+
+/*
+ * MIGRATE host port key|"" destination-db timeout [COPY] [REPLACE] [AUTH password] [AUTH2 username password]
+ * [KEYS key ...]: copies the keys to another arenakv node with RESTORE-ASKING over one connection, then
+ * (without COPY) deletes them here. The engine shards of the keys stay locked from the first read to the
+ * last delete, so no command observes or changes a key between its copy and its deletion (commands on a
+ * slot being moved take the same locks, see cluster_redirect); the wait is bounded by `timeout`
+ * milliseconds. Replies +OK, +NOKEY when none of the keys exists, -IOERR when the target cannot be
+ * reached in time, and the target's error otherwise (then nothing is deleted).
+ */
+static void cmd_migrate(akvd *d, const struct arg *a, size_t n, struct obuf *o) {
+    if (n < 6) {
+        r_arity(o, &a[0]);
+        return;
+    }
+    if (tl_locked) {
+        r_err(o, "ERR MIGRATE is not allowed in a transaction");
+        return;
+    }
+    long long port;
+    long long db;
+    long long timeout;
+    if (arg_ll(&a[2], &port) != 0 || port <= 0 || port > 65535 || arg_ll(&a[4], &db) != 0 ||
+        arg_ll(&a[5], &timeout) != 0 || timeout < 0) {
+        r_err(o, "ERR value is not an integer or out of range");
+        return;
+    }
+    if (db != 0) {
+        r_err(o, "ERR DB index is out of range");
+        return;
+    }
+    int copy = 0;
+    int replace = 0;
+    char user[256] = "";
+    char pass[256] = "";
+    size_t first_key = 3;
+    size_t nkeys = 1;
+    for (size_t i = 6; i < n; i++) {
+        if (is(&a[i], "COPY")) {
+            copy = 1;
+        } else if (is(&a[i], "REPLACE")) {
+            replace = 1;
+        } else if (is(&a[i], "AUTH") && i + 1 < n && a[i + 1].n < sizeof(pass)) {
+            snprintf(pass, sizeof(pass), "%.*s", (int)a[i + 1].n, a[i + 1].p);
+            i++;
+        } else if (is(&a[i], "AUTH2") && i + 2 < n && a[i + 1].n < sizeof(user) &&
+                   a[i + 2].n < sizeof(pass)) {
+            snprintf(user, sizeof(user), "%.*s", (int)a[i + 1].n, a[i + 1].p);
+            snprintf(pass, sizeof(pass), "%.*s", (int)a[i + 2].n, a[i + 2].p);
+            i += 2;
+        } else if (is(&a[i], "KEYS") && a[3].n == 0 && i + 1 < n) {
+            first_key = i + 1;
+            nkeys = n - first_key;
+            break;
+        } else {
+            r_err(o, "ERR syntax error");
+            return;
+        }
+    }
+    if (nkeys > 4096) {
+        r_err(o, "ERR too many keys for one MIGRATE (at most 4096)");
+        return;
+    }
+    char host[256];
+    snprintf(host, sizeof(host), "%.*s", (int)(a[1].n < sizeof(host) ? a[1].n : sizeof(host) - 1), a[1].p);
+    respc *c = respc_open(host, (int)port, timeout > 0 ? (unsigned)timeout : 1000u);
+    if (c == NULL) {
+        r_err(o, "IOERR error or timeout connecting to the target instance");
+        return;
+    }
+    if (pass[0] != '\0' && respc_auth(c, user, pass) != 0) {
+        respc_close(c);
+        r_err(o, "ERR Target instance replied with error: authentication failed");
+        return;
+    }
+    akv *s = akvd_store(d);
+    const void **keys = calloc(nkeys, sizeof(*keys));
+    size_t *lens = calloc(nkeys, sizeof(*lens));
+    uint8_t *sent = calloc(nkeys, 1);
+    if (keys == NULL || lens == NULL || sent == NULL) {
+        free(keys);
+        free(lens);
+        free(sent);
+        respc_close(c);
+        r_err(o, "ERR out of memory");
+        return;
+    }
+    for (size_t i = 0; i < nkeys; i++) {
+        keys[i] = a[first_key + i].p;
+        lens[i] = a[first_key + i].n;
+    }
+    uint64_t txn = akvd_next_txn(d);
+    akv_lockset set;
+    akv_lock_keys(s, keys, lens, nkeys, txn, &set);
+    size_t nsent = 0;
+    int failed = 0;
+    struct obuf b = {0};
+    for (size_t i = 0; i < nkeys && !failed; i++) {
+        akv_meta m;
+        const uint8_t *val;
+        size_t vlen;
+        if (srv_fetch(d, keys[i], lens[i], &m, AKV_TTL_KEEP, &val, &vlen) != 0) {
+            continue;
+        }
+        b.len = 0;
+        dump_payload(&b, m.flags, val, vlen);
+        char ttl[24];
+        snprintf(ttl, sizeof(ttl), "%lld", (long long)(m.ttl_ms < 0 ? 0 : m.ttl_ms == 0 ? 1 : m.ttl_ms));
+        const char *argv[5] = {"RESTORE-ASKING", keys[i], ttl, (const char *)b.p, "REPLACE"};
+        size_t alen[5] = {14, lens[i], strlen(ttl), b.len, 7};
+        if (respc_send(c, replace ? 5 : 4, argv, alen) != 0) {
+            failed = 1;
+            break;
+        }
+        sent[i] = 1;
+        nsent++;
+    }
+    ob_free(&b);
+    char err[256] = "";
+    for (size_t i = 0; i < nsent && !failed; i++) {
+        respv *v = respc_read(c);
+        if (v == NULL) {
+            failed = 1;
+        } else if (v->t == '-' && err[0] == '\0') {
+            snprintf(err, sizeof(err), "%s", v->s != NULL ? v->s : "");
+        }
+        respv_free(v);
+    }
+    if (failed) {
+        r_err(o, "IOERR error or timeout reading to the target instance");
+    } else if (err[0] != '\0') {
+        ob_printf(o, "-ERR Target instance replied with error: %s\r\n", err);
+    } else if (nsent == 0) {
+        ob_add(o, "+NOKEY\r\n", 8);
+    } else {
+        for (size_t i = 0; i < nkeys && !copy; i++) {
+            if (sent[i]) {
+                akv_del(s, keys[i], lens[i]);
+            }
+        }
+        r_ok(o);
+    }
+    akvd_txn_end(d, txn);
+    akv_unlock(s, &set);
+    respc_close(c);
+    free(keys);
+    free(lens);
+    free(sent);
+}
+
+/*
+ * Runs a command with the shards of its keys locked and its change records grouped: composite commands, and
+ * commands on a slot that is being moved (cluster_redirect).
+ */
 static void run_locked(akvd *d, struct session *ss, struct arg *a, size_t n, struct obuf *o) {
     akv *s = akvd_store(d);
     const void *keys[64];
     size_t lens[64];
-    size_t nk = 0;
-    int all = 0;
-    if (is(&a[0], "MSET")) {
-        for (size_t i = 1; i < n; i += 2) {
-            if (nk == 64) {
-                all = 1; /* many keys: every shard */
-                break;
-            }
-            keys[nk] = a[i].p;
-            lens[nk++] = a[i].n;
-        }
-    } else {
-        keys[nk] = a[1].p;
-        lens[nk++] = a[1].n;
+    size_t idx[64];
+    size_t nk = cmd_key_args(a, n, idx, 64);
+    int all = nk > 64; /* many keys: every shard */
+    for (size_t i = 0; i < nk && !all; i++) {
+        keys[i] = a[idx[i]].p;
+        lens[i] = a[idx[i]].n;
     }
     uint64_t txn = akvd_next_txn(d);
     akv_lockset set;
@@ -1330,8 +1737,13 @@ static void dispatch(akvd *d, struct session *ss, struct arg *a, size_t n, struc
         r_bulk(o, n >= 2 ? a[1].p : "", n >= 2 ? a[1].n : 0);
         return;
     }
-    if (cluster_redirect(d, ss, a, n, o)) {
+    int redirect = cluster_redirect(d, ss, a, n, o);
+    if (redirect == 1) {
         ss->multi_error |= ss->in_multi;
+        return;
+    }
+    if (redirect == 2 && !ss->in_multi) {
+        run_locked(d, ss, a, n, o); /* queued commands are checked again when EXEC runs them locked */
         return;
     }
     if (akvd_read_only(d)) {
@@ -1753,6 +2165,19 @@ static void dispatch(akvd *d, struct session *ss, struct arg *a, size_t n, struc
         cmd_pubsub(d, a, n, o);
     } else if (is(c, "CLUSTER")) {
         cmd_cluster(d, a, n, o);
+    } else if (is(c, "ASKING")) {
+        if (akvd_cluster(d) == NULL) {
+            r_err(o, "ERR This instance has cluster support disabled");
+        } else {
+            ss->asking = 1; /* resp_execute clears it after the next command */
+            r_ok(o);
+        }
+    } else if (is(c, "DUMP")) {
+        cmd_dump(d, a, n, o);
+    } else if (is(c, "RESTORE") || is(c, "RESTORE-ASKING")) {
+        cmd_restore(d, a, n, o);
+    } else if (is(c, "MIGRATE")) {
+        cmd_migrate(d, a, n, o);
     } else if (is(c, "READONLY") || is(c, "READWRITE")) {
         if (akvd_cluster(d) == NULL) {
             r_err(o, "ERR This instance has cluster support disabled");
@@ -2128,6 +2553,9 @@ size_t resp_execute(akvd *d, struct session *ss, const uint8_t *in, size_t len, 
             continue; /* empty line or empty array */
         }
         dispatch(d, ss, tl_args, nargs, out);
+        if (!is(&tl_args[0], "ASKING")) {
+            ss->asking = 0; /* ASKING applies to the one command that follows it */
+        }
         if (ss->waiting) {
             break; /* the worker answers the WAIT; later commands run afterwards */
         }

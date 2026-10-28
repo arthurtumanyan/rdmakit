@@ -79,7 +79,7 @@ warm-up (`--warmup`, default 2 s) whose operations are not counted, then the mea
 | Server | Driver | Typical options |
 |---|---|---|
 | Redis, Valkey, Dragonfly, arenakvd `--resp-port` | `resp` | `--port 6379` |
-| a Redis Cluster (Valkey, Redis, arenakvd with `--cluster-config`) | `resp-cluster` | `--port` of any node; requests go to the primary of each key's slot, `MOVED` reloads the slot map; one connection per thread (not with `--conns-per-thread` or `--pipeline`) |
+| a Redis Cluster (Valkey, Redis, arenakvd with `--cluster-config`) | `resp-cluster` | `--port` of any node; requests go to the primary of each key's slot, `MOVED` reloads the slot map, `ASK` (during resharding) sends a request to the named node after `ASKING`, `TRYAGAIN` repeats it; one connection per thread (not with `--conns-per-thread` or `--pipeline`) |
 | memcached, Dragonfly `--memcached_port`, arenakvd `--memcached-port` | `memcached` | `--port 11211` |
 | arenakvd native listener over TCP | `native` | `--driver-opt transport=tcp --port 7600` |
 | arenakvd native listener over RDMA | `native` | `--driver-opt transport=rdma --host <RDMA interface address> --port 7600` |

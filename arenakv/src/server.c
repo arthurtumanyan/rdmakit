@@ -204,6 +204,8 @@ struct akvd {
     _Atomic(cluster *) cluster;
     cluster **old_clusters; /* replaced maps, still referenced by running commands; freed at stop */
     size_t nold_clusters;
+    pthread_mutex_t cluster_lock;  /* slot changes, the map file, the keys-in-slot list */
+    struct slot_cache *slot_cache; /* keys of slots being moved away (akvd_slot_keys), NULL until needed */
 #ifdef AKV_HAVE_TLS
     SSL_CTX *tls;
 #endif
@@ -484,6 +486,253 @@ const cluster *akvd_cluster(akvd *d) {
     return atomic_load(&d->cluster);
 }
 
+/* Keys (2-byte length, bytes) of the slots being moved away, built by one engine scan. */
+struct slot_list {
+    uint8_t *p;
+    size_t len;
+    size_t cap;
+};
+
+struct slot_cache {
+    uint8_t covered[CLUSTER_SLOTS]; /* the list of the slot was built */
+    struct slot_list keys[CLUSTER_SLOTS];
+    int failed; /* out of memory during the scan */
+};
+
+static void slot_cache_free(struct slot_cache *c) {
+    if (c == NULL) {
+        return;
+    }
+    for (unsigned s = 0; s < CLUSTER_SLOTS; s++) {
+        free(c->keys[s].p);
+    }
+    free(c);
+}
+
+static int slot_cache_add(void *arg, const akv_record *r) {
+    struct slot_cache *c = arg;
+    unsigned slot = cluster_keyslot(r->key, r->klen);
+    struct slot_list *l = &c->keys[slot];
+    if (!c->covered[slot] || r->klen > 0xffff) {
+        return 0;
+    }
+    if (l->len + 2 + r->klen > l->cap) {
+        size_t cap = l->cap ? l->cap * 2 : 256;
+        while (cap < l->len + 2 + r->klen) {
+            cap *= 2;
+        }
+        uint8_t *p = realloc(l->p, cap);
+        if (p == NULL) {
+            c->failed = 1;
+            return 1;
+        }
+        l->p = p;
+        l->cap = cap;
+    }
+    l->p[l->len] = (uint8_t)r->klen;
+    l->p[l->len + 1] = (uint8_t)(r->klen >> 8);
+    memcpy(l->p + l->len + 2, r->key, r->klen);
+    l->len += 2 + r->klen;
+    return 0;
+}
+
+/*
+ * Makes sure the list of `slot` exists: when it does not, every list is rebuilt by one scan for the slots
+ * this node is moving away, and `slot`. Called with cluster_lock held. Returns 0 or -1.
+ */
+static int slot_cache_cover(akvd *d, unsigned slot) {
+    if (d->slot_cache != NULL && d->slot_cache->covered[slot]) {
+        return 0;
+    }
+    slot_cache_free(d->slot_cache);
+    d->slot_cache = calloc(1, sizeof(*d->slot_cache));
+    if (d->slot_cache == NULL) {
+        return -1;
+    }
+    const cluster *cl = atomic_load(&d->cluster);
+    for (unsigned s = 0; s < CLUSTER_SLOTS; s++) {
+        d->slot_cache->covered[s] = cl != NULL && cluster_migrating(cl, s) >= 0;
+    }
+    d->slot_cache->covered[slot] = 1;
+    akv_foreach(d->store, slot_cache_add, d->slot_cache);
+    if (d->slot_cache->failed) {
+        slot_cache_free(d->slot_cache);
+        d->slot_cache = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+/* Drops the list of a slot (it is no longer being moved away). Called with cluster_lock held. */
+static void slot_cache_drop(akvd *d, unsigned slot) {
+    if (d->slot_cache != NULL && d->slot_cache->covered[slot]) {
+        free(d->slot_cache->keys[slot].p);
+        d->slot_cache->keys[slot] = (struct slot_list){0};
+        d->slot_cache->covered[slot] = 0;
+    }
+}
+
+/*
+ * Walks the list of a slot, removing keys that no longer exist, and calls fn (when not NULL) for up to
+ * count existing keys. Called with cluster_lock held. Returns the number of existing keys passed to fn, or
+ * all existing keys when fn is NULL.
+ */
+static long slot_cache_walk(akvd *d, unsigned slot, unsigned long count,
+                            void (*fn)(void *arg, const void *key, size_t klen), void *arg) {
+    struct slot_list *l = &d->slot_cache->keys[slot];
+    size_t in = 0;
+    size_t out = 0;
+    long n = 0;
+    while (in < l->len) {
+        size_t klen = (size_t)l->p[in] | ((size_t)l->p[in + 1] << 8);
+        const uint8_t *key = l->p + in + 2;
+        if (akv_exists(d->store, key, klen)) {
+            if (fn == NULL || (unsigned long)n < count) {
+                if (fn != NULL) {
+                    fn(arg, key, klen);
+                }
+                n++;
+            }
+            memmove(l->p + out, l->p + in, 2 + klen);
+            out += 2 + klen;
+        }
+        in += 2 + klen;
+    }
+    l->len = out;
+    return n;
+}
+
+struct slot_scan {
+    unsigned slot;
+    unsigned long count;
+    long n;
+    void (*fn)(void *arg, const void *key, size_t klen);
+    void *arg;
+};
+
+static int slot_scan_cb(void *arg, const akv_record *r) {
+    struct slot_scan *sc = arg;
+    if (cluster_keyslot(r->key, r->klen) == sc->slot) {
+        if (sc->fn != NULL) {
+            sc->fn(sc->arg, r->key, r->klen);
+        }
+        sc->n++;
+        return sc->fn != NULL && (unsigned long)sc->n >= sc->count;
+    }
+    return 0;
+}
+
+long akvd_slot_keys(akvd *d, unsigned slot, unsigned count,
+                    void (*fn)(void *arg, const void *key, size_t klen), void *arg) {
+    const cluster *cl = atomic_load(&d->cluster);
+    if (cl == NULL || cluster_migrating(cl, slot) < 0) {
+        struct slot_scan sc = {.slot = slot, .count = count, .fn = fn, .arg = arg};
+        akv_foreach(d->store, slot_scan_cb, &sc);
+        return sc.n;
+    }
+    pthread_mutex_lock(&d->cluster_lock);
+    long n = slot_cache_cover(d, slot) == 0 ? slot_cache_walk(d, slot, count, fn, arg) : -1;
+    pthread_mutex_unlock(&d->cluster_lock);
+    return n;
+}
+
+long akvd_slot_count(akvd *d, unsigned slot) {
+    const cluster *cl = atomic_load(&d->cluster);
+    if (cl == NULL || cluster_migrating(cl, slot) < 0) {
+        struct slot_scan sc = {.slot = slot};
+        akv_foreach(d->store, slot_scan_cb, &sc);
+        return sc.n;
+    }
+    pthread_mutex_lock(&d->cluster_lock);
+    long n = slot_cache_cover(d, slot) == 0 ? slot_cache_walk(d, slot, 0, NULL, NULL) : -1;
+    pthread_mutex_unlock(&d->cluster_lock);
+    return n;
+}
+
+int akvd_cluster_setslot(akvd *d, unsigned slot, enum akvd_setslot kind, int node, char *err, size_t errlen) {
+    pthread_mutex_lock(&d->cluster_lock);
+    /* the live map is owned by the server; workers read its slot fields with atomic accesses */
+    cluster *cl = (cluster *)atomic_load(&d->cluster);
+    int rc = 0;
+    int self = cl != NULL ? cl->self : -1;
+    if (cl == NULL) {
+        snprintf(err, errlen, "ERR This instance has cluster support disabled");
+        rc = -1;
+    } else if (self < 0 || (!cl->nodes[self].primary && kind != AKVD_SLOT_NODE)) {
+        /* replicas learn new owners (NODE) but never move slots themselves */
+        snprintf(err, errlen, "ERR Please use SETSLOT only with masters.");
+        rc = -1;
+    } else if (kind == AKVD_SLOT_IMPORTING && cluster_owner(cl, slot) == self) {
+        snprintf(err, errlen, "ERR I'm already the owner of hash slot %u", slot);
+        rc = -1;
+    } else if (kind == AKVD_SLOT_MIGRATING && cluster_owner(cl, slot) != self) {
+        snprintf(err, errlen, "ERR I'm not the owner of hash slot %u", slot);
+        rc = -1;
+    } else if ((kind == AKVD_SLOT_IMPORTING || kind == AKVD_SLOT_MIGRATING) && node == self) {
+        snprintf(err, errlen, "ERR I can't migrate a slot to or from myself");
+        rc = -1;
+    }
+    if (rc == 0 && kind == AKVD_SLOT_NODE && cluster_owner(cl, slot) == self && node != self) {
+        long left;
+        if (cluster_migrating(cl, slot) >= 0) {
+            left = slot_cache_cover(d, slot) == 0 ? slot_cache_walk(d, slot, 0, NULL, NULL) : -1;
+        } else {
+            struct slot_scan sc = {.slot = slot};
+            akv_foreach(d->store, slot_scan_cb, &sc);
+            left = sc.n;
+        }
+        if (left != 0) {
+            snprintf(err, errlen,
+                     "ERR Can't assign hashslot %u to a different node while I still hold keys for this hash "
+                     "slot.",
+                     slot);
+            rc = -1;
+        }
+    }
+    if (rc == 0) {
+        switch (kind) {
+        case AKVD_SLOT_IMPORTING:
+            cluster_set_importing(cl, slot, node);
+            break;
+        case AKVD_SLOT_MIGRATING:
+            cluster_set_migrating(cl, slot, node);
+            break;
+        case AKVD_SLOT_STABLE:
+            cluster_set_migrating(cl, slot, -1);
+            cluster_set_importing(cl, slot, -1);
+            slot_cache_drop(d, slot);
+            break;
+        case AKVD_SLOT_NODE:
+            cluster_set_owner(cl, slot, node);
+            cluster_set_migrating(cl, slot, -1);
+            cluster_set_importing(cl, slot, -1);
+            slot_cache_drop(d, slot);
+            if (d->cfg.cluster_config != NULL) {
+                char msg[512];
+                if (cluster_save(cl, d->cfg.cluster_config, 0, msg, sizeof(msg)) != 0) {
+                    akvd_log(d, AKVD_LOG_ERROR, "cluster map not written: %s", msg);
+                }
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&d->cluster_lock);
+    return rc;
+}
+
+int akvd_cluster_saveconfig(akvd *d, char *err, size_t errlen) {
+    pthread_mutex_lock(&d->cluster_lock);
+    const cluster *cl = atomic_load(&d->cluster);
+    int rc = -1;
+    if (cl == NULL || d->cfg.cluster_config == NULL) {
+        snprintf(err, errlen, "ERR This instance has cluster support disabled");
+    } else if (cluster_save(cl, d->cfg.cluster_config, 1, err, errlen) == 0) {
+        rc = 0;
+    }
+    pthread_mutex_unlock(&d->cluster_lock);
+    return rc;
+}
+
 int akvd_cluster_reload(akvd *d, char *err, size_t errlen) {
     if (d->cfg.cluster_config == NULL) {
         snprintf(err, errlen, "cluster mode is not configured (cluster-config option)");
@@ -502,7 +751,11 @@ int akvd_cluster_reload(akvd *d, char *err, size_t errlen) {
         return -ENOMEM;
     }
     d->old_clusters = r;
+    pthread_mutex_lock(&d->cluster_lock);
     d->old_clusters[d->nold_clusters++] = atomic_exchange(&d->cluster, n);
+    slot_cache_free(d->slot_cache);
+    d->slot_cache = NULL;
+    pthread_mutex_unlock(&d->cluster_lock);
     pthread_mutex_unlock(&d->acl_lock);
     akvd_log(d, AKVD_LOG_INFO, "cluster map reloaded: %u nodes, %u slots assigned", n->n,
              cluster_assigned(n));
@@ -2375,6 +2628,8 @@ static void free_all(akvd *d) {
     }
     free(d->retired);
     pthread_mutex_destroy(&d->acl_lock);
+    slot_cache_free(d->slot_cache);
+    pthread_mutex_destroy(&d->cluster_lock);
 #ifdef AKV_HAVE_TLS
     if (d->tls != NULL) {
         SSL_CTX_free(d->tls);
@@ -2405,6 +2660,7 @@ akvd *akvd_start(const akvd_config *cfg, int *err) {
     d->mc_fd = d->resp_fd = d->tls_mc_fd = d->tls_resp_fd = d->stop_fd = -1;
     pthread_mutex_init(&d->log_lock, NULL);
     pthread_mutex_init(&d->acl_lock, NULL);
+    pthread_mutex_init(&d->cluster_lock, NULL);
     pthread_mutex_init(&d->save_lock, NULL);
     pthread_mutex_init(&d->saver_lock, NULL);
     pthread_cond_init(&d->saver_cond, NULL);

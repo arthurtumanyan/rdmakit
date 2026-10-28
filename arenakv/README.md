@@ -21,7 +21,8 @@ instructions, and evicts with a second chance.
 - Sharded engine: operations on different shards run in parallel. Tag comparison with SSE2 (x86-64) or NEON
   (aarch64), with a portable fallback.
 - Replication over the native transport (TCP or RDMA): replicas continue from their offset after a reconnect or a
-  promotion; read-only replicas; `WAIT`; automatic failover by `akv_sentinel` monitors (Redis Sentinel protocol); the Redis Cluster protocol with a fixed slot map (`MOVED`, `CLUSTER SLOTS`).
+  promotion; read-only replicas; `WAIT`; automatic failover by `akv_sentinel` monitors (Redis Sentinel protocol); the Redis Cluster protocol (`MOVED`, `CLUSTER SLOTS`) with live resharding by `akv_reshard` (`ASK`,
+  `MIGRATE`, `CLUSTER SETSLOT`).
 - Client library (`akvclient.h`) with pipelining, consistent hashing over several servers and failover to a
   promoted replica, and a native driver for [`kvpace`](../kvpace).
 
@@ -63,7 +64,7 @@ below show where `arenakv` is in the same range, where it is better, and where i
 | Data types | strings | strings | strings, lists, hashes, sets, sorted sets, streams | as Valkey |
 | Authentication | ACL users with per-user commands, categories and key patterns (subset of the Valkey ACL file syntax) | SASL, ASCII auth | ACL users | ACL users |
 | Persistence | snapshots, append-only log (fsync always, everysec or no), warm restart | warm restart | RDB, AOF | snapshots |
-| Replication, cluster | asynchronous replication over TCP or RDMA with partial resynchronization; automatic failover by monitors (`akv_sentinel`, Redis Sentinel protocol) or manual; Redis Cluster protocol with a fixed slot map | no (client-side hashing) | yes | replication, cluster mode |
+| Replication, cluster | asynchronous replication over TCP or RDMA with partial resynchronization; automatic failover by monitors (`akv_sentinel`, Redis Sentinel protocol) or manual; Redis Cluster protocol with live resharding (`akv_reshard`, `ASK`, `MIGRATE`) | no (client-side hashing) | yes | replication, cluster mode |
 | Hash index | grows from a small size | grows | grows | grows |
 | Production use | not recommended | widely deployed | widely deployed | deployed |
 
@@ -219,7 +220,7 @@ Linux, a C compiler with `-std=gnu2x` (gcc 13 or newer, clang 18 or newer), `mak
 ## Build and test
 
 ```
-make                  # build/<arch>/libarenakv.a, arenakvd, akv_cli, akv_bench, akv_sentinel
+make                  # build/<arch>/libarenakv.a, arenakvd, akv_cli, akv_bench, akv_sentinel, akv_reshard
 sudo make install     # /usr/local/bin (PREFIX= and DESTDIR= are honored)
 make TLS=1            # with TLS listeners (needs libssl-dev; build/<arch>-tls/)
 make test             # engine, protocol, network and server tests
@@ -250,6 +251,7 @@ and clang on x86-64 and arm64.
 | `replication.py` | a replica of 20,000 keys equal to its primary, read-only refusal, WAIT, ROLE, partial resynchronization after a link restart, full resynchronization after falling behind the backlog, expiry, failover with partial continuation from the promoted replica |
 | `test_sentinel` | failover rules (choice of the replica, votes needed, one vote per epoch), the Sentinel replies that clients parse, a vote kept across a restart from the state file |
 | `failover.py` | three monitors over a primary and two replicas: automatic failover to the replica with the highest offset after `SIGKILL` (no key lost, the other replica follows, redis-py's Sentinel finds the new primary), the old primary rejoining as a replica, no failover with one of three monitors and failover when they return, `SENTINEL FAILOVER` without loss of acknowledged keys |
+| `reshard.py` | `CLUSTER SETSLOT`, `ASK`, `ASKING`, `TRYAGAIN`, `MIGRATE`, `DUMP`/`RESTORE` and their refusals; `akv_reshard` moving 2,000 slots while redis-py `RedisCluster` writers and kvpace `--driver resp-cluster` run (no acknowledged write lost, no error), every node and the replica on the new map, map files reread after restarts |
 | `cluster.py` | slots against the Redis Cluster CRC16, CLUSTER SLOTS/SHARDS/NODES/INFO, MOVED, CROSSSLOT, READONLY reads on a replica, redis-py RedisCluster, `valkey-cli -c`, kvpace `--driver resp-cluster` |
 | `test_server` | native protocol round trips, malformed requests, size limits, concurrent clients, shutdown with clients connected; over TCP, and over RDMA when `DUCT_TEST_ADDR` is set |
 
@@ -293,7 +295,7 @@ END
 | `--aclfile FILE` | none | users with per-user rights; reloaded by `ACL LOAD` |
 | `--pubsub-output-limit SIZE` | 32M | pending messages of a subscriber before it is disconnected |
 | `--replicaof HOST:PORT`, `--primary-auth USER:PASS` | none | follow a primary (its native port) |
-| `--cluster-config FILE`, `--cluster-node-id ID` | none | Redis Cluster protocol with a fixed slot map |
+| `--cluster-config FILE`, `--cluster-node-id ID` | none | Redis Cluster protocol; the node rewrites FILE when resharding changes a slot's owner |
 | `--snapshot FILE`, `--save-interval SEC`, `--no-save-on-stop` | none, off, save at stop | snapshots |
 | `--appendonly DIR`, `--appendfsync always\|everysec\|no` | none, everysec | append-only log |
 | `--warm-restart FILE` | none | keep the cache memory (on tmpfs) across restarts |
@@ -368,7 +370,7 @@ transport.
 |---|---|
 | `include/` | public headers: `akv.h` (engine), `akvproto.h` (protocol), `akvd.h` (server), `akvclient.h` |
 | `src/` | `akv.c` engine, `simd.h`, `hash.h`, `server.c` core, `proto_mc.c`, `proto_resp.c`, `snapshot.c`, `aof.c` append-only log, `client.c` |
-| `tools/` | `arenakvd` daemon, `akv_cli` native-protocol client, `akv_bench` micro-benchmarks, `akv_sentinel` failover monitor |
+| `tools/` | `arenakvd` daemon, `akv_cli` native-protocol client, `akv_bench` micro-benchmarks, `akv_sentinel` failover monitor, `akv_reshard` slot mover |
 | `tests/` | engine, protocol, network and server tests; `compat.sh` with third-party clients |
 | `contrib/` | example configuration, systemd unit, Dockerfile |
 | `docs/` | architecture, native protocol and operations |
